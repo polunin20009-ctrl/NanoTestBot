@@ -1,0 +1,7 @@
+Nano.env
+venv/
+__pycache__/
+*.pyc
+*.log
+state*.json
+signals*.jsonl
