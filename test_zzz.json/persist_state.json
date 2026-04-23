@@ -1,0 +1,25 @@
+{
+  "admin_user_id": 459845057,
+  "started_users": {
+    "459845057": {
+      "first_seen": "2026-04-18T21:30:17.572134+00:00",
+      "last_seen": "2026-04-18T21:30:17.572134+00:00",
+      "ts": "2026-04-18T21:30:17.572134+00:00"
+    }
+  },
+  "pinned_daily_msg_id": null,
+  "pinned_daily_stats_message_id": null,
+  "instruction_message_id": 1439,
+  "daily_report_last_sent_date": null,
+  "last_daily_stats_sent_date_msk": null,
+  "stats": {
+    "last_daily_stats_date_msk": null
+  },
+  "maintenance": {
+    "last_cleanup_date_msk": "2026-04-21",
+    "pending_cleanup": true,
+    "cleanup_requested": true,
+    "cleanup_requested_at": 1776884329.361053,
+    "cleanup_in_progress": false
+  }
+}

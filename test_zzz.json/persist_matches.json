@@ -1,0 +1,188 @@
+{
+  "1384887": {
+    "last_sent_text_hash": "ebc6b7a98780ef74f4aa48e25b66e211276c027ddfc8a07f3922e87ee67b1e90",
+    "last_updated_ts": 1776621652.7037363,
+    "last_home_score": 0,
+    "last_away_score": 1,
+    "last_score_home": 0,
+    "last_score_away": 1,
+    "last_status": "{'LONG': 'SECOND HALF', 'SHORT': '2H', 'ELAPSED': 71, 'EXTRA': NONE}",
+    "last_minute_seen": 71
+  },
+  "1392150": {
+    "last_sent_text_hash": "aed5f4529c5e439d97c38f5d4a8071bbdfb06550fd08d21a51059c006c67c7c1",
+    "last_updated_ts": 1776621650.98677,
+    "last_home_score": 1,
+    "last_away_score": 0,
+    "last_score_home": 1,
+    "last_score_away": 0,
+    "last_status": "{'LONG': 'SECOND HALF', 'SHORT': '2H', 'ELAPSED': 70, 'EXTRA': NONE}",
+    "last_minute_seen": 70
+  },
+  "1492028": {
+    "last_sent_text_hash": "a751c743c9d1c829c94b2626b01eba8e462a6f56a399a14bb2172aa89d0cc36b",
+    "last_updated_ts": 1776621652.1610072,
+    "last_home_score": 1,
+    "last_away_score": 0,
+    "last_score_home": 1,
+    "last_score_away": 0,
+    "last_status": "{'LONG': 'SECOND HALF', 'SHORT': '2H', 'ELAPSED': 70, 'EXTRA': NONE}",
+    "last_minute_seen": 70
+  },
+  "1505421": {
+    "last_sent_text_hash": "29e5871d219ed291b936c0075c5f9a9261023f92b48a9826eb2b5fdffc8dc032",
+    "last_updated_ts": 1776621653.0041006,
+    "last_home_score": 1,
+    "last_away_score": 0,
+    "last_score_home": 1,
+    "last_score_away": 0,
+    "last_status": "{'LONG': 'SECOND HALF', 'SHORT': '2H', 'ELAPSED': 66, 'EXTRA': NONE}",
+    "last_minute_seen": 66
+  },
+  "1536986": {
+    "last_sent_text_hash": "66f1cca0a099e2e7db54c7d274c815fc41288b8e5f76921f0773066d8e0dd053",
+    "last_updated_ts": 1776621674.1410213,
+    "last_home_score": 1,
+    "last_away_score": 1,
+    "last_score_home": 1,
+    "last_score_away": 1,
+    "last_status": "{'LONG': 'SECOND HALF', 'SHORT': '2H', 'ELAPSED': 70, 'EXTRA': NONE}",
+    "last_minute_seen": 70
+  },
+  "1541023": {
+    "last_sent_text_hash": "a0e56ff230c00ab88de0413f170ad175357629154766d082dfda36ed11d3700e",
+    "last_updated_ts": 1776718814.910822,
+    "last_home_score": 1,
+    "last_away_score": 2,
+    "last_score_home": 1,
+    "last_score_away": 2,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 7}",
+    "last_minute_seen": 90,
+    "is_finished": true,
+    "kickoff_utc": "2026-04-20T16:15:00+00:00"
+  },
+  "1530573": {
+    "last_sent_text_hash": "e9748e1ade9af901f2166d1848dcc1a0fc5b2c7ba0a7705dc35080ca97d939c3",
+    "last_updated_ts": 1776718814.3270087,
+    "last_home_score": 2,
+    "last_away_score": 1,
+    "last_score_home": 2,
+    "last_score_away": 1,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 6}",
+    "last_minute_seen": 90,
+    "is_finished": true,
+    "kickoff_utc": "2026-04-20T17:00:00+00:00"
+  },
+  "1394696": {
+    "last_sent_text_hash": "f94c43b4ce456efe2d5b59069e46dd013ad6c1d799f0963378d8bc9eded6442f",
+    "last_updated_ts": 1776718813.4442415,
+    "last_home_score": 3,
+    "last_away_score": 0,
+    "last_score_home": 3,
+    "last_score_away": 0,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 3}",
+    "last_minute_seen": 90,
+    "is_finished": true,
+    "kickoff_utc": "2026-04-20T17:00:00+00:00"
+  },
+  "1380639": {
+    "last_sent_text_hash": "0946801c3f5e7485b49385444d395816282630ba3982f1106913312e2679e444",
+    "last_updated_ts": 1776718812.912659,
+    "last_home_score": 1,
+    "last_away_score": 1,
+    "last_score_home": 1,
+    "last_score_away": 1,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 6}",
+    "last_minute_seen": 90,
+    "is_finished": true,
+    "kickoff_utc": "2026-04-20T17:00:00+00:00"
+  },
+  "1536947": {
+    "last_sent_text_hash": "3ae264c3a28665d7aba4bfd557083137ec7cadf86ba5f61e1b9275e1d097a934",
+    "last_updated_ts": 1776878561.108256,
+    "last_home_score": 1,
+    "last_away_score": 1,
+    "last_score_home": 1,
+    "last_score_away": 1,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 7}",
+    "last_minute_seen": 90,
+    "is_finished": true,
+    "kickoff_utc": "2026-04-21T18:30:00+00:00"
+  },
+  "1531245": {
+    "last_sent_text_hash": "dd1bf955107c8b8cdbb86bc196fb51aaed2f3b8d6c4e9fcce100b2b718313afa",
+    "last_updated_ts": 1776882153.3425977,
+    "last_home_score": 3,
+    "last_away_score": 1,
+    "last_score_home": 3,
+    "last_score_away": 1,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 4}",
+    "last_minute_seen": 90,
+    "is_finished": true
+  },
+  "1531246": {
+    "last_sent_text_hash": "745b2d2da759311afb9817757288517586d32e2c3fc9fcbb0f622d6ac683be20",
+    "last_updated_ts": 1776882351.0729675,
+    "last_home_score": 0,
+    "last_away_score": 2,
+    "last_score_home": 0,
+    "last_score_away": 2,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 6}",
+    "last_minute_seen": 90,
+    "is_finished": true
+  },
+  "1540273": {
+    "last_sent_text_hash": "fd2ee20cf7658e52538dee063c18c9c378275f861db2419d20ad3456c7e8be2f",
+    "last_updated_ts": 1776882484.2662907,
+    "last_home_score": 0,
+    "last_away_score": 0,
+    "last_score_home": 0,
+    "last_score_away": 0,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 6}",
+    "last_minute_seen": 90,
+    "is_finished": true
+  },
+  "1400235": {
+    "last_sent_text_hash": "daafb93af0de061479cffc7568164b2c979eb5605a1bb1ed9abcd52faf480480",
+    "last_updated_ts": 1776883799.2231913,
+    "last_home_score": 0,
+    "last_away_score": 0,
+    "last_score_home": 0,
+    "last_score_away": 0,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 11}",
+    "last_minute_seen": 90,
+    "is_finished": true
+  },
+  "1537089": {
+    "last_sent_text_hash": "6ad818145b2b3b6b419fafd14460b369ebb5e8bc7159de7df7e0dbebc74f3a88",
+    "last_updated_ts": 1776884059.572344,
+    "last_home_score": 2,
+    "last_away_score": 1,
+    "last_score_home": 2,
+    "last_score_away": 1,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 7}",
+    "last_minute_seen": 90,
+    "is_finished": true
+  },
+  "1387929": {
+    "last_sent_text_hash": "a9851e7e57003e5cc477678ac2a68e1d56a9a0e23f59b427134a765d3020704a",
+    "last_updated_ts": 1776883994.5552757,
+    "last_home_score": 3,
+    "last_away_score": 0,
+    "last_score_home": 3,
+    "last_score_away": 0,
+    "last_status": "{'LONG': 'MATCH FINISHED', 'SHORT': 'FT', 'ELAPSED': 90, 'EXTRA': 4}",
+    "last_minute_seen": 90,
+    "is_finished": true
+  },
+  "1391141": {
+    "last_sent_text_hash": "63bed8e3206d428db9814571ec66f31d5e2a0855c6a846b570e98dcf3a3ce474",
+    "last_updated_ts": 1776884312.9428062,
+    "last_home_score": 3,
+    "last_away_score": 2,
+    "last_score_home": 3,
+    "last_score_away": 2,
+    "last_status": "{'LONG': 'SECOND HALF', 'SHORT': '2H', 'ELAPSED': 90, 'EXTRA': 2}",
+    "last_minute_seen": 90
+  }
+}

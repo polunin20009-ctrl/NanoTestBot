@@ -1,0 +1,2728 @@
+{
+  "sent": {
+    "1536947": {
+      "chat_id": -1002204373098,
+      "message_id": 1522,
+      "sent_at_ts": 1776800212.3694668,
+      "signal_ts": 1776800212.3694668,
+      "signal_score": {
+        "home": 0,
+        "away": 1
+      },
+      "signal_minute": 48,
+      "last_edit_ts": 1776802756.979272,
+      "last_known_score": {
+        "home": 1,
+        "away": 1
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        86
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1531245": {
+      "chat_id": -1002204373098,
+      "message_id": 1523,
+      "sent_at_ts": 1776879259.140256,
+      "signal_ts": 1776879259.140256,
+      "signal_score": {
+        "home": 2,
+        "away": 1
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776881878.3200252,
+      "last_known_score": {
+        "home": 3,
+        "away": 1
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        76
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1531246": {
+      "chat_id": -1002204373098,
+      "message_id": 1524,
+      "sent_at_ts": 1776879399.3997173,
+      "signal_ts": 1776879399.3997173,
+      "signal_score": {
+        "home": 0,
+        "away": 1
+      },
+      "signal_minute": 48,
+      "last_edit_ts": 1776881948.637679,
+      "last_known_score": {
+        "home": 0,
+        "away": 2
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        82
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1540273": {
+      "chat_id": -1002204373098,
+      "message_id": 1525,
+      "sent_at_ts": 1776879597.589343,
+      "signal_ts": 1776879597.589343,
+      "signal_score": {
+        "home": 0,
+        "away": 0
+      },
+      "signal_minute": 49,
+      "last_edit_ts": 1776882086.2500737,
+      "last_known_score": {
+        "home": 0,
+        "away": 0
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [],
+      "finished": true,
+      "status": "FT"
+    },
+    "1400235": {
+      "chat_id": -1002204373098,
+      "message_id": 1526,
+      "sent_at_ts": 1776880636.2087748,
+      "signal_ts": 1776880636.2087748,
+      "signal_score": {
+        "home": 0,
+        "away": 0
+      },
+      "signal_minute": 49,
+      "last_edit_ts": 1776883072.4010756,
+      "last_known_score": {
+        "home": 0,
+        "away": 0
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [],
+      "finished": true,
+      "status": "FT"
+    },
+    "1537089": {
+      "chat_id": -1002204373098,
+      "message_id": 1527,
+      "sent_at_ts": 1776880980.3507981,
+      "signal_ts": 1776880980.3507981,
+      "signal_score": {
+        "home": 1,
+        "away": 1
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776883601.0949473,
+      "last_known_score": {
+        "home": 2,
+        "away": 1
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        62
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1387929": {
+      "chat_id": -1002204373098,
+      "message_id": 1528,
+      "sent_at_ts": 1776881118.489877,
+      "signal_ts": 1776881118.489877,
+      "signal_score": {
+        "home": 2,
+        "away": 0
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776883731.2814841,
+      "last_known_score": {
+        "home": 3,
+        "away": 0
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        50
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1391141": {
+      "chat_id": -1002204373098,
+      "message_id": 1529,
+      "sent_at_ts": 1776881570.0660515,
+      "signal_ts": 1776881570.0660515,
+      "signal_score": {
+        "home": 2,
+        "away": 2
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776884187.296604,
+      "last_known_score": {
+        "home": 3,
+        "away": 2
+      },
+      "flash_goal_until_ts": 1776883492.0158803,
+      "last_known_scored_goals": [
+        75
+      ],
+      "finished": false,
+      "status": "LIVE"
+    }
+  },
+  "sent_matches": {
+    "1536947": 1522,
+    "1531245": 1523,
+    "1531246": 1524,
+    "1540273": 1525,
+    "1400235": 1526,
+    "1537089": 1527,
+    "1387929": 1528,
+    "1391141": 1529
+  },
+  "last_message_texts": {
+    "1536947": "🚨 Сигнал\n\nGenk — Charleroi\n\nJupiler Pro League, Belgium\n\nСчет: 0 - 1 (Завершен)\n\nxG: 2.76 - 1.50\n\nУдары по воротам: 21 - 12\nУдары в створ: 7 - 5\nСейвы: 4 - 6\nУдары из штрафной: 12 - 9\nУгловые: 10 - 1\nВладение: 61% - 39%\n\n⚽️Голы: 86′\n\n✅ Финальный счёт: 1 - 1",
+    "1531245": "🚨 Сигнал\n\nRed Bull Salzburg — Austria Vienna\n\nBundesliga, Austria\n\nСчет: 2 - 1 (Завершен)\n\nxG: 1.46 - 1.09\n\nУдары по воротам: 12 - 7\nУдары в створ: 4 - 2\nСейвы: 1 - 2\nУдары из штрафной: 8 - 7\nУгловые: 5 - 0\nВладение: 53% - 47%\n\n⚽️Голы: 76′\n\n✅ Финальный счёт: 3 - 1",
+    "1531246": "🚨 Сигнал\n\nRapid Vienna — TSV Hartberg\n\nBundesliga, Austria\n\nСчет: 0 - 1 (Завершен)\n\nxG: 1.88 - 0.41\n\nУдары по воротам: 13 - 4\nУдары в створ: 3 - 2\nСейвы: 0 - 2\nУдары из штрафной: 10 - 1\nУгловые: 9 - 1\nВладение: 61% - 39%\n\n⚽️Голы: 82′\n\n✅ Финальный счёт: 0 - 2",
+    "1540273": "🚨 Сигнал\n\nOFK Beograd — Cukaricki\n\nSuper Liga, Serbia\n\nСчет: 0 - 0 (Завершен)\n\nxG: 0.15 - 1.03\n\nУдары по воротам: 6 - 13\nУдары в створ: 0 - 6\nСейвы: 6 - 0\nУдары из штрафной: 4 - 7\nУгловые: 2 - 4\nВладение: 49% - 51%\n\n❌ Финальный счёт: 0 - 0",
+    "1400235": "🚨 Сигнал\n\nLokomotiv — Zenit\n\nPremier League, Russia\n\nСчет: 0 - 0 (Завершен)\n\nxG: 1.11 - 0.50\n\nУдары по воротам: 11 - 12\nУдары в створ: 4 - 1\nСейвы: 1 - 4\nУдары из штрафной: 7 - 6\nУгловые: 3 - 3\nВладение: 40% - 60%\n\n❌ Финальный счёт: 0 - 0",
+    "1537089": "🚨 Сигнал\n\nAsteras Tripolis — Panetolikos\n\nSuper League 1, Greece\n\nСчет: 1 - 1 (Завершен)\n\nxG: 1.37 - 1.01\n\nУдары по воротам: 17 - 5\nУдары в створ: 5 - 4\nСейвы: 3 - 2\nУдары из штрафной: 11 - 4\nУгловые: 1 - 2\nВладение: 42% - 58%\n\n⚽️Голы: 62′\n\n✅ Финальный счёт: 2 - 1",
+    "1387929": "🚨 Сигнал\n\nParis Saint Germain — Nantes\n\nLigue 1, France\n\nСчет: 2 - 0 (Завершен)\n\nxG: 2.16 - 0.82\n\nУдары по воротам: 14 - 10\nУдары в створ: 6 - 3\nСейвы: 4 - 3\nУдары из штрафной: 10 - 5\nУгловые: 7 - 6\nВладение: 70% - 30%\n\n⚽️Голы: 50′\n\n✅ Финальный счёт: 3 - 0",
+    "1391141": "🚨 Сигнал\n\nElche — Atletico Madrid\n\nLa Liga, Spain\n\nСчет: 2 - 2 90 минута\n\nxG до 90 минуты: 2.54 - 0.87\n\nУдары по воротам: 14 - 3\nУдары в створ: 6 - 2\nСейвы: 0 - 4\nУдары из штрафной: 10 - 2\nУгловые: 13 - 2\nВладение: 73% - 27%\n\n⚽️Голы: 75’\n\n✅Счёт: 3 - 2"
+  },
+  "tracked_matches": {
+    "1536947": {
+      "chat_id": -1002204373098,
+      "message_id": 1522,
+      "sent_at_ts": 1776800212.3694668,
+      "signal_ts": 1776800212.3694668,
+      "score_at_signal": {
+        "home": 0,
+        "away": 1
+      },
+      "signal_score": {
+        "home": 0,
+        "away": 1
+      },
+      "signal_minute": 48,
+      "last_edit_ts": 1776878559.9962416,
+      "last_known_score": {
+        "home": 1,
+        "away": 1
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        86
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1531245": {
+      "chat_id": -1002204373098,
+      "message_id": 1523,
+      "sent_at_ts": 1776879259.140256,
+      "signal_ts": 1776879259.140256,
+      "score_at_signal": {
+        "home": 2,
+        "away": 1
+      },
+      "signal_score": {
+        "home": 2,
+        "away": 1
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776882152.011311,
+      "last_known_score": {
+        "home": 3,
+        "away": 1
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        76
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1531246": {
+      "chat_id": -1002204373098,
+      "message_id": 1524,
+      "sent_at_ts": 1776879399.3997173,
+      "signal_ts": 1776879399.3997173,
+      "score_at_signal": {
+        "home": 0,
+        "away": 1
+      },
+      "signal_score": {
+        "home": 0,
+        "away": 1
+      },
+      "signal_minute": 48,
+      "last_edit_ts": 1776882349.9850795,
+      "last_known_score": {
+        "home": 0,
+        "away": 2
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        82
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1540273": {
+      "chat_id": -1002204373098,
+      "message_id": 1525,
+      "sent_at_ts": 1776879597.589343,
+      "signal_ts": 1776879597.589343,
+      "score_at_signal": {
+        "home": 0,
+        "away": 0
+      },
+      "signal_score": {
+        "home": 0,
+        "away": 0
+      },
+      "signal_minute": 49,
+      "last_edit_ts": 1776882483.0210938,
+      "last_known_score": {
+        "home": 0,
+        "away": 0
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [],
+      "finished": true,
+      "status": "FT"
+    },
+    "1400235": {
+      "chat_id": -1002204373098,
+      "message_id": 1526,
+      "sent_at_ts": 1776880636.2087748,
+      "signal_ts": 1776880636.2087748,
+      "score_at_signal": {
+        "home": 0,
+        "away": 0
+      },
+      "signal_score": {
+        "home": 0,
+        "away": 0
+      },
+      "signal_minute": 49,
+      "last_edit_ts": 1776883797.7402813,
+      "last_known_score": {
+        "home": 0,
+        "away": 0
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [],
+      "finished": true,
+      "status": "FT"
+    },
+    "1537089": {
+      "chat_id": -1002204373098,
+      "message_id": 1527,
+      "sent_at_ts": 1776880980.3507981,
+      "signal_ts": 1776880980.3507981,
+      "score_at_signal": {
+        "home": 1,
+        "away": 1
+      },
+      "signal_score": {
+        "home": 1,
+        "away": 1
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776884058.4696844,
+      "last_known_score": {
+        "home": 2,
+        "away": 1
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        62
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1387929": {
+      "chat_id": -1002204373098,
+      "message_id": 1528,
+      "sent_at_ts": 1776881118.489877,
+      "signal_ts": 1776881118.489877,
+      "score_at_signal": {
+        "home": 2,
+        "away": 0
+      },
+      "signal_score": {
+        "home": 2,
+        "away": 0
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776883993.4519806,
+      "last_known_score": {
+        "home": 3,
+        "away": 0
+      },
+      "flash_goal_until_ts": 0.0,
+      "last_known_scored_goals": [
+        50
+      ],
+      "finished": true,
+      "status": "FT"
+    },
+    "1391141": {
+      "chat_id": -1002204373098,
+      "message_id": 1529,
+      "sent_at_ts": 1776881570.0660515,
+      "signal_ts": 1776881570.0660515,
+      "score_at_signal": {
+        "home": 2,
+        "away": 2
+      },
+      "signal_score": {
+        "home": 2,
+        "away": 2
+      },
+      "signal_minute": 46,
+      "last_edit_ts": 1776884187.296604,
+      "last_known_score": {
+        "home": 3,
+        "away": 2
+      },
+      "flash_goal_until_ts": 1776883492.0158803,
+      "last_known_scored_goals": [
+        75
+      ],
+      "finished": false,
+      "status": "LIVE"
+    }
+  },
+  "active_fixtures": [
+    1391141
+  ],
+  "signal_header_texts": {
+    "1536947": "🚨 Сигнал\n\nGenk — Charleroi\n\nJupiler Pro League, Belgium\n\nСчет: 0 - 1 48 минута\n\nВероятность гола до 75 минуты: 72.4%\nВероятность гола до 90 минуты: 88.5%\n\nxG до 48 минуты: 1.92 - 0.46\n\nУдары по воротам: 14 - 3\nУдары в створ: 5 - 2\nСейвы: 1 - 4\nУдары из штрафной: 7 - 2\nУгловые: 7 - 0\nВладение: 67% - 33%",
+    "1531245": "🚨 Сигнал\n\nRed Bull Salzburg — Austria Vienna\n\nBundesliga, Austria\n\nСчет: 2 - 1 46 минута\n\nВероятность гола до 75 минуты: 54.1%\nВероятность гола до 90 минуты: 74.6%\n\nxG до 46 минуты: 0.63 - 0.45\n\nУдары по воротам: 6 - 1\nУдары в створ: 3 - 1\nСейвы: 0 - 1\nУдары из штрафной: 4 - 1\nУгловые: 5 - 0\nВладение: 55% - 45%",
+    "1531246": "🚨 Сигнал\n\nRapid Vienna — TSV Hartberg\n\nBundesliga, Austria\n\nСчет: 0 - 1 48 минута\n\nВероятность гола до 75 минуты: 49.2%\nВероятность гола до 90 минуты: 67.9%\n\nxG до 48 минуты: 1.30 - 0.31\n\nУдары по воротам: 6 - 3\nУдары в створ: 0 - 1\nСейвы: 0 - 0\nУдары из штрафной: 6 - 1\nУгловые: 2 - 1\nВладение: 57% - 43%",
+    "1540273": "🚨 Сигнал\n\nOFK Beograd — Cukaricki\n\nSuper Liga, Serbia\n\nСчет: 0 - 0 49 минута\n\nВероятность гола до 75 минуты: 59.4%\nВероятность гола до 90 минуты: 77.2%\n\nxG до 49 минуты: 0.15 - 0.69\n\nУдары по воротам: 3 - 10\nУдары в створ: 0 - 5\nСейвы: 5 - 0\nУдары из штрафной: 2 - 5\nУгловые: 2 - 3\nВладение: 42% - 58%",
+    "1400235": "🚨 Сигнал\n\nLokomotiv — Zenit\n\nPremier League, Russia\n\nСчет: 0 - 0 49 минута\n\nВероятность гола до 75 минуты: 53.7%\nВероятность гола до 90 минуты: 71.7%\n\nxG до 49 минуты: 0.55 - 0.50\n\nУдары по воротам: 7 - 8\nУдары в створ: 2 - 1\nСейвы: 1 - 2\nУдары из штрафной: 3 - 5\nУгловые: 1 - 2\nВладение: 33% - 67%",
+    "1537089": "🚨 Сигнал\n\nAsteras Tripolis — Panetolikos\n\nSuper League 1, Greece\n\nСчет: 1 - 1 46 минута\n\nВероятность гола до 75 минуты: 59.8%\nВероятность гола до 90 минуты: 79.9%\n\nxG до 46 минуты: 0.57 - 0.16\n\nУдары по воротам: 6 - 4\nУдары в створ: 3 - 3\nСейвы: 2 - 1\nУдары из штрафной: 5 - 3\nУгловые: 0 - 0\nВладение: 45% - 55%",
+    "1387929": "🚨 Сигнал\n\nParis Saint Germain — Nantes\n\nLigue 1, France\n\nСчет: 2 - 0 46 минута\n\nВероятность гола до 75 минуты: 61.5%\nВероятность гола до 90 минуты: 81.3%\n\nxG до 46 минуты: 0.98 - 0.26\n\nУдары по воротам: 6 - 6\nУдары в створ: 3 - 2\nСейвы: 2 - 1\nУдары из штрафной: 6 - 2\nУгловые: 4 - 4\nВладение: 76% - 24%",
+    "1391141": "🚨 Сигнал\n\nElche — Atletico Madrid\n\nLa Liga, Spain\n\nСчет: 2 - 2 46 минута\n\nВероятность гола до 75 минуты: 62.3%\nВероятность гола до 90 минуты: 82.0%\n\nxG до 46 минуты: 1.26 - 0.87\n\nУдары по воротам: 5 - 3\nУдары в створ: 2 - 2\nСейвы: 0 - 0\nУдары из штрафной: 3 - 2\nУгловые: 7 - 0\nВладение: 72% - 28%"
+  },
+  "signal_snapshot_meta": {
+    "1536947": {
+      "signal_score_home": 0,
+      "signal_score_away": 1,
+      "signal_minute": 48,
+      "message_id": 1522,
+      "chat_id": -1002204373098,
+      "prob_to75": 72.36,
+      "prob_to90": 88.47,
+      "signal_model": "45_plus"
+    },
+    "1531245": {
+      "signal_score_home": 2,
+      "signal_score_away": 1,
+      "signal_minute": 46,
+      "message_id": 1523,
+      "chat_id": -1002204373098,
+      "prob_to75": 54.14,
+      "prob_to90": 74.64,
+      "signal_model": "45_plus"
+    },
+    "1531246": {
+      "signal_score_home": 0,
+      "signal_score_away": 1,
+      "signal_minute": 48,
+      "message_id": 1524,
+      "chat_id": -1002204373098,
+      "prob_to75": 49.18,
+      "prob_to90": 67.93,
+      "signal_model": "45_plus"
+    },
+    "1540273": {
+      "signal_score_home": 0,
+      "signal_score_away": 0,
+      "signal_minute": 49,
+      "message_id": 1525,
+      "chat_id": -1002204373098,
+      "prob_to75": 59.42,
+      "prob_to90": 77.21,
+      "signal_model": "45_plus"
+    },
+    "1400235": {
+      "signal_score_home": 0,
+      "signal_score_away": 0,
+      "signal_minute": 49,
+      "message_id": 1526,
+      "chat_id": -1002204373098,
+      "prob_to75": 53.7,
+      "prob_to90": 71.72,
+      "signal_model": "45_plus"
+    },
+    "1537089": {
+      "signal_score_home": 1,
+      "signal_score_away": 1,
+      "signal_minute": 46,
+      "message_id": 1527,
+      "chat_id": -1002204373098,
+      "prob_to75": 59.82,
+      "prob_to90": 79.91,
+      "signal_model": "45_plus"
+    },
+    "1387929": {
+      "signal_score_home": 2,
+      "signal_score_away": 0,
+      "signal_minute": 46,
+      "message_id": 1528,
+      "chat_id": -1002204373098,
+      "prob_to75": 61.49,
+      "prob_to90": 81.35,
+      "signal_model": "45_plus"
+    },
+    "1391141": {
+      "signal_score_home": 2,
+      "signal_score_away": 2,
+      "signal_minute": 46,
+      "message_id": 1529,
+      "chat_id": -1002204373098,
+      "prob_to75": 62.31,
+      "prob_to90": 82.04,
+      "signal_model": "45_plus"
+    }
+  },
+  "monitored_matches": [
+    1391141
+  ],
+  "match_initial_score": {
+    "1536947": [
+      0,
+      1
+    ],
+    "1531245": [
+      2,
+      1
+    ],
+    "1531246": [
+      0,
+      1
+    ],
+    "1540273": [
+      0,
+      0
+    ],
+    "1400235": [
+      0,
+      0
+    ],
+    "1537089": [
+      1,
+      1
+    ],
+    "1387929": [
+      2,
+      0
+    ],
+    "1391141": [
+      2,
+      2
+    ]
+  },
+  "match_initial_minute": {
+    "1536947": 48,
+    "1531245": 46,
+    "1531246": 48,
+    "1540273": 49,
+    "1400235": 49,
+    "1537089": 46,
+    "1387929": 46,
+    "1391141": 46
+  },
+  "match_prob_status": {
+    "1536947": 0.0,
+    "1531245": 0.0,
+    "1531246": 0.0,
+    "1540273": 0.0,
+    "1400235": 0.0,
+    "1537089": 0.0,
+    "1387929": 0.0,
+    "1391141": 0.0
+  },
+  "match_goal_status": {
+    "1536947": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": "✅ Финальный счёт: 1 - 1",
+      "cancellations": [],
+      "score": [
+        1,
+        1
+      ],
+      "processed_ids": [],
+      "finalized": true,
+      "last_reported_minute": null,
+      "last_pressure_index": 41.6
+    },
+    "1531245": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": "✅ Финальный счёт: 3 - 1",
+      "cancellations": [],
+      "score": [
+        3,
+        1
+      ],
+      "processed_ids": [],
+      "finalized": true,
+      "last_reported_minute": null,
+      "last_pressure_index": 26.16
+    },
+    "1531246": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": "✅ Финальный счёт: 0 - 2",
+      "cancellations": [],
+      "score": [
+        0,
+        2
+      ],
+      "processed_ids": [],
+      "finalized": true,
+      "last_reported_minute": null,
+      "last_pressure_index": 26.34
+    },
+    "1540273": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": "❌ Финальный счёт: 0 - 0",
+      "cancellations": [],
+      "score": [
+        0,
+        0
+      ],
+      "processed_ids": [],
+      "finalized": true,
+      "last_reported_minute": null,
+      "last_pressure_index": 24.3
+    },
+    "1400235": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": "❌ Финальный счёт: 0 - 0",
+      "cancellations": [],
+      "score": [
+        0,
+        0
+      ],
+      "processed_ids": [],
+      "finalized": true,
+      "last_reported_minute": null,
+      "last_pressure_index": 23.5
+    },
+    "1537089": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": "✅ Финальный счёт: 2 - 1",
+      "cancellations": [],
+      "score": [
+        2,
+        1
+      ],
+      "processed_ids": [],
+      "finalized": true,
+      "last_reported_minute": null,
+      "last_pressure_index": 24.68
+    },
+    "1387929": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": "✅ Финальный счёт: 3 - 0",
+      "cancellations": [],
+      "score": [
+        3,
+        0
+      ],
+      "processed_ids": [],
+      "finalized": true,
+      "last_reported_minute": null,
+      "last_pressure_index": 35.96
+    },
+    "1391141": {
+      "valid_goals_after_send": false,
+      "last_goal_time": null,
+      "persistent_goal_line": null,
+      "final_line": null,
+      "cancellations": [],
+      "score": [
+        3,
+        2
+      ],
+      "processed_ids": [],
+      "finalized": false,
+      "last_reported_minute": 90,
+      "last_pressure_index": 36.32
+    }
+  },
+  "match_processed_event_ids": {
+    "1536947": [],
+    "1531245": [],
+    "1531246": [],
+    "1540273": [],
+    "1400235": [],
+    "1537089": [],
+    "1387929": [],
+    "1391141": []
+  },
+  "match_sent_at": {
+    "1536947": 1776800212.378592,
+    "1531245": 1776879259.1453443,
+    "1531246": 1776879399.408002,
+    "1540273": 1776879597.6005282,
+    "1400235": 1776880636.2175446,
+    "1537089": 1776880980.3564563,
+    "1387929": 1776881118.4972618,
+    "1391141": 1776881570.0804687
+  },
+  "excluded_matches": [
+    1536947,
+    1531245,
+    1531246,
+    1540273,
+    1400235,
+    1387929,
+    1537089
+  ],
+  "ignored_matches": [],
+  "daily_stats": {},
+  "match_goals_after_signal": {
+    "1536947": [
+      86
+    ],
+    "1531245": [
+      76
+    ],
+    "1387929": [
+      50
+    ],
+    "1531246": [
+      82
+    ],
+    "1537089": [
+      62
+    ],
+    "1391141": [
+      75
+    ]
+  },
+  "labeled_matches": [],
+  "gsheets_rows": {},
+  "user_rate_limit": {},
+  "no_stats_fixtures": {
+    "1508886": {
+      "ts": 1776759249.0695884,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776780849.0695884
+    },
+    "1453110": {
+      "ts": 1776762347.5537496,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776783947.5537496
+    },
+    "1483321": {
+      "ts": 1776765141.7455492,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776786741.7455492
+    },
+    "1483313": {
+      "ts": 1776765693.1255658,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776787293.1255658
+    },
+    "1498028": {
+      "ts": 1776769578.6681044,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776791178.6681044
+    },
+    "1498100": {
+      "ts": 1776769645.2796755,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776791245.2796755
+    },
+    "1538147": {
+      "ts": 1776771528.2607753,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776793128.2607753
+    },
+    "1506944": {
+      "ts": 1776771596.4788916,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776793196.4788916
+    },
+    "1506945": {
+      "ts": 1776771603.795963,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776793203.795963
+    },
+    "1506946": {
+      "ts": 1776771793.7504792,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776793393.7504792
+    },
+    "1509718": {
+      "ts": 1776773335.7442875,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776794935.7442875
+    },
+    "1490644": {
+      "ts": 1776773472.233925,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776795072.233925
+    },
+    "1531032": {
+      "ts": 1776774899.2413235,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776796499.2413235
+    },
+    "1530957": {
+      "ts": 1776775163.7748153,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776796763.7748153
+    },
+    "1486204": {
+      "ts": 1776776667.1950433,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776798267.1950433
+    },
+    "1533837": {
+      "ts": 1776776743.4547634,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776798343.4547634
+    },
+    "1433971": {
+      "ts": 1776776812.1175945,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776798412.1175945
+    },
+    "1538148": {
+      "ts": 1776778558.0353837,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776800158.0353837
+    },
+    "1539684": {
+      "ts": 1776778808.574047,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776800408.574047
+    },
+    "1446402": {
+      "ts": 1776780153.0820658,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776801753.0820658
+    },
+    "1516302": {
+      "ts": 1776780160.2973096,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776801760.2973096
+    },
+    "1541822": {
+      "ts": 1776780167.404501,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776801767.404501
+    },
+    "1446403": {
+      "ts": 1776780235.9969037,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776801835.9969037
+    },
+    "1446404": {
+      "ts": 1776780244.1547563,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776801844.1547563
+    },
+    "1516304": {
+      "ts": 1776780251.7659044,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776801851.7659044
+    },
+    "1516305": {
+      "ts": 1776780258.696022,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776801858.696022
+    },
+    "1516306": {
+      "ts": 1776780265.1858459,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776801865.1858459
+    },
+    "1531034": {
+      "ts": 1776780272.112419,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776801872.112419
+    },
+    "1498027": {
+      "ts": 1776780340.400478,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776801940.400478
+    },
+    "1516303": {
+      "ts": 1776780347.0391436,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776801947.0391436
+    },
+    "1540631": {
+      "ts": 1776780354.3950956,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776801954.3950956
+    },
+    "1508323": {
+      "ts": 1776780422.7255194,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776802022.7255194
+    },
+    "1540884": {
+      "ts": 1776780794.766727,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776802394.766727
+    },
+    "1434160": {
+      "ts": 1776781713.1405709,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776803313.1405709
+    },
+    "1508705": {
+      "ts": 1776783616.8193593,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776805216.8193593
+    },
+    "1508706": {
+      "ts": 1776783803.9327788,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776805403.9327788
+    },
+    "1508707": {
+      "ts": 1776783870.442115,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776805470.442115
+    },
+    "1539686": {
+      "ts": 1776783944.2329266,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776805544.2329266
+    },
+    "1498099": {
+      "ts": 1776784010.7733042,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776805610.7733042
+    },
+    "1498101": {
+      "ts": 1776784017.4059105,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776805617.4059105
+    },
+    "1508708": {
+      "ts": 1776784023.7868977,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776805623.7868977
+    },
+    "1539895": {
+      "ts": 1776784032.000002,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776805632.000002
+    },
+    "1498098": {
+      "ts": 1776784103.423494,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776805703.423494
+    },
+    "1539896": {
+      "ts": 1776784111.2100134,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776805711.2100134
+    },
+    "1437779": {
+      "ts": 1776784179.7335062,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776805779.7335062
+    },
+    "1540576": {
+      "ts": 1776784519.9811182,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776806119.9811182
+    },
+    "1394940": {
+      "ts": 1776785580.6489859,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776807180.6489859
+    },
+    "1540581": {
+      "ts": 1776785896.4557488,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776807496.4557488
+    },
+    "1515809": {
+      "ts": 1776787271.2832873,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776808871.2832873
+    },
+    "1509094": {
+      "ts": 1776787397.8238547,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776808997.8238547
+    },
+    "1539127": {
+      "ts": 1776787585.6080081,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809185.6080081
+    },
+    "1530099": {
+      "ts": 1776787651.508204,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776809251.508204
+    },
+    "1539120": {
+      "ts": 1776787657.5043252,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776809257.5043252
+    },
+    "1539121": {
+      "ts": 1776787666.7142322,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809266.7142322
+    },
+    "1539123": {
+      "ts": 1776787672.7302134,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809272.7302134
+    },
+    "1539126": {
+      "ts": 1776787678.735234,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809278.735234
+    },
+    "1535366": {
+      "ts": 1776787745.012106,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809345.012106
+    },
+    "1539122": {
+      "ts": 1776787750.8911805,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809350.8911805
+    },
+    "1513390": {
+      "ts": 1776787817.5092726,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809417.5092726
+    },
+    "1533841": {
+      "ts": 1776787823.9471836,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776809423.9471836
+    },
+    "1498241": {
+      "ts": 1776787889.8865082,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809489.8865082
+    },
+    "1486203": {
+      "ts": 1776787955.6928308,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809555.6928308
+    },
+    "1498243": {
+      "ts": 1776787961.57592,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809561.57592
+    },
+    "1539131": {
+      "ts": 1776787967.4733167,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809567.4733167
+    },
+    "1498244": {
+      "ts": 1776788034.0412853,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809634.0412853
+    },
+    "1539128": {
+      "ts": 1776788343.1336987,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776809943.1336987
+    },
+    "1504206": {
+      "ts": 1776789344.45133,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776810944.45133
+    },
+    "1513529": {
+      "ts": 1776790197.812462,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776811797.812462
+    },
+    "1499078": {
+      "ts": 1776791052.5152187,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776812652.5152187
+    },
+    "1389082": {
+      "ts": 1776791118.413251,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776812718.413251
+    },
+    "1538244": {
+      "ts": 1776791123.9070187,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776812723.9070187
+    },
+    "1408631": {
+      "ts": 1776791191.0361679,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776812791.0361679
+    },
+    "1541829": {
+      "ts": 1776791196.4324083,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776812796.4324083
+    },
+    "1486159": {
+      "ts": 1776791262.3906205,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776812862.3906205
+    },
+    "1525433": {
+      "ts": 1776791267.6799912,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776812867.6799912
+    },
+    "1409136": {
+      "ts": 1776791334.0940702,
+      "reason": "coverage=0.00 at minute=56",
+      "expires_ts": 1776812934.0940702
+    },
+    "1409098": {
+      "ts": 1776791401.177416,
+      "reason": "coverage=0.00 at minute=52",
+      "expires_ts": 1776813001.177416
+    },
+    "1409133": {
+      "ts": 1776791407.9757226,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776813007.9757226
+    },
+    "1499079": {
+      "ts": 1776791413.5177777,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776813013.5177777
+    },
+    "1499080": {
+      "ts": 1776791600.5630963,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776813200.5630963
+    },
+    "1409137": {
+      "ts": 1776791728.3003757,
+      "reason": "coverage=0.00 at minute=49",
+      "expires_ts": 1776813328.3003757
+    },
+    "1409591": {
+      "ts": 1776791976.5755079,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776813576.5755079
+    },
+    "1409588": {
+      "ts": 1776792042.8328302,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776813642.8328302
+    },
+    "1499081": {
+      "ts": 1776792169.3954787,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776813769.3954787
+    },
+    "1530103": {
+      "ts": 1776793019.6988316,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776814619.6988316
+    },
+    "1540504": {
+      "ts": 1776793231.2078352,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776814831.2078352
+    },
+    "1408626": {
+      "ts": 1776793297.3868306,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776814897.3868306
+    },
+    "1497307": {
+      "ts": 1776794302.330311,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776815902.330311
+    },
+    "1515810": {
+      "ts": 1776794510.8764467,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816110.8764467
+    },
+    "1541843": {
+      "ts": 1776794516.5087945,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816116.5087945
+    },
+    "1408628": {
+      "ts": 1776794585.810737,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816185.810737
+    },
+    "1408630": {
+      "ts": 1776794591.3991077,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816191.3991077
+    },
+    "1538245": {
+      "ts": 1776794597.0988822,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816197.0988822
+    },
+    "1408629": {
+      "ts": 1776794667.292092,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816267.292092
+    },
+    "1497533": {
+      "ts": 1776794672.724027,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816272.724027
+    },
+    "1516307": {
+      "ts": 1776794678.6547275,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816278.6547275
+    },
+    "1408624": {
+      "ts": 1776794752.5672448,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816352.5672448
+    },
+    "1408625": {
+      "ts": 1776794757.9409723,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816357.9409723
+    },
+    "1408627": {
+      "ts": 1776794764.0765421,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816364.0765421
+    },
+    "1408930": {
+      "ts": 1776794770.4308991,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816370.4308991
+    },
+    "1408931": {
+      "ts": 1776794775.8308973,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816375.8308973
+    },
+    "1408936": {
+      "ts": 1776794781.2800634,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816381.2800634
+    },
+    "1408937": {
+      "ts": 1776794786.6562579,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816386.6562579
+    },
+    "1408632": {
+      "ts": 1776794859.9248917,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816459.9248917
+    },
+    "1408933": {
+      "ts": 1776794865.2493205,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816465.2493205
+    },
+    "1409585": {
+      "ts": 1776794870.9915755,
+      "reason": "coverage=0.00 at minute=49",
+      "expires_ts": 1776816470.9915755
+    },
+    "1498026": {
+      "ts": 1776794876.8508534,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816476.8508534
+    },
+    "1509097": {
+      "ts": 1776794882.8484375,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816482.8484375
+    },
+    "1541831": {
+      "ts": 1776794888.088207,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776816488.088207
+    },
+    "1408929": {
+      "ts": 1776795025.6774173,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776816625.6774173
+    },
+    "1412143": {
+      "ts": 1776795100.4625978,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776816700.4625978
+    },
+    "1531970": {
+      "ts": 1776796546.1073062,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776818146.1073062
+    },
+    "1512341": {
+      "ts": 1776798189.8618345,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776819789.8618345
+    },
+    "1538246": {
+      "ts": 1776798197.1076837,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776819797.1076837
+    },
+    "1530104": {
+      "ts": 1776798264.6016731,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776819864.6016731
+    },
+    "1512343": {
+      "ts": 1776798331.5848882,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776819931.5848882
+    },
+    "1533842": {
+      "ts": 1776798398.1873436,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776819998.1873436
+    },
+    "1526091": {
+      "ts": 1776798525.602691,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776820125.602691
+    },
+    "1541945": {
+      "ts": 1776798654.1655092,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776820254.1655092
+    },
+    "1389083": {
+      "ts": 1776800202.687524,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776821802.687524
+    },
+    "1428489": {
+      "ts": 1776800855.0783997,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776822455.0783997
+    },
+    "1402275": {
+      "ts": 1776800973.0073721,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776822573.0073721
+    },
+    "1383031": {
+      "ts": 1776801045.967121,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776822645.967121
+    },
+    "1399883": {
+      "ts": 1776801105.2745657,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776822705.2745657
+    },
+    "1402529": {
+      "ts": 1776801217.3942585,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776822817.3942585
+    },
+    "1428759": {
+      "ts": 1776801223.4664297,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776822823.4664297
+    },
+    "1538341": {
+      "ts": 1776801994.4952078,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776823594.4952078
+    },
+    "1522370": {
+      "ts": 1776802073.1357152,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776823673.1357152
+    },
+    "1408263": {
+      "ts": 1776878501.2955375,
+      "reason": "coverage=0.00 at minute=58",
+      "expires_ts": 1776900101.2955375
+    },
+    "1498248": {
+      "ts": 1776878506.6826637,
+      "reason": "coverage=0.00 at minute=54",
+      "expires_ts": 1776900106.6826637
+    },
+    "1528508": {
+      "ts": 1776878516.4773514,
+      "reason": "coverage=0.00 at minute=60",
+      "expires_ts": 1776900116.4773514
+    },
+    "1530098": {
+      "ts": 1776878522.1102374,
+      "reason": "coverage=0.00 at minute=57",
+      "expires_ts": 1776900122.1102374
+    },
+    "1538826": {
+      "ts": 1776878528.4784489,
+      "reason": "coverage=0.00 at minute=59",
+      "expires_ts": 1776900128.4784489
+    },
+    "1541869": {
+      "ts": 1776878533.9190269,
+      "reason": "coverage=0.00 at minute=56",
+      "expires_ts": 1776900133.9190269
+    },
+    "1409382": {
+      "ts": 1776878724.2442415,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776900324.2442415
+    },
+    "1499083": {
+      "ts": 1776879055.5519402,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776900655.5519402
+    },
+    "1540797": {
+      "ts": 1776879181.9988859,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776900781.9988859
+    },
+    "1540812": {
+      "ts": 1776879187.7669728,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776900787.7669728
+    },
+    "1461567": {
+      "ts": 1776879253.6794474,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776900853.6794474
+    },
+    "1540507": {
+      "ts": 1776879330.3891134,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776900930.3891134
+    },
+    "1499082": {
+      "ts": 1776879396.1482165,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776900996.1482165
+    },
+    "1540509": {
+      "ts": 1776879404.6341007,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776901004.6341007
+    },
+    "1540508": {
+      "ts": 1776879724.2658129,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776901324.2658129
+    },
+    "1421642": {
+      "ts": 1776880032.704527,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776901632.704527
+    },
+    "1421641": {
+      "ts": 1776880220.1736667,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776901820.1736667
+    },
+    "1453271": {
+      "ts": 1776880351.779273,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776901951.779273
+    },
+    "1421639": {
+      "ts": 1776880425.647415,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902025.647415
+    },
+    "1421643": {
+      "ts": 1776880431.2382538,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776902031.2382538
+    },
+    "1421640": {
+      "ts": 1776880502.1057854,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776902102.1057854
+    },
+    "1461563": {
+      "ts": 1776880962.7900057,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776902562.7900057
+    },
+    "1507129": {
+      "ts": 1776880974.8602686,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902574.8602686
+    },
+    "1408934": {
+      "ts": 1776881126.8672047,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776902726.8672047
+    },
+    "1509093": {
+      "ts": 1776881143.0236123,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902743.0236123
+    },
+    "1512332": {
+      "ts": 1776881148.5857706,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902748.5857706
+    },
+    "1397261": {
+      "ts": 1776881215.1618376,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776902815.1618376
+    },
+    "1407916": {
+      "ts": 1776881227.5385344,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902827.5385344
+    },
+    "1408115": {
+      "ts": 1776881233.649927,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776902833.649927
+    },
+    "1408257": {
+      "ts": 1776881242.29456,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902842.29456
+    },
+    "1516918": {
+      "ts": 1776881261.2531683,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902861.2531683
+    },
+    "1408256": {
+      "ts": 1776881331.342379,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776902931.342379
+    },
+    "1531966": {
+      "ts": 1776881503.731221,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776903103.731221
+    },
+    "1535367": {
+      "ts": 1776881670.3247764,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776903270.3247764
+    },
+    "1408935": {
+      "ts": 1776881819.727719,
+      "reason": "coverage=0.00 at minute=55",
+      "expires_ts": 1776903419.727719
+    },
+    "1540268": {
+      "ts": 1776881839.13058,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776903439.13058
+    },
+    "1408932": {
+      "ts": 1776882128.334838,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776903728.334838
+    },
+    "1491419": {
+      "ts": 1776882831.79823,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776904431.79823
+    },
+    "1491423": {
+      "ts": 1776882838.0008855,
+      "reason": "coverage=0.00 at minute=46",
+      "expires_ts": 1776904438.0008855
+    },
+    "1409952": {
+      "ts": 1776882971.335076,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776904571.335076
+    },
+    "1531969": {
+      "ts": 1776883044.4226916,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776904644.4226916
+    },
+    "1409285": {
+      "ts": 1776883111.9645462,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776904711.9645462
+    },
+    "1409395": {
+      "ts": 1776883118.65574,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776904718.65574
+    },
+    "1412053": {
+      "ts": 1776883125.3104832,
+      "reason": "coverage=0.00 at minute=49",
+      "expires_ts": 1776904725.3104832
+    },
+    "1412115": {
+      "ts": 1776883132.3892007,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776904732.3892007
+    },
+    "1407055": {
+      "ts": 1776883205.824112,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776904805.824112
+    },
+    "1412090": {
+      "ts": 1776883278.666158,
+      "reason": "coverage=0.00 at minute=48",
+      "expires_ts": 1776904878.666158
+    },
+    "1407976": {
+      "ts": 1776883478.4206855,
+      "reason": "coverage=0.00 at minute=47",
+      "expires_ts": 1776905078.4206855
+    }
+  },
+  "no_stats_blocked": {
+    "1508886": {
+      "ts": 1776759249.0693583,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776780849.0693583
+    },
+    "1453110": {
+      "ts": 1776762347.553505,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776783947.553505
+    },
+    "1483321": {
+      "ts": 1776765141.745332,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776786741.745332
+    },
+    "1483313": {
+      "ts": 1776765693.1253033,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776787293.1253033
+    },
+    "1498028": {
+      "ts": 1776769578.667863,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776791178.667863
+    },
+    "1498100": {
+      "ts": 1776769645.2794309,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776791245.2794309
+    },
+    "1538147": {
+      "ts": 1776771528.2602494,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776793128.2602494
+    },
+    "1506944": {
+      "ts": 1776771596.4786723,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776793196.4786723
+    },
+    "1506945": {
+      "ts": 1776771603.7957149,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776793203.7957149
+    },
+    "1506946": {
+      "ts": 1776771793.7502568,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776793393.7502568
+    },
+    "1509718": {
+      "ts": 1776773335.7440243,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776794935.7440243
+    },
+    "1490644": {
+      "ts": 1776773472.2336943,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776795072.2336943
+    },
+    "1531032": {
+      "ts": 1776774899.2409658,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776796499.2409658
+    },
+    "1530957": {
+      "ts": 1776775163.7745807,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776796763.7745807
+    },
+    "1486204": {
+      "ts": 1776776667.1945307,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776798267.1945307
+    },
+    "1533837": {
+      "ts": 1776776743.4545064,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776798343.4545064
+    },
+    "1433971": {
+      "ts": 1776776812.1173549,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776798412.1173549
+    },
+    "1538148": {
+      "ts": 1776778558.0351598,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776800158.0351598
+    },
+    "1539684": {
+      "ts": 1776778808.5738015,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776800408.5738015
+    },
+    "1446402": {
+      "ts": 1776780153.0818694,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801753.0818694
+    },
+    "1516302": {
+      "ts": 1776780160.2971315,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801760.2971315
+    },
+    "1541822": {
+      "ts": 1776780167.4043124,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801767.4043124
+    },
+    "1446403": {
+      "ts": 1776780235.9966376,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801835.9966376
+    },
+    "1446404": {
+      "ts": 1776780244.1544957,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801844.1544957
+    },
+    "1516304": {
+      "ts": 1776780251.765663,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801851.765663
+    },
+    "1516305": {
+      "ts": 1776780258.6958067,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801858.6958067
+    },
+    "1516306": {
+      "ts": 1776780265.1855974,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801865.1855974
+    },
+    "1531034": {
+      "ts": 1776780272.1121912,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801872.1121912
+    },
+    "1498027": {
+      "ts": 1776780340.4002647,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801940.4002647
+    },
+    "1516303": {
+      "ts": 1776780347.038673,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801947.038673
+    },
+    "1540631": {
+      "ts": 1776780354.3948655,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776801954.3948655
+    },
+    "1508323": {
+      "ts": 1776780422.7253203,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776802022.7253203
+    },
+    "1540884": {
+      "ts": 1776780794.7663481,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776802394.7663481
+    },
+    "1434160": {
+      "ts": 1776781713.1403244,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776803313.1403244
+    },
+    "1508705": {
+      "ts": 1776783616.8191712,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805216.8191712
+    },
+    "1508706": {
+      "ts": 1776783803.932585,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805403.932585
+    },
+    "1508707": {
+      "ts": 1776783870.441845,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805470.441845
+    },
+    "1539686": {
+      "ts": 1776783944.2327898,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805544.2327898
+    },
+    "1498099": {
+      "ts": 1776784010.7731154,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805610.7731154
+    },
+    "1498101": {
+      "ts": 1776784017.40573,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805617.40573
+    },
+    "1508708": {
+      "ts": 1776784023.7867393,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805623.7867393
+    },
+    "1539895": {
+      "ts": 1776784031.9996948,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805631.9996948
+    },
+    "1498098": {
+      "ts": 1776784103.4232378,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805703.4232378
+    },
+    "1539896": {
+      "ts": 1776784111.2098372,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805711.2098372
+    },
+    "1437779": {
+      "ts": 1776784179.7333274,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776805779.7333274
+    },
+    "1540576": {
+      "ts": 1776784519.9809384,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776806119.9809384
+    },
+    "1394940": {
+      "ts": 1776785580.6488118,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776807180.6488118
+    },
+    "1540581": {
+      "ts": 1776785896.4555695,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776807496.4555695
+    },
+    "1515809": {
+      "ts": 1776787271.283052,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776808871.283052
+    },
+    "1509094": {
+      "ts": 1776787397.8236618,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776808997.8236618
+    },
+    "1539127": {
+      "ts": 1776787585.60783,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809185.60783
+    },
+    "1530099": {
+      "ts": 1776787651.5079947,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809251.5079947
+    },
+    "1539120": {
+      "ts": 1776787657.5039227,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809257.5039227
+    },
+    "1539121": {
+      "ts": 1776787666.7140436,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809266.7140436
+    },
+    "1539123": {
+      "ts": 1776787672.7300606,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809272.7300606
+    },
+    "1539126": {
+      "ts": 1776787678.734993,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809278.734993
+    },
+    "1535366": {
+      "ts": 1776787745.0118847,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809345.0118847
+    },
+    "1539122": {
+      "ts": 1776787750.8909523,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809350.8909523
+    },
+    "1513390": {
+      "ts": 1776787817.5090365,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809417.5090365
+    },
+    "1533841": {
+      "ts": 1776787823.9469476,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809423.9469476
+    },
+    "1498241": {
+      "ts": 1776787889.886276,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809489.886276
+    },
+    "1486203": {
+      "ts": 1776787955.6926713,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809555.6926713
+    },
+    "1498243": {
+      "ts": 1776787961.5756981,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809561.5756981
+    },
+    "1539131": {
+      "ts": 1776787967.4729292,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809567.4729292
+    },
+    "1498244": {
+      "ts": 1776788034.0410628,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809634.0410628
+    },
+    "1539128": {
+      "ts": 1776788343.133465,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776809943.133465
+    },
+    "1504206": {
+      "ts": 1776789344.451112,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776810944.451112
+    },
+    "1513529": {
+      "ts": 1776790197.8122025,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776811797.8122025
+    },
+    "1499078": {
+      "ts": 1776791052.515057,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812652.515057
+    },
+    "1389082": {
+      "ts": 1776791118.4130764,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812718.4130764
+    },
+    "1538244": {
+      "ts": 1776791123.9067705,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812723.9067705
+    },
+    "1408631": {
+      "ts": 1776791191.0359204,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812791.0359204
+    },
+    "1541829": {
+      "ts": 1776791196.4322035,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812796.4322035
+    },
+    "1486159": {
+      "ts": 1776791262.3903918,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812862.3903918
+    },
+    "1525433": {
+      "ts": 1776791267.6797476,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812867.6797476
+    },
+    "1409136": {
+      "ts": 1776791334.0935707,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776812934.0935707
+    },
+    "1409098": {
+      "ts": 1776791401.1771913,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813001.1771913
+    },
+    "1409133": {
+      "ts": 1776791407.975466,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813007.975466
+    },
+    "1499079": {
+      "ts": 1776791413.5175004,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813013.5175004
+    },
+    "1499080": {
+      "ts": 1776791600.5623565,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813200.5623565
+    },
+    "1409137": {
+      "ts": 1776791728.300058,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813328.300058
+    },
+    "1409591": {
+      "ts": 1776791976.575151,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813576.575151
+    },
+    "1409588": {
+      "ts": 1776792042.8326085,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813642.8326085
+    },
+    "1499081": {
+      "ts": 1776792169.3952448,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776813769.3952448
+    },
+    "1530103": {
+      "ts": 1776793019.6986115,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776814619.6986115
+    },
+    "1540504": {
+      "ts": 1776793231.2076404,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776814831.2076404
+    },
+    "1408626": {
+      "ts": 1776793297.3866224,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776814897.3866224
+    },
+    "1497307": {
+      "ts": 1776794302.3301022,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776815902.3301022
+    },
+    "1515810": {
+      "ts": 1776794510.876236,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816110.876236
+    },
+    "1541843": {
+      "ts": 1776794516.5086045,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816116.5086045
+    },
+    "1408628": {
+      "ts": 1776794585.8105521,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816185.8105521
+    },
+    "1408630": {
+      "ts": 1776794591.3989127,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816191.3989127
+    },
+    "1538245": {
+      "ts": 1776794597.098703,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816197.098703
+    },
+    "1408629": {
+      "ts": 1776794667.2918227,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816267.2918227
+    },
+    "1497533": {
+      "ts": 1776794672.723716,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816272.723716
+    },
+    "1516307": {
+      "ts": 1776794678.6545339,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816278.6545339
+    },
+    "1408624": {
+      "ts": 1776794752.5669742,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816352.5669742
+    },
+    "1408625": {
+      "ts": 1776794757.9406462,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816357.9406462
+    },
+    "1408627": {
+      "ts": 1776794764.0763636,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816364.0763636
+    },
+    "1408930": {
+      "ts": 1776794770.4307094,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816370.4307094
+    },
+    "1408931": {
+      "ts": 1776794775.8307183,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816375.8307183
+    },
+    "1408936": {
+      "ts": 1776794781.2798595,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816381.2798595
+    },
+    "1408937": {
+      "ts": 1776794786.656106,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816386.656106
+    },
+    "1408632": {
+      "ts": 1776794859.9244952,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816459.9244952
+    },
+    "1408933": {
+      "ts": 1776794865.2491255,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816465.2491255
+    },
+    "1409585": {
+      "ts": 1776794870.9913723,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816470.9913723
+    },
+    "1498026": {
+      "ts": 1776794876.8506045,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816476.8506045
+    },
+    "1509097": {
+      "ts": 1776794882.8481987,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816482.8481987
+    },
+    "1541831": {
+      "ts": 1776794888.0880036,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816488.0880036
+    },
+    "1408929": {
+      "ts": 1776795025.6772256,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816625.6772256
+    },
+    "1412143": {
+      "ts": 1776795100.462404,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776816700.462404
+    },
+    "1531970": {
+      "ts": 1776796546.106796,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776818146.106796
+    },
+    "1512341": {
+      "ts": 1776798189.861419,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776819789.861419
+    },
+    "1538246": {
+      "ts": 1776798197.1069252,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776819797.1069252
+    },
+    "1530104": {
+      "ts": 1776798264.6010323,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776819864.6010323
+    },
+    "1512343": {
+      "ts": 1776798331.584687,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776819931.584687
+    },
+    "1533842": {
+      "ts": 1776798398.1871376,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776819998.1871376
+    },
+    "1526091": {
+      "ts": 1776798525.6025105,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776820125.6025105
+    },
+    "1541945": {
+      "ts": 1776798654.1652997,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776820254.1652997
+    },
+    "1389083": {
+      "ts": 1776800202.687062,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776821802.687062
+    },
+    "1428489": {
+      "ts": 1776800855.078124,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776822455.078124
+    },
+    "1402275": {
+      "ts": 1776800973.007183,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776822573.007183
+    },
+    "1383031": {
+      "ts": 1776801045.966874,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776822645.966874
+    },
+    "1399883": {
+      "ts": 1776801105.274321,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776822705.274321
+    },
+    "1402529": {
+      "ts": 1776801217.393503,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776822817.393503
+    },
+    "1428759": {
+      "ts": 1776801223.4662614,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776822823.4662614
+    },
+    "1538341": {
+      "ts": 1776801994.494863,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776823594.494863
+    },
+    "1522370": {
+      "ts": 1776802073.1354802,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776823673.1354802
+    },
+    "1408263": {
+      "ts": 1776878501.2952595,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900101.2952595
+    },
+    "1498248": {
+      "ts": 1776878506.6823761,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900106.6823761
+    },
+    "1528508": {
+      "ts": 1776878516.4770725,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900116.4770725
+    },
+    "1530098": {
+      "ts": 1776878522.1099782,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900122.1099782
+    },
+    "1538826": {
+      "ts": 1776878528.4781854,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900128.4781854
+    },
+    "1541869": {
+      "ts": 1776878533.9188185,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900133.9188185
+    },
+    "1409382": {
+      "ts": 1776878724.2439957,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900324.2439957
+    },
+    "1499083": {
+      "ts": 1776879055.551724,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900655.551724
+    },
+    "1540797": {
+      "ts": 1776879181.9986727,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900781.9986727
+    },
+    "1540812": {
+      "ts": 1776879187.766584,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900787.766584
+    },
+    "1461567": {
+      "ts": 1776879253.679235,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900853.679235
+    },
+    "1540507": {
+      "ts": 1776879330.3885002,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900930.3885002
+    },
+    "1499082": {
+      "ts": 1776879396.1478431,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776900996.1478431
+    },
+    "1540509": {
+      "ts": 1776879404.6334841,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776901004.6334841
+    },
+    "1540508": {
+      "ts": 1776879724.2651544,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776901324.2651544
+    },
+    "1421642": {
+      "ts": 1776880032.7042313,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776901632.7042313
+    },
+    "1421641": {
+      "ts": 1776880220.173279,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776901820.173279
+    },
+    "1453271": {
+      "ts": 1776880351.7790914,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776901951.7790914
+    },
+    "1421639": {
+      "ts": 1776880425.6467752,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902025.6467752
+    },
+    "1421643": {
+      "ts": 1776880431.237993,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902031.237993
+    },
+    "1421640": {
+      "ts": 1776880502.1055355,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902102.1055355
+    },
+    "1461563": {
+      "ts": 1776880962.789825,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902562.789825
+    },
+    "1507129": {
+      "ts": 1776880974.8600416,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902574.8600416
+    },
+    "1408934": {
+      "ts": 1776881126.8668165,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902726.8668165
+    },
+    "1509093": {
+      "ts": 1776881143.0232737,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902743.0232737
+    },
+    "1512332": {
+      "ts": 1776881148.5854523,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902748.5854523
+    },
+    "1397261": {
+      "ts": 1776881215.1616542,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902815.1616542
+    },
+    "1407916": {
+      "ts": 1776881227.5381923,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902827.5381923
+    },
+    "1408115": {
+      "ts": 1776881233.6497335,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902833.6497335
+    },
+    "1408257": {
+      "ts": 1776881242.2943482,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902842.2943482
+    },
+    "1516918": {
+      "ts": 1776881261.2528841,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902861.2528841
+    },
+    "1408256": {
+      "ts": 1776881331.3421524,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776902931.3421524
+    },
+    "1531966": {
+      "ts": 1776881503.7310166,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776903103.7310166
+    },
+    "1535367": {
+      "ts": 1776881670.3238459,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776903270.3238459
+    },
+    "1408935": {
+      "ts": 1776881819.7275033,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776903419.7275033
+    },
+    "1540268": {
+      "ts": 1776881839.1303053,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776903439.1303053
+    },
+    "1408932": {
+      "ts": 1776882128.3346274,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776903728.3346274
+    },
+    "1491419": {
+      "ts": 1776882831.7980156,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904431.7980156
+    },
+    "1491423": {
+      "ts": 1776882838.0007021,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904438.0007021
+    },
+    "1409952": {
+      "ts": 1776882971.3348944,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904571.3348944
+    },
+    "1531969": {
+      "ts": 1776883044.422432,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904644.422432
+    },
+    "1409285": {
+      "ts": 1776883111.9642494,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904711.9642494
+    },
+    "1409395": {
+      "ts": 1776883118.6555336,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904718.6555336
+    },
+    "1412053": {
+      "ts": 1776883125.3102646,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904725.3102646
+    },
+    "1412115": {
+      "ts": 1776883132.389037,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904732.389037
+    },
+    "1407055": {
+      "ts": 1776883205.823881,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904805.823881
+    },
+    "1412090": {
+      "ts": 1776883278.6658452,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776904878.6658452
+    },
+    "1407976": {
+      "ts": 1776883478.4204044,
+      "reason": "no statistics in live data",
+      "expires_ts": 1776905078.4204044
+    }
+  },
+  "training_signal_records": {
+    "1536947_48_e3118054ef75": {
+      "signal_id": "1536947_48_e3118054ef75",
+      "fixture_id": 1536947,
+      "timestamp_utc": "2026-04-21T19:36:52.376410+00:00",
+      "date": "2026-04-21",
+      "signal_minute": 48,
+      "signal_score_home": 0,
+      "signal_score_away": 1,
+      "home_team": "Genk",
+      "away_team": "Charleroi",
+      "league_name": "Jupiler Pro League",
+      "prob_next_15_at_signal": 53.77,
+      "prob_second_half_remain_at_signal": 72.36,
+      "lambda_2h_at_signal": 0.0514,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1522,
+      "snapshot_saved": true,
+      "outcome_saved": true,
+      "outcome_saved_utc": "2026-04-22T17:22:41.105401+00:00"
+    },
+    "1531245_46_d3ae00315d1a": {
+      "signal_id": "1531245_46_d3ae00315d1a",
+      "fixture_id": 1531245,
+      "timestamp_utc": "2026-04-22T17:34:19.144181+00:00",
+      "date": "2026-04-22",
+      "signal_minute": 46,
+      "signal_score_home": 2,
+      "signal_score_away": 1,
+      "home_team": "Red Bull Salzburg",
+      "away_team": "Austria Vienna",
+      "league_name": "Bundesliga",
+      "prob_next_15_at_signal": 37.36,
+      "prob_second_half_remain_at_signal": 54.14,
+      "lambda_2h_at_signal": 0.0312,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1523,
+      "snapshot_saved": true,
+      "outcome_saved": true,
+      "outcome_saved_utc": "2026-04-22T18:22:33.340381+00:00"
+    },
+    "1531246_48_fefd9cf760ca": {
+      "signal_id": "1531246_48_fefd9cf760ca",
+      "fixture_id": 1531246,
+      "timestamp_utc": "2026-04-22T17:36:39.406399+00:00",
+      "date": "2026-04-22",
+      "signal_minute": 48,
+      "signal_score_home": 0,
+      "signal_score_away": 1,
+      "home_team": "Rapid Vienna",
+      "away_team": "TSV Hartberg",
+      "league_name": "Bundesliga",
+      "prob_next_15_at_signal": 33.38,
+      "prob_second_half_remain_at_signal": 49.18,
+      "lambda_2h_at_signal": 0.0271,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1524,
+      "snapshot_saved": true,
+      "outcome_saved": true,
+      "outcome_saved_utc": "2026-04-22T18:25:51.069770+00:00"
+    },
+    "1540273_49_37cc7005bf54": {
+      "signal_id": "1540273_49_37cc7005bf54",
+      "fixture_id": 1540273,
+      "timestamp_utc": "2026-04-22T17:39:57.598983+00:00",
+      "date": "2026-04-22",
+      "signal_minute": 49,
+      "signal_score_home": 0,
+      "signal_score_away": 0,
+      "home_team": "OFK Beograd",
+      "away_team": "Cukaricki",
+      "league_name": "Super Liga",
+      "prob_next_15_at_signal": 41.79,
+      "prob_second_half_remain_at_signal": 59.42,
+      "lambda_2h_at_signal": 0.0361,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1525,
+      "snapshot_saved": true,
+      "outcome_saved": true,
+      "outcome_saved_utc": "2026-04-22T18:28:04.263789+00:00"
+    },
+    "1400235_49_4c0e42165abb": {
+      "signal_id": "1400235_49_4c0e42165abb",
+      "fixture_id": 1400235,
+      "timestamp_utc": "2026-04-22T17:57:16.214971+00:00",
+      "date": "2026-04-22",
+      "signal_minute": 49,
+      "signal_score_home": 0,
+      "signal_score_away": 0,
+      "home_team": "Lokomotiv",
+      "away_team": "Zenit",
+      "league_name": "Premier League",
+      "prob_next_15_at_signal": 37.0,
+      "prob_second_half_remain_at_signal": 53.7,
+      "lambda_2h_at_signal": 0.0308,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1526,
+      "snapshot_saved": true,
+      "outcome_saved": true,
+      "outcome_saved_utc": "2026-04-22T18:49:59.218491+00:00"
+    },
+    "1537089_46_7a42a8a89742": {
+      "signal_id": "1537089_46_7a42a8a89742",
+      "fixture_id": 1537089,
+      "timestamp_utc": "2026-04-22T18:03:00.355123+00:00",
+      "date": "2026-04-22",
+      "signal_minute": 46,
+      "signal_score_home": 1,
+      "signal_score_away": 1,
+      "home_team": "Asteras Tripolis",
+      "away_team": "Panetolikos",
+      "league_name": "Super League 1",
+      "prob_next_15_at_signal": 42.14,
+      "prob_second_half_remain_at_signal": 59.82,
+      "lambda_2h_at_signal": 0.0365,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1527,
+      "snapshot_saved": true,
+      "outcome_saved": true,
+      "outcome_saved_utc": "2026-04-22T18:54:19.569921+00:00"
+    },
+    "1387929_46_c7e704e175f7": {
+      "signal_id": "1387929_46_c7e704e175f7",
+      "fixture_id": 1387929,
+      "timestamp_utc": "2026-04-22T18:05:18.495946+00:00",
+      "date": "2026-04-22",
+      "signal_minute": 46,
+      "signal_score_home": 2,
+      "signal_score_away": 0,
+      "home_team": "Paris Saint Germain",
+      "away_team": "Nantes",
+      "league_name": "Ligue 1",
+      "prob_next_15_at_signal": 43.59,
+      "prob_second_half_remain_at_signal": 61.49,
+      "lambda_2h_at_signal": 0.0382,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1528,
+      "snapshot_saved": true,
+      "outcome_saved": true,
+      "outcome_saved_utc": "2026-04-22T18:53:14.552949+00:00"
+    },
+    "1391141_46_97f85c6aaf00": {
+      "signal_id": "1391141_46_97f85c6aaf00",
+      "fixture_id": 1391141,
+      "timestamp_utc": "2026-04-22T18:12:50.077774+00:00",
+      "date": "2026-04-22",
+      "signal_minute": 46,
+      "signal_score_home": 2,
+      "signal_score_away": 2,
+      "home_team": "Elche",
+      "away_team": "Atletico Madrid",
+      "league_name": "La Liga",
+      "prob_next_15_at_signal": 44.31,
+      "prob_second_half_remain_at_signal": 62.31,
+      "lambda_2h_at_signal": 0.039,
+      "model_version": "v2",
+      "signal_model": "45_plus",
+      "telegram_message_id": 1529,
+      "snapshot_saved": true,
+      "outcome_saved": false
+    }
+  },
+  "training_fixture_index": {
+    "1536947": [
+      "1536947_48_e3118054ef75"
+    ],
+    "1531245": [
+      "1531245_46_d3ae00315d1a"
+    ],
+    "1531246": [
+      "1531246_48_fefd9cf760ca"
+    ],
+    "1540273": [
+      "1540273_49_37cc7005bf54"
+    ],
+    "1400235": [
+      "1400235_49_4c0e42165abb"
+    ],
+    "1537089": [
+      "1537089_46_7a42a8a89742"
+    ],
+    "1387929": [
+      "1387929_46_c7e704e175f7"
+    ],
+    "1391141": [
+      "1391141_46_97f85c6aaf00"
+    ]
+  },
+  "approved_matches_auto": [],
+  "admin_auto_posted": {},
+  "review_queue": {},
+  "review_tracking": {},
+  "admin_reviews": {},
+  "match_signal_info": {
+    "1536947": {
+      "signal_date": "2026-04-21",
+      "is_finished": true
+    },
+    "1531245": {
+      "signal_date": "2026-04-22",
+      "is_finished": true
+    },
+    "1531246": {
+      "signal_date": "2026-04-22",
+      "is_finished": true
+    },
+    "1540273": {
+      "signal_date": "2026-04-22",
+      "is_finished": true
+    },
+    "1400235": {
+      "signal_date": "2026-04-22",
+      "is_finished": true
+    },
+    "1537089": {
+      "signal_date": "2026-04-22",
+      "is_finished": true
+    },
+    "1387929": {
+      "signal_date": "2026-04-22",
+      "is_finished": true
+    },
+    "1391141": {
+      "signal_date": "2026-04-22",
+      "is_finished": false
+    }
+  }
+}

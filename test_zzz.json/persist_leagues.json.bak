@@ -1,0 +1,62 @@
+{
+  "72": {
+    "league_id": 72,
+    "name": "Serie B",
+    "country": "Brazil",
+    "type": "League",
+    "season": 2026,
+    "last_updated_utc": "2026-04-18T21:54:32.103606+00:00",
+    "sample_size": 40,
+    "total_goals": 86,
+    "avg_goals": 2.15,
+    "factor": 0.85,
+    "last_attempt_utc": "2026-04-18T21:54:31.529744+00:00",
+    "last_error": null,
+    "cooldown_until_utc": null
+  },
+  "265": {
+    "league_id": 265,
+    "name": "Primera División",
+    "country": "Chile",
+    "type": "League",
+    "season": 2026,
+    "last_updated_utc": "2026-04-18T22:03:15.592494+00:00",
+    "sample_size": 72,
+    "total_goals": 189,
+    "avg_goals": 2.625,
+    "factor": 0.990566,
+    "last_attempt_utc": "2026-04-18T22:03:14.308684+00:00",
+    "last_error": null,
+    "cooldown_until_utc": null
+  },
+  "242": {
+    "league_id": 242,
+    "name": "Liga Pro",
+    "country": "Ecuador",
+    "type": "League",
+    "season": 2026,
+    "last_updated_utc": "2026-04-18T22:03:16.850466+00:00",
+    "sample_size": 67,
+    "total_goals": 131,
+    "avg_goals": 1.955224,
+    "factor": 0.85,
+    "last_attempt_utc": "2026-04-18T22:03:15.609033+00:00",
+    "last_error": null,
+    "cooldown_until_utc": null
+  },
+  "71": {
+    "league_id": 71,
+    "name": "Serie A",
+    "country": "Brazil",
+    "type": "League",
+    "season": 2026,
+    "last_updated_utc": "2026-04-18T22:06:59.397057+00:00",
+    "sample_size": 107,
+    "total_goals": 278,
+    "avg_goals": 2.598131,
+    "factor": 0.980427,
+    "last_attempt_utc": "2026-04-18T22:06:58.091477+00:00",
+    "last_error": null,
+    "cooldown_until_utc": null
+  }
+}

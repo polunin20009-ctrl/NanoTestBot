@@ -26,14 +26,12 @@ from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError
 
-# Google Sheets integration
+# Load environment variables from .env file if available
 try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    GSHEETS_AVAILABLE = True
+    from dotenv import load_dotenv
+    load_dotenv()
 except ImportError:
-    GSHEETS_AVAILABLE = False
-    logger_warning = "Google Sheets libraries not installed. Run: pip install gspread google-auth"
+    pass  # dotenv not installed, skip loading .env
 
 # Ensure UTF-8 stdout on Windows (best-effort)
 # Skip when running under pytest to avoid capture errors.
@@ -44,67 +42,150 @@ try:
 except Exception:
     pass
 
+# Helper functions for safe environment parsing
+def _parse_env_str(name: str) -> Optional[str]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    return value if value else None
+
+
+def _parse_env_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
 # -------------------------
 # Configuration (embedded per user request)
 # -------------------------
 API_FOOTBALL_KEY = "fc7e650f8109ac4ad77e446b26a363b9"
-TELEGRAM_CHAT_ID = -1002161710363  # Numeric ID for private channel (was @xtrzv)
-TELEGRAM_TOKEN = "7794472947:AAG3NpELJvpk4gG7EI5dfWUpvSR7LZFtXnM"
+TELEGRAM_TOKEN = _parse_env_str("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = None
+TELEGRAM_CHAT_ID_RAW = _parse_env_str("TELEGRAM_CHAT_ID")
+if TELEGRAM_CHAT_ID_RAW is not None:
+    try:
+        TELEGRAM_CHAT_ID = int(TELEGRAM_CHAT_ID_RAW)
+    except ValueError:
+        TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID_RAW
 
-def save_snapshot(snapshot: dict) -> None:
-    os.makedirs("zzz.json", exist_ok=True)
+CHANNEL_ID = _parse_env_int("CHANNEL_ID") or TELEGRAM_CHAT_ID
+REVIEW_TARGET_CHAT = _parse_env_str("REVIEW_TARGET_CHAT")
+STATS_MESSAGE_ID = _parse_env_int("STATS_MESSAGE_ID")
+BOT_USERNAME = _parse_env_str("BOT_USERNAME")
 
-    file_path = os.path.join("zzz.json", "match_snapshots.jsonl")
+GOAL_LOG_FILE = _parse_env_str("LOG_FILE") or "test_goal_predictor.log"
 
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+# Google Sheets integration disabled for isolated test bot
+GSHEETS_AVAILABLE = False
 
-def save_outcome(outcome: dict) -> None:
-    os.makedirs("zzz.json", exist_ok=True)
+def save_snapshot(snapshot: dict) -> bool:
+    logger_obj = logging.getLogger("mat")
+    try:
+        if not isinstance(snapshot, dict):
+            raise TypeError("snapshot payload must be a dict")
+        if not bool(snapshot.get("_training_jsonl")):
+            logger_obj.debug("[SNAPSHOT_JSONL] skipped non-training snapshot payload")
+            return False
 
-    file_path = os.path.join("zzz.json", "match_outcomes.jsonl")
+        payload = dict(snapshot)
+        payload.pop("_training_jsonl", None)
+        _append_jsonl_record(MATCH_SNAPSHOTS_JSONL_PATH, payload)
+        logger_obj.info(
+            "[SNAPSHOT_JSONL] saved fixture_id=%s signal_id=%s",
+            payload.get("fixture_id"),
+            payload.get("signal_id"),
+        )
+        return True
+    except Exception as e:
+        fixture_id = snapshot.get("fixture_id") if isinstance(snapshot, dict) else None
+        logger_obj.exception("[JSONL_ERROR] snapshot save failed fixture_id=%s error=%s", fixture_id, e)
+        return False
 
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(outcome, ensure_ascii=False) + "\n")
+
+def save_outcome(outcome: dict) -> bool:
+    global _existing_outcome_keys
+
+    logger_obj = logging.getLogger("mat")
+    try:
+        if not isinstance(outcome, dict):
+            raise TypeError("outcome payload must be a dict")
+        if not bool(outcome.get("_training_jsonl")):
+            logger_obj.debug("[OUTCOME_JSONL] skipped non-training outcome payload")
+            return False
+
+        payload = dict(outcome)
+        payload.pop("_training_jsonl", None)
+        outcome_key = _build_training_outcome_key(payload)
+        if not outcome_key:
+            raise ValueError("outcome payload missing linkage fields")
+
+        with _jsonl_outcome_keys_lock:
+            if _existing_outcome_keys is None:
+                _existing_outcome_keys = load_existing_outcome_keys()
+            if outcome_key in _existing_outcome_keys:
+                logger_obj.debug(
+                    "[OUTCOME_JSONL] duplicate skip fixture_id=%s signal_id=%s",
+                    payload.get("fixture_id"),
+                    payload.get("signal_id"),
+                )
+                return True
+
+            _append_jsonl_record(MATCH_OUTCOMES_JSONL_PATH, payload)
+            _existing_outcome_keys.add(outcome_key)
+
+        logger_obj.info(
+            "[OUTCOME_JSONL] saved fixture_id=%s signal_id=%s",
+            payload.get("fixture_id"),
+            payload.get("signal_id"),
+        )
+        return True
+    except Exception as e:
+        fixture_id = outcome.get("fixture_id") if isinstance(outcome, dict) else None
+        logger_obj.exception("[JSONL_ERROR] outcome save failed fixture_id=%s error=%s", fixture_id, e)
+        return False
+
 
 def load_existing_outcome_keys() -> set:
-    """
-    Load existing outcome keys as set of (match_id, signal_ts_utc) tuples.
-    """
-    file_path = os.path.join("zzz.json", "match_outcomes.jsonl")
-    if not os.path.exists(file_path):
-        return set()
-    
-    keys = set()
+    logger_obj = logging.getLogger("mat")
+    keys: Set[str] = set()
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        outcome = json.loads(line)
-                        match_id = outcome.get("match_id")
-                        signal_ts_utc = outcome.get("signal_ts_utc")
-                        if match_id is not None and signal_ts_utc is not None:
-                            keys.add((match_id, signal_ts_utc))
-                    except json.JSONDecodeError:
+        _ensure_jsonl_file(MATCH_OUTCOMES_JSONL_PATH)
+        with _jsonl_file_lock:
+            with open(MATCH_OUTCOMES_JSONL_PATH, "r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line:
                         continue
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        logger_obj.warning("[JSONL_ERROR] invalid outcome JSONL line skipped path=%s", MATCH_OUTCOMES_JSONL_PATH)
+                        continue
+                    outcome_key = _build_training_outcome_key(payload)
+                    if outcome_key:
+                        keys.add(outcome_key)
     except Exception as e:
-        logger.error(f"[OUTCOME] Failed to load existing outcome keys: {e}")
-    
+        logger_obj.exception("[JSONL_ERROR] failed to load outcome keys error=%s", e)
+        return set()
     return keys
 
 # -------------------------
-# Configuration Loading from config.json
+# Configuration Loading from config_test.json
 # -------------------------
 def load_config() -> Dict[str, Any]:
     """
-    Load configuration from config.json.
+    Load configuration from config_test.json.
     
     Returns:
         Dictionary with configuration, or empty dict if file doesn't exist.
     """
-    config_file = "config.json"
+    config_file = os.environ.get("CONFIG_FILE", "config_test.json")
     
     if not os.path.exists(config_file):
         logging.error(f"[CONFIG] File '{config_file}' not found. Review mode will be disabled.")
@@ -127,7 +208,7 @@ def _get_admin_user_id(config: Dict[str, Any]) -> Optional[int]:
     Extract and validate admin_user_id from config.
     
     Args:
-        config: Configuration dictionary from config.json
+        config: Configuration dictionary from config_test.json
         
     Returns:
         Admin user ID as int, or None if not found or invalid
@@ -139,7 +220,7 @@ def _get_admin_user_id(config: Dict[str, Any]) -> Optional[int]:
     admin_id_value = config.get("admin_user_id")
     
     if admin_id_value is None:
-        logging.error("[CONFIG] admin_user_id not found in config.json. Review mode will be disabled.")
+        logging.error("[CONFIG] admin_user_id not found in config_test.json. Review mode will be disabled.")
         return None
     
     # Handle both int and string formats
@@ -185,8 +266,8 @@ ADMIN_USER_ID = _get_admin_user_id(CONFIG)
 AUTO_APPROVE_THRESHOLD = _get_auto_approve_threshold(CONFIG)
 
 # Channel configuration for daily stats (legacy, use TELEGRAM_CHAT_ID instead)
-CHANNEL_ID = -1002161710363  # Numeric ID of the channel
-STATS_MESSAGE_ID = 316         # ID of the pinned stats message to edit daily
+CHANNEL_ID = _parse_env_int("CHANNEL_ID") or TELEGRAM_CHAT_ID
+STATS_MESSAGE_ID = _parse_env_int("STATS_MESSAGE_ID")
 
 API_FOOTBALL_HOST = os.environ.get("API_FOOTBALL_HOST", "v3.football.api-sports.io")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
@@ -194,23 +275,45 @@ MONITOR_INTERVAL = int(os.environ.get("MONITOR_INTERVAL", "60"))  # per-minute m
 UPDATE_INTERVAL_AFTER_SEND = int(os.environ.get("UPDATE_INTERVAL_AFTER_SEND", "60"))
 MATCH_MIN_MINUTE = int(os.environ.get("MATCH_MIN_MINUTE", "30"))
 MATCH_MAX_MINUTE = int(os.environ.get("MATCH_MAX_MINUTE", "45"))
-PROB_SEND_THRESHOLD = float(os.environ.get("PROB_SEND_THRESHOLD", "80"))
-REVIEW_MIN_THRESHOLD = 50.0  # Minimum probability for REVIEW mode
+REGULAR_SIGNAL_MIN_MINUTE = 46
+REGULAR_SIGNAL_MAX_MINUTE = 60
+REGULAR_SIGNAL_WINDOW_1_MAX_MINUTE = 53
+REGULAR_SIGNAL_WINDOW_2_MIN_MINUTE = 54
+REVIEW_PIPELINE_MIN_MINUTE = 47
+PROB_SEND_THRESHOLD = float(os.environ.get("PROB_SEND_THRESHOLD", "30"))
+REVIEW_MIN_THRESHOLD = 80.0  # Minimum probability for REVIEW mode
 REVIEW_MAX_THRESHOLD = 79.999  # Maximum probability for REVIEW mode (exclusive of 80% send)
-REVIEW_TARGET_CHAT = "@OrgazmDonor500"  # REVIEW recipient username
+
+# New 2-window second-half decision thresholds for ordinary signals
+WINDOW_1_NEXT_15_THRESHOLD = 32.0
+WINDOW_1_REMAIN_THRESHOLD = 75.0
+WINDOW_2_NEXT_15_THRESHOLD = 35.0
+WINDOW_2_REMAIN_THRESHOLD = 70.0
+WINDOW_2_LIVE_GATE_MIN_PASSED = 2
+
+# New 45+ model constants
+LAMBDA_2H_SCALE = 0.055  # Scaling factor for lambda_2h calculation (cooled from 0.4)
+LAMBDA_2H_FLOOR = 0.001  # Minimum lambda value
+LAMBDA_2H_CAP = 0.09     # Maximum lambda value (cooled from 1.0)
+REVIEW_TARGET_CHAT = _parse_env_str("REVIEW_TARGET_CHAT")
 REVIEW_TIMEOUT_MINUTES = 10  # Auto-skip review after this many minutes
 ADMIN_REVIEW_INTERVAL = 60  # seconds between admin review updates
+
+# Test mode: disable admin/review signals for testing 45+ model only
+ENABLE_ADMIN_REVIEW_SIGNALS = _parse_env_str("ENABLE_ADMIN_REVIEW_SIGNALS") == "true"
 ADMIN_REVIEW_EDIT_GUARD = 55  # minimum seconds between edits
 TG_EDIT_GLOBAL_LIMIT_PER_MIN = int(os.environ.get("TG_EDIT_GLOBAL_LIMIT_PER_MIN", "30"))
 TG_EDIT_PER_MESSAGE_SECONDS = int(os.environ.get("TG_EDIT_PER_MESSAGE_SECONDS", "60"))
-PERSIST_DIR = os.environ.get("PERSIST_DIR", "zzz.json")
+PERSIST_DIR = os.environ.get("PERSIST_DIR", "test_zzz.json")
 CORE_PATH = os.path.join(PERSIST_DIR, "persist_state.json")
 MATCHES_PATH = os.path.join(PERSIST_DIR, "persist_matches.json")
 PERSIST_LEAGUES_PATH = os.path.join(PERSIST_DIR, "persist_leagues.json")
 PERSIST_TEAMS_PATH = os.path.join(PERSIST_DIR, "persist_teams.json")
+MATCH_SNAPSHOTS_JSONL_PATH = os.environ.get("MATCH_SNAPSHOTS_JSONL_PATH", os.path.join(PERSIST_DIR, "test_match_snapshots.jsonl"))
+MATCH_OUTCOMES_JSONL_PATH = os.environ.get("MATCH_OUTCOMES_JSONL_PATH", os.path.join(PERSIST_DIR, "test_match_outcomes.jsonl"))
 LEAGUES_PATH = PERSIST_LEAGUES_PATH
 PERSIST_STATE_PATH = CORE_PATH
-TEMP_STATE_PATH = "bot_state.json"
+TEMP_STATE_PATH = os.environ.get("STATE_FILE", "test_bot_state.json")
 STATE_FILE = os.environ.get("STATE_FILE", TEMP_STATE_PATH)
 GOAL_CONFIRM_SECONDS = int(os.environ.get("GOAL_CONFIRM_SECONDS", "25"))
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
@@ -314,9 +417,9 @@ ESTIMATED_XG_GATE = 3.2               # жесткий шлюз: если estima
 FALLBACK_XG_CLAMP_MAX = 4.5           # макс xG для одной команды
 FALLBACK_TOTAL_XG_CLAMP_MAX = 7.5     # макс суммарный xG
 
-# Google Sheets configuration
-GOOGLE_SHEETS_URL = "https://docs.google.com/spreadsheets/d/1QWzm00fLgw6W_MykUWAL2c6j23-ATvf1xWB5jyLvqv4/edit?gid=0"
-GOOGLE_SERVICE_ACCOUNT_FILE = "goal-signal-bot-xxxx.json"
+# Google Sheets configuration disabled for isolated test bot
+GOOGLE_SHEETS_URL = None
+GOOGLE_SERVICE_ACCOUNT_FILE = None
 
 # -------------------------
 # Logging Setup
@@ -350,7 +453,7 @@ def setup_logging():
     
     # File handler
     file_handler = logging.FileHandler(
-        "goal_predictor.log",
+        GOAL_LOG_FILE,
         encoding="utf-8"
     )
     file_handler.setLevel(logging.INFO)
@@ -1641,105 +1744,83 @@ def finalize_match_outcomes(match_id: int, client):
         logger.exception(f"[GSHEETS] finalize_match_outcomes failed for match {match_id}: {e}")
 
 def process_match_outcomes_for_jsonl(match_id: int, client):
-    """
-    Process outcomes for all signals of a finished match and save to JSONL.
-    
-    Reads snapshots from match_snapshots.jsonl and creates outcomes in match_outcomes.jsonl.
-    """
+    records = _get_training_signal_records_for_fixture(match_id)
+    if not records:
+        return
+
     try:
-        # Load existing outcome keys to avoid duplicates
-        existing_keys = load_existing_outcome_keys()
-        
-        # Load snapshots for this match
-        snapshots_file = os.path.join("zzz.json", "match_snapshots.jsonl")
-        if not os.path.exists(snapshots_file):
-            logger.debug(f"[OUTCOME_JSONL] No snapshots file for match {match_id}")
-            return
-        
-        match_snapshots = []
-        with open(snapshots_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        snapshot = json.loads(line)
-                        if snapshot.get("match_id") == match_id:
-                            match_snapshots.append(snapshot)
-                    except json.JSONDecodeError:
-                        continue
-        
-        if not match_snapshots:
-            logger.debug(f"[OUTCOME_JSONL] No snapshots found for match {match_id}")
-            return
-        
-        # Fetch match events
-        try:
-            events = client.fetch_fixture_events(match_id)
-            if not events:
-                events = []
-        except Exception as e:
-            logger.error(f"[OUTCOME_JSONL] Failed to fetch events for match {match_id}: {e}")
-            events = []
-        
-        # Process each snapshot
-        for snapshot in match_snapshots:
-            signal_ts_utc = snapshot.get("signal_ts_utc")
-            minute_at_signal = snapshot.get("minute")
-            
-            if signal_ts_utc is None or minute_at_signal is None:
-                logger.warning(f"[OUTCOME_JSONL] Invalid snapshot for match {match_id}: missing ts or minute")
-                continue
-            
-            # Check if outcome already exists
-            outcome_key = (match_id, signal_ts_utc)
-            if outcome_key in existing_keys:
-                logger.debug(f"[OUTCOME_JSONL] Outcome already exists for match {match_id} at {signal_ts_utc}")
-                continue
-            
-            # Extract goals after signal
-            goal_minutes, first_goal_minute, first_goal_team = _extract_counted_goals_after_signal(events, minute_at_signal, match_id)
-            
-            # Determine next goal team
-            next_goal_team = first_goal_team or "none"
-            
-            # Calculate flags
-            if first_goal_minute is not None:
-                time_to_next_goal_min = first_goal_minute - minute_at_signal
-                goal_after_15 = time_to_next_goal_min <= 15
-                goal_after_30 = time_to_next_goal_min <= 30
-                goal_after_45 = time_to_next_goal_min <= 45
-                goal_to_75 = first_goal_minute <= 75
-                goal_to_ft = True
-            else:
-                time_to_next_goal_min = None
-                goal_after_15 = False
-                goal_after_30 = False
-                goal_after_45 = False
-                goal_to_75 = False
-                goal_to_ft = False
-            
-            # Create outcome
-            outcome = {
-                "match_id": match_id,
-                "signal_ts_utc": signal_ts_utc,
-                "minute_at_signal": minute_at_signal,
-                "goal_after_15": goal_after_15,
-                "goal_after_30": goal_after_30,
-                "goal_after_45": goal_after_45,
-                "goal_to_75": goal_to_75,
-                "goal_to_ft": goal_to_ft,
-                "first_goal_minute": first_goal_minute,
-                "time_to_next_goal_min": time_to_next_goal_min,
-                "next_goal_team": next_goal_team,
-                "labels_finalized_ts_utc": datetime.utcnow().isoformat()
-            }
-            
-            # Save outcome
-            save_outcome(outcome)
-            logger.info(f"[OUTCOME_JSONL] Saved outcome for match {match_id} signal at {signal_ts_utc}: first_goal={first_goal_minute}, team={next_goal_team}")
-            
+        raw_fixture = client.fetch_fixture(match_id) or {}
     except Exception as e:
-        logger.exception(f"[OUTCOME_JSONL] Failed to process outcomes for match {match_id}: {e}")
+        raw_fixture = {}
+        logger.exception(f"[JSONL_ERROR] failed to fetch final fixture for outcome fixture_id={match_id}: {e}")
+
+    try:
+        events = client.fetch_fixture_events(match_id) or []
+    except Exception as e:
+        events = []
+        logger.exception(f"[JSONL_ERROR] failed to fetch events for outcome fixture_id={match_id}: {e}")
+
+    last_known_home, last_known_away = _get_last_known_score_for_fixture(match_id)
+    goals_obj = raw_fixture.get("goals") or {}
+    final_score_home = _safe_int(goals_obj.get("home"), last_known_home)
+    final_score_away = _safe_int(goals_obj.get("away"), last_known_away)
+    final_total_goals = final_score_home + final_score_away
+
+    teams_obj = raw_fixture.get("teams") or {}
+    league_obj = raw_fixture.get("league") or {}
+    final_home_team = str(((teams_obj.get("home") or {}).get("name")) or "")
+    final_away_team = str(((teams_obj.get("away") or {}).get("name")) or "")
+    final_league_name = str(league_obj.get("name") or "")
+
+    for record in records:
+        signal_id = str(record.get("signal_id") or "").strip()
+        if not signal_id:
+            continue
+        if bool(record.get("outcome_saved", False)):
+            continue
+
+        signal_minute = _safe_int(record.get("signal_minute"), 0)
+        goal_minutes, first_goal_minute, _first_goal_team = _extract_counted_goals_after_signal(events, signal_minute, match_id)
+        goals_after_signal_count = len(goal_minutes)
+        signal_total_goals = _safe_int(record.get("signal_score_home"), 0) + _safe_int(record.get("signal_score_away"), 0)
+
+        if not events and final_total_goals > signal_total_goals:
+            logger.error(
+                "[JSONL_ERROR] cannot save outcome without events fixture_id=%s signal_id=%s",
+                match_id,
+                signal_id,
+            )
+            continue
+
+        outcome = {
+            "_training_jsonl": True,
+            "signal_id": signal_id,
+            "fixture_id": _safe_int(record.get("fixture_id"), match_id),
+            "timestamp_utc": str(record.get("timestamp_utc") or ""),
+            "home_team": str(record.get("home_team") or final_home_team),
+            "away_team": str(record.get("away_team") or final_away_team),
+            "league_name": str(record.get("league_name") or final_league_name),
+            "signal_minute": signal_minute,
+            "signal_score_home": _safe_int(record.get("signal_score_home"), 0),
+            "signal_score_away": _safe_int(record.get("signal_score_away"), 0),
+            "prob_next_15_at_signal": round(_safe_float(record.get("prob_next_15_at_signal"), 0.0), 2),
+            "prob_second_half_remain_at_signal": round(_safe_float(record.get("prob_second_half_remain_at_signal"), 0.0), 2),
+            "lambda_2h_at_signal": round(_safe_float(record.get("lambda_2h_at_signal"), 0.0), 4),
+            "final_score_home": final_score_home,
+            "final_score_away": final_score_away,
+            "final_total_goals": final_total_goals,
+            "goal_after_signal": 1 if goals_after_signal_count > 0 else 0,
+            "goal_in_next_15": 1 if any(goal_minute <= signal_minute + 15 for goal_minute in goal_minutes) else 0,
+            "goals_after_signal_count": goals_after_signal_count,
+            "first_goal_after_signal_minute": first_goal_minute,
+            "goal_by_90": 1 if any(goal_minute <= 90 for goal_minute in goal_minutes) else 0,
+            "model_version": str(record.get("model_version") or "v2"),
+            "signal_model": str(record.get("signal_model") or "45_plus"),
+            "outcome_saved_utc": _utc_now_iso(),
+        }
+
+        if save_outcome(outcome):
+            _mark_training_signal_outcome_saved(signal_id)
 
 def label_match_rows(match_id: int, goals_minutes: List[int]):
     """
@@ -2506,7 +2587,7 @@ def _run_cleanup_step_with_timeout(step_name: str, fn, timeout_seconds: float, c
 
 
 def _rotate_logs_safe() -> bool:
-    log_file = "goal_predictor.log"
+    log_file = GOAL_LOG_FILE
     logger_obj = logging.getLogger("mat")
     for handler in list(logger_obj.handlers):
         try:
@@ -2529,7 +2610,7 @@ def _state_cleanup_safe() -> bool:
         save_json_atomic(TEMP_STATE_PATH, {})
         return True
     except Exception:
-        logger.exception("[MAINT] Failed to reset bot_state.json")
+        logger.exception("[MAINT] Failed to reset test_bot_state.json")
         return False
 
 
@@ -3392,6 +3473,346 @@ def save_json(path: str, data: Any) -> None:
 
 def save_json_atomic(path: str, data: Any) -> None:
     save_json(path, data)
+
+
+_jsonl_file_lock = threading.RLock()
+_jsonl_outcome_keys_lock = threading.RLock()
+_existing_outcome_keys: Optional[Set[str]] = None
+
+
+def _ensure_jsonl_file(path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "a", encoding="utf-8"):
+            pass
+
+
+def _append_jsonl_record(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=False)
+    with _jsonl_file_lock:
+        _ensure_jsonl_file(path)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.write("\n")
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return int(default)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _build_training_signal_id(
+    fixture_id: int,
+    signal_minute: int,
+    timestamp_utc: str,
+    telegram_message_id: Optional[int] = None,
+) -> str:
+    seed = f"{int(fixture_id)}|{int(signal_minute)}|{timestamp_utc}|{_safe_int(telegram_message_id, 0)}"
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+    return f"{int(fixture_id)}_{int(signal_minute)}_{digest}"
+
+
+def _build_training_outcome_key(payload: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+
+    fixture_id = _safe_int(payload.get("fixture_id"), 0)
+    if fixture_id <= 0:
+        return None
+
+    signal_id = str(payload.get("signal_id") or "").strip()
+    if signal_id:
+        return f"{fixture_id}|{signal_id}"
+
+    timestamp_utc = str(payload.get("timestamp_utc") or "").strip()
+    if not timestamp_utc:
+        return None
+
+    signal_minute = _safe_int(payload.get("signal_minute"), 0)
+    return f"{fixture_id}|{signal_minute}|{timestamp_utc}"
+
+
+def _register_training_signal_record(record: Dict[str, Any]) -> None:
+    signal_id = str(record.get("signal_id") or "").strip()
+    fixture_id = _safe_int(record.get("fixture_id"), 0)
+    if not signal_id or fixture_id <= 0:
+        return
+
+    with state_lock:
+        records = state.setdefault("training_signal_records", {})
+        if not isinstance(records, dict):
+            records = {}
+            state["training_signal_records"] = records
+        records[signal_id] = dict(record)
+
+        fixture_index = state.setdefault("training_fixture_index", {})
+        if not isinstance(fixture_index, dict):
+            fixture_index = {}
+            state["training_fixture_index"] = fixture_index
+
+        ids = fixture_index.setdefault(str(fixture_id), [])
+        if not isinstance(ids, list):
+            ids = []
+            fixture_index[str(fixture_id)] = ids
+        if signal_id not in ids:
+            ids.append(signal_id)
+
+        mark_state_dirty()
+
+
+def _mark_training_signal_outcome_saved(signal_id: str) -> None:
+    if not signal_id:
+        return
+
+    with state_lock:
+        records = state.setdefault("training_signal_records", {})
+        if not isinstance(records, dict):
+            return
+        record = records.get(str(signal_id))
+        if not isinstance(record, dict):
+            return
+
+        record["outcome_saved"] = True
+        record["outcome_saved_utc"] = _utc_now_iso()
+        records[str(signal_id)] = record
+        mark_state_dirty()
+
+
+def _get_training_signal_records_for_fixture(fixture_id: int) -> List[Dict[str, Any]]:
+    fixture_key = str(int(fixture_id))
+    with state_lock:
+        fixture_index = state.get("training_fixture_index", {})
+        records = state.get("training_signal_records", {})
+        signal_ids = list(fixture_index.get(fixture_key, [])) if isinstance(fixture_index, dict) else []
+
+        out: List[Dict[str, Any]] = []
+        if not isinstance(records, dict):
+            return out
+        for signal_id in signal_ids:
+            record = records.get(str(signal_id))
+            if isinstance(record, dict):
+                out.append(dict(record))
+        return out
+
+
+def _get_last_known_score_for_fixture(fixture_id: int) -> Tuple[int, int]:
+    fixture_key = str(int(fixture_id))
+    with state_lock:
+        tracked = state.get("tracked_matches", {})
+        if isinstance(tracked, dict):
+            tracked_rec = tracked.get(fixture_key)
+            if isinstance(tracked_rec, dict):
+                last_known = tracked_rec.get("last_known_score") or tracked_rec.get("score_at_signal") or {}
+                if isinstance(last_known, dict):
+                    return (
+                        _safe_int(last_known.get("home"), 0),
+                        _safe_int(last_known.get("away"), 0),
+                    )
+
+        sent_map = state.get("sent", {})
+        if isinstance(sent_map, dict):
+            sent_rec = sent_map.get(fixture_key)
+            if isinstance(sent_rec, dict):
+                last_known = sent_rec.get("last_known_score") or sent_rec.get("signal_score") or {}
+                if isinstance(last_known, dict):
+                    return (
+                        _safe_int(last_known.get("home"), 0),
+                        _safe_int(last_known.get("away"), 0),
+                    )
+
+    return (0, 0)
+
+
+def _build_regular_signal_training_payload(
+    fixture_id: int,
+    fixture_metrics: Dict[str, Any],
+    signal_minute: int,
+    signal_score: Tuple[int, int],
+    signal_timestamp_utc: str,
+    signal_date: str,
+    telegram_message_id: Optional[int],
+    res_45: Dict[str, Any],
+    threshold_next15: float,
+    threshold_remain: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    fixture_id_int = int(fixture_id)
+    signal_minute_int = _safe_int(signal_minute, 0)
+    score_home = _safe_int(signal_score[0], 0)
+    score_away = _safe_int(signal_score[1], 0)
+    telegram_message_id_int = _safe_int(telegram_message_id, 0)
+    telegram_message_value = telegram_message_id_int if telegram_message_id_int > 0 else None
+
+    league_id = _unwrap_metric_int(fixture_metrics.get("league_id"))
+    home_team_id = _unwrap_metric_int(fixture_metrics.get("team_home_id"))
+    away_team_id = _unwrap_metric_int(fixture_metrics.get("team_away_id"))
+    league_name = str(_unwrap_value(fixture_metrics.get("league_name")) or "")
+    home_team = str(_unwrap_value(fixture_metrics.get("team_home_name")) or "")
+    away_team = str(_unwrap_value(fixture_metrics.get("team_away_name")) or "")
+
+    status_short = _normalize_status_short(fixture_metrics)
+    elapsed = _safe_int(get_metric_from_fixture(fixture_metrics, "elapsed", signal_minute_int), signal_minute_int)
+    if elapsed <= 0:
+        elapsed = signal_minute_int
+
+    xg_home = round(_safe_float(get_any_metric(fixture_metrics, ["expected_goals"], "home"), 0.0), 4)
+    xg_away = round(_safe_float(get_any_metric(fixture_metrics, ["expected_goals"], "away"), 0.0), 4)
+    xg_total = round(xg_home + xg_away, 4)
+    xg_delta = round(xg_home - xg_away, 4)
+
+    shots_on_target_home = _safe_int(get_any_metric(fixture_metrics, ["shots_on_target"], "home"), 0)
+    shots_on_target_away = _safe_int(get_any_metric(fixture_metrics, ["shots_on_target"], "away"), 0)
+    shots_on_target_total = shots_on_target_home + shots_on_target_away
+
+    shots_in_box_home = _safe_int(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box", "inside_box"], "home"), 0)
+    shots_in_box_away = _safe_int(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box", "inside_box"], "away"), 0)
+    shots_in_box_total = shots_in_box_home + shots_in_box_away
+
+    total_shots_home = _safe_int(get_any_metric(fixture_metrics, ["total_shots"], "home"), 0)
+    total_shots_away = _safe_int(get_any_metric(fixture_metrics, ["total_shots"], "away"), 0)
+    total_shots = total_shots_home + total_shots_away
+
+    saves_home = _safe_int(get_any_metric(fixture_metrics, ["saves", "goalkeeper_saves"], "home"), 0)
+    saves_away = _safe_int(get_any_metric(fixture_metrics, ["saves", "goalkeeper_saves"], "away"), 0)
+    save_stress = round(
+        _safe_float(
+            res_45.get("save_stress"),
+            calculate_save_stress(
+                saves_home=saves_home,
+                saves_away=saves_away,
+                current_home_score=score_home,
+                current_away_score=score_away,
+                shots_on_target_home=shots_on_target_home,
+                shots_on_target_away=shots_on_target_away,
+            ),
+        ),
+        4,
+    )
+
+    corners_home = _safe_int(get_any_metric(fixture_metrics, ["corner_kicks", "corners"], "home"), 0)
+    corners_away = _safe_int(get_any_metric(fixture_metrics, ["corner_kicks", "corners"], "away"), 0)
+
+    possession_home = round(_safe_float(get_any_metric(fixture_metrics, ["ball_possession", "passes_%"], "home"), 0.0), 2)
+    possession_away = round(_safe_float(get_any_metric(fixture_metrics, ["ball_possession", "passes_%"], "away"), 0.0), 2)
+
+    attacks_home = _safe_float(get_any_metric(fixture_metrics, ["attacks"], "home"), 0.0)
+    attacks_away = _safe_float(get_any_metric(fixture_metrics, ["attacks"], "away"), 0.0)
+    tempo = round(_safe_float(res_45.get("tempo"), (attacks_home + attacks_away) / max(1.0, 24.0)), 4)
+
+    pressure_index = round(_safe_float(res_45.get("pressure_index"), calculate_pressure_index(fixture_metrics)), 4)
+    goal_xg_gap = round(_safe_float(res_45.get("goal_xg_gap"), (score_home + score_away) - xg_total), 4)
+    signal_id = _build_training_signal_id(
+        fixture_id=fixture_id_int,
+        signal_minute=signal_minute_int,
+        timestamp_utc=signal_timestamp_utc,
+        telegram_message_id=telegram_message_value,
+    )
+
+    snapshot = {
+        "_training_jsonl": True,
+        "fixture_id": fixture_id_int,
+        "signal_id": signal_id,
+        "timestamp_utc": signal_timestamp_utc,
+        "date": str(signal_date or ""),
+        "minute": signal_minute_int,
+        "league_id": league_id,
+        "league_name": league_name,
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
+        "home_team": home_team,
+        "away_team": away_team,
+        "score_home": score_home,
+        "score_away": score_away,
+        "score_state": str(res_45.get("score_state") or f"{score_home}-{score_away}"),
+        "status": status_short,
+        "elapsed": elapsed,
+        "xg_home": xg_home,
+        "xg_away": xg_away,
+        "xg_total": xg_total,
+        "xg_delta": xg_delta,
+        "goal_xg_gap": goal_xg_gap,
+        "pressure_index": pressure_index,
+        "shots_on_target_home": shots_on_target_home,
+        "shots_on_target_away": shots_on_target_away,
+        "shots_on_target_total": shots_on_target_total,
+        "shots_in_box_home": shots_in_box_home,
+        "shots_in_box_away": shots_in_box_away,
+        "shots_in_box_total": shots_in_box_total,
+        "total_shots_home": total_shots_home,
+        "total_shots_away": total_shots_away,
+        "total_shots": total_shots,
+        "saves_home": saves_home,
+        "saves_away": saves_away,
+        "save_stress": save_stress,
+        "corners_home": corners_home,
+        "corners_away": corners_away,
+        "possession_home": possession_home,
+        "possession_away": possession_away,
+        "tempo": tempo,
+        "live_intensity": round(_safe_float(res_45.get("live_intensity"), 0.0), 4),
+        "adjusted_intensity": round(_safe_float(res_45.get("adjusted_intensity"), 0.0), 4),
+        "game_state_factor": round(_safe_float(res_45.get("game_state_factor"), 1.0), 4),
+        "goal_xg_gap_factor": round(_safe_float(res_45.get("goal_xg_gap_factor"), 1.0), 4),
+        "xg_delta_factor": round(_safe_float(res_45.get("xg_delta_factor"), 1.0), 4),
+        "combined_m_2h": round(_safe_float(res_45.get("combined_m_2h"), 1.0), 4),
+        "urgency_factor": round(_safe_float(res_45.get("urgency_factor"), 1.0), 4),
+        "lambda_2h": round(_safe_float(res_45.get("lambda_2h"), 0.0), 4),
+        "remaining_minutes_adjusted": round(_safe_float(res_45.get("remaining_minutes_adjusted"), 0.0), 2),
+        "prob_next_15": round(_safe_float(res_45.get("prob_next_15"), 0.0), 2),
+        "prob_second_half_remain": round(_safe_float(res_45.get("prob_second_half_remain"), 0.0), 2),
+        "prob_to90": round(_safe_float(res_45.get("prob_to90"), 0.0), 2),
+        "prob_to75": round(_safe_float(res_45.get("prob_to75"), 0.0), 2),
+        "threshold_next15": round(_safe_float(threshold_next15, 0.0), 2),
+        "threshold_remain": round(_safe_float(threshold_remain, 0.0), 2),
+        "signal_model": "45_plus",
+        "model_version": "v2",
+        "readiness_check_passed": True,
+        "anti_garbage_passed": bool(res_45.get("anti_garbage_passed", True)),
+        "telegram_message_id": telegram_message_value,
+        "signal_sent": True,
+    }
+
+    record = {
+        "signal_id": signal_id,
+        "fixture_id": fixture_id_int,
+        "timestamp_utc": signal_timestamp_utc,
+        "date": str(signal_date or ""),
+        "signal_minute": signal_minute_int,
+        "signal_score_home": score_home,
+        "signal_score_away": score_away,
+        "home_team": home_team,
+        "away_team": away_team,
+        "league_name": league_name,
+        "prob_next_15_at_signal": snapshot["prob_next_15"],
+        "prob_second_half_remain_at_signal": snapshot["prob_second_half_remain"],
+        "lambda_2h_at_signal": snapshot["lambda_2h"],
+        "model_version": snapshot["model_version"],
+        "signal_model": snapshot["signal_model"],
+        "telegram_message_id": telegram_message_value,
+        "snapshot_saved": False,
+        "outcome_saved": False,
+    }
+    return snapshot, record
 
 
 _league_file_lock = threading.RLock()
@@ -5401,6 +5822,8 @@ state: Dict[str, Any] = {
     "user_rate_limit": {},              # Rate limiting: user_id -> {"ts": timestamp}
     "no_stats_fixtures": {},            # Blocked fixtures without live stats: fixture_id -> {"ts": unix_time, "reason": str, "expires_ts": unix_time}
     "no_stats_blocked": {},             # Long block for fixtures without stats: key -> {"ts": unix_time, "reason": str, "expires_ts": unix_time}
+    "training_signal_records": {},      # signal_id -> JSONL linkage + frozen signal metadata
+    "training_fixture_index": {},       # fixture_id -> [signal_id, ...]
     "approved_matches_auto": [],        # Auto-approved review matches (duplicate protection)
     "admin_auto_posted": {},            # fixture_id -> bool, dedupe guard for auto "Сигнал от админа"
     "review_queue": {},                 # fixture_id -> {"review_sent": bool, "review_decision": str, "review_ts": float, "data": {...}}
@@ -5429,6 +5852,8 @@ def load_state():
                         state.setdefault("active_fixtures", state.get("active_fixtures", []))
                         state.setdefault("signal_header_texts", state.get("signal_header_texts", {}))
                         state.setdefault("signal_snapshot_meta", state.get("signal_snapshot_meta", {}))
+                        state.setdefault("training_signal_records", state.get("training_signal_records", {}))
+                        state.setdefault("training_fixture_index", state.get("training_fixture_index", {}))
                         logger.info(f"[STATE] Loaded state from {STATE_FILE}")
         except Exception:
             logger.exception("Failed to load state")
@@ -5719,6 +6144,8 @@ def start_state_saver_daemon():
     t.start()
 
 os.makedirs(PERSIST_DIR, exist_ok=True)
+_ensure_jsonl_file(MATCH_SNAPSHOTS_JSONL_PATH)
+_ensure_jsonl_file(MATCH_OUTCOMES_JSONL_PATH)
 load_persistent_state()
 load_matches_state()
 load_leagues_state()
@@ -5779,6 +6206,7 @@ def save_signal_snapshot_state(
     chat_id: Optional[int],
     prob_to75: Optional[float] = None,
     prob_to90: Optional[float] = None,
+    signal_model: Optional[str] = None,
 ) -> None:
     with state_lock:
         state.setdefault("signal_header_texts", {})[str(match_id)] = str(header_text or "")
@@ -5790,6 +6218,7 @@ def save_signal_snapshot_state(
             "chat_id": int(chat_id) if chat_id else None,
             "prob_to75": float(prob_to75) if prob_to75 is not None else None,
             "prob_to90": float(prob_to90) if prob_to90 is not None else None,
+            "signal_model": str(signal_model) if signal_model is not None else None,
         }
         mark_state_dirty()
 
@@ -6291,14 +6720,17 @@ def validate_telegram_target():
     """
     ok = True
     
-    # Check bot token
-    status, body = _tg_get("getMe")
-    if status != 200 or not body or not body.get("ok"):
-        logger.error("[TG] getMe failed. Check TELEGRAM_TOKEN.")
+    if not TELEGRAM_TOKEN:
+        logger.error("[TG] TELEGRAM_TOKEN not set.")
         ok = False
     else:
-        bot_username = body.get("result", {}).get("username", "unknown")
-        logger.info(f"[TG] Bot validated: @{bot_username}")
+        status, body = _tg_get("getMe")
+        if status != 200 or not body or not body.get("ok"):
+            logger.error("[TG] getMe failed. Check TELEGRAM_TOKEN.")
+            ok = False
+        else:
+            bot_username = body.get("result", {}).get("username", "unknown")
+            logger.info(f"[TG] Bot validated: @{bot_username}")
     
     # Check chat_id
     if not TELEGRAM_CHAT_ID:
@@ -6332,6 +6764,10 @@ def send_to_telegram(
     score_at_signal: Optional[Tuple[int, int]] = None,
     signal_minute: Optional[int] = None,
 ) -> Optional[int]:
+    if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is None:
+        logger.warning("[TG] Telegram send skipped: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not configured.")
+        return None
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     
@@ -7850,7 +8286,7 @@ def _apply_auto_signal_prob_boost(base_prob_percent: float, score: float, league
 def send_review_to_admin(fixture_id: int, data: Dict[str, Any], prob: float, minute: int) -> bool:
     """
     Send review request to admin for moderation.
-    Uses ADMIN_USER_ID from config.json (loaded at startup).
+    Uses ADMIN_USER_ID from config_test.json (loaded at startup).
     
     Args:
         fixture_id: Match fixture ID
@@ -9901,12 +10337,10 @@ def get_channel_keyboard() -> Dict[str, Any]:
 
 def send_permanent_instruction_message():
     """Send permanent instruction message to the channel (only once)."""
+    global BOT_USERNAME
     with persistent_state_lock:
         if persistent_state.get("instruction_message_id"):
             return
-    
-    # Hardcoded bot username to avoid initialization issues
-    BOT_USERNAME = "Test_Z1z1Z_Bot"
     
     instruction_text = (
         "👁️ Инструкция\n\n"
@@ -9914,25 +10348,31 @@ def send_permanent_instruction_message():
         "перейдите в личные сообщения бота 🔻"
     )
     
-    # Create URL button that opens bot with /start
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "🔘Открыть бота",
-                    "url": f"https://t.me/{BOT_USERNAME}?start=strategy"
-                }
+    # Create URL button that opens bot with /start (only if BOT_USERNAME is configured)
+    keyboard = None
+    if BOT_USERNAME:
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🔘Открыть бота",
+                        "url": f"https://t.me/{BOT_USERNAME}?start=strategy"
+                    }
+                ]
             ]
-        ]
-    }
+        }
+    else:
+        logger.warning("[TG] BOT_USERNAME not configured in .env - instruction button will not be shown")
     
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": instruction_text,
-            "reply_markup": json.dumps(keyboard)
+            "text": instruction_text
         }
+        if keyboard:
+            payload["reply_markup"] = json.dumps(keyboard)
+        
         r = requests.post(url, data=payload, timeout=10)
         
         if r.ok:
@@ -10951,8 +11391,93 @@ def compute_coverage_score(fixture_metrics: Dict[str, Any]) -> Tuple[float, List
         match_id = fixture_metrics.get("match_id") or fixture_metrics.get("id")
         logger.debug(f"[COVERAGE_DEBUG] match={match_id} score={score:.2f} missing={missing_list} details={debug_info}")
     
-    
     return score, missing_list
+
+
+def is_first_signal_snapshot_ready(
+    fixture_metrics: Dict[str, Any],
+    minute: int,
+    prob_next_15: float,
+    prob_second_half_remain: float,
+) -> Tuple[bool, str]:
+    """Check whether the first ordinary 47+ signal snapshot is stable enough.
+
+    Applied ONLY before the first regular signal per match. Updates skip this check.
+
+    Checks:
+    1. Not in halftime/transitional status
+    2. Minute is actually in second half
+    3. Near-kickoff of second half: require at least minimal live activity
+    4. Post-goal transitional state: score vs xG coherence
+    5. Critically missing data (all-zero aggregates in mid-game)
+    6. Extreme probability with weak live metrics
+    7. Suspicious first snapshot at minute 47 with near-zero metrics
+    """
+    # 1. Status must NOT be halftime / transition
+    status_short = _normalize_status_short(fixture_metrics)
+    if status_short in ("HT", "1H", "HALFTIME"):
+        return False, "halftime state"
+
+    # 2. Must actually be in second half
+    if minute < REGULAR_SIGNAL_MIN_MINUTE:
+        return False, f"not yet in second half (minute={minute})"
+
+    xg_home = float(get_any_metric(fixture_metrics, ["expected_goals"], "home") or 0.0)
+    xg_away = float(get_any_metric(fixture_metrics, ["expected_goals"], "away") or 0.0)
+    xg_total = xg_home + xg_away
+
+    shots_on_target_home = float(get_any_metric(fixture_metrics, ["shots_on_target"], "home") or 0.0)
+    shots_on_target_away = float(get_any_metric(fixture_metrics, ["shots_on_target"], "away") or 0.0)
+    shots_on_target_total = shots_on_target_home + shots_on_target_away
+
+    shots_in_box_home = float(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box"], "home") or 0.0)
+    shots_in_box_away = float(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box"], "away") or 0.0)
+    shots_in_box_total = shots_in_box_home + shots_in_box_away
+
+    attacks_home = float(get_any_metric(fixture_metrics, ["attacks"], "home") or 0.0)
+    attacks_away = float(get_any_metric(fixture_metrics, ["attacks"], "away") or 0.0)
+    total_attacks = attacks_home + attacks_away
+    tempo = total_attacks / max(1.0, 24.0)
+
+    score_home = int(get_metric_from_fixture(fixture_metrics, "score_home", 0) or 0)
+    score_away = int(get_metric_from_fixture(fixture_metrics, "score_away", 0) or 0)
+    total_goals = score_home + score_away
+
+    pressure_index = float(calculate_pressure_index(fixture_metrics) or 0.0)
+
+    # 3. Near second-half start: require minimal live second-half activity
+    if minute <= 48:
+        if xg_total < 0.2 and total_attacks < 5:
+            return False, (
+                f"transitional at 2H start: minute={minute} xg_total={xg_total:.2f} "
+                f"attacks={total_attacks:.0f} — waiting for stable snapshot"
+            )
+
+    # 4. Post-goal transitional: score exists but xG is near-zero (stats not yet updated)
+    if total_goals > 0 and xg_total < 0.1:
+        return False, (
+            f"post-goal transitional: score={score_home}-{score_away} "
+            f"but xg_total={xg_total:.2f} — stats lag after goal"
+        )
+
+    # 5. Critically missing data (mid-game, all-zero aggregates)
+    if minute >= 52 and xg_total < 0.05 and shots_on_target_total == 0 and shots_in_box_total == 0:
+        return False, (
+            f"critically missing data at minute={minute}: "
+            f"xg_total={xg_total:.2f} shots_on_target=0 shots_in_box=0"
+        )
+
+    # 6. Extreme probability with weak live metrics
+    if prob_second_half_remain >= 95.0 or prob_next_15 >= 85.0:
+        if xg_total < 0.7 and shots_on_target_total < 3 and shots_in_box_total < 5:
+            return False, "weak live metrics with extreme probability"
+
+    # 7. Suspicious first snapshot (minute 47) with nearly zero live metrics
+    if minute == REGULAR_SIGNAL_MIN_MINUTE:
+        if prob_second_half_remain >= 92.0 and xg_total < 0.4 and tempo < 0.5 and shots_on_target_total < 2:
+            return False, "suspicious first snapshot with almost zero live metrics"
+
+    return True, ""
 
 
 def estimate_team_xg(shots_total: Any, shots_on_target: Any, shots_in_box: Any, 
@@ -11517,6 +12042,317 @@ def compute_lambda_and_probability(fixture_metrics: Dict[str,Any], minute: int, 
         return {"lambda_home":0.001,"lambda_away":0.001,"prob_goal_either_to75":0.0,"prob_next_goal_home":0.0,"prob_next_goal_away":0.0,"pred_xg_home_to_75":0.0,"pred_xg_away_to_75":0.0}
 
 # -------------------------
+# New 45+ Minute Probability Model
+# -------------------------
+
+def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) -> Dict[str, Any]:
+    """
+    Compute probability model optimized for second half signals (45+ minutes).
+    
+    Focuses on: "How likely is the next goal in the second half given current match state?"
+    
+    Returns:
+        Dictionary with:
+        - prob_next_15: probability of goal in next 15 minutes (%)
+        - prob_second_half_remain: probability of goal until end of second half (%)
+        - prob_to75: legacy compatibility (%)
+        - prob_to90: legacy compatibility (%)
+        - lambda_2h: second half goal intensity per minute
+        - game_state_factor: score-based multiplier
+        - goal_xg_gap_factor: realization gap multiplier
+        - combined_m_2h: second half league/team context
+        - time_zone_factor: time-based urgency multiplier
+    """
+    try:
+        # Extract basic metrics
+        raw_xg_home = get_any_metric(fixture_metrics, ["expected_goals"], "home")
+        raw_xg_away = get_any_metric(fixture_metrics, ["expected_goals"], "away")
+        try:
+            raw_xg_home = float(raw_xg_home) if raw_xg_home not in (None, "", "N/A") else None
+        except (TypeError, ValueError):
+            raw_xg_home = None
+        try:
+            raw_xg_away = float(raw_xg_away) if raw_xg_away not in (None, "", "N/A") else None
+        except (TypeError, ValueError):
+            raw_xg_away = None
+
+        if raw_xg_home is not None and raw_xg_home > 0.0:
+            xg_home = raw_xg_home
+            xg_home_source = "api"
+        else:
+            xg_home = max(0.0, float(estimate_xg_from_metrics_combined(fixture_metrics, "home") or 0.0))
+            xg_home_source = "fallback_estimated"
+
+        if raw_xg_away is not None and raw_xg_away > 0.0:
+            xg_away = raw_xg_away
+            xg_away_source = "api"
+        else:
+            xg_away = max(0.0, float(estimate_xg_from_metrics_combined(fixture_metrics, "away") or 0.0))
+            xg_away_source = "fallback_estimated"
+
+        xg_source = "api" if xg_home_source == "api" and xg_away_source == "api" else "fallback_estimated"
+        xg_total = xg_home + xg_away
+        xg_delta = abs(xg_home - xg_away)
+        
+        score_home = int(get_metric_from_fixture(fixture_metrics, "score_home", 0) or 0)
+        score_away = int(get_metric_from_fixture(fixture_metrics, "score_away", 0) or 0)
+        total_goals = score_home + score_away
+        
+        goal_xg_gap = total_goals - xg_total
+        
+        pressure_index = float(calculate_pressure_index(fixture_metrics) or 0.0)
+        pressure_norm = clamp(pressure_index / 25.0, 0.0, 1.0)
+        
+        shots_on_target_home = float(get_any_metric(fixture_metrics, ["shots_on_target"], "home") or 0.0)
+        shots_on_target_away = float(get_any_metric(fixture_metrics, ["shots_on_target"], "away") or 0.0)
+        shots_on_target_total = shots_on_target_home + shots_on_target_away
+        shots_on_target_norm = clamp(shots_on_target_total / 8.0, 0.0, 1.0)
+        
+        shots_in_box_home = float(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box"], "home") or 0.0)
+        shots_in_box_away = float(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box"], "away") or 0.0)
+        shots_in_box_total = shots_in_box_home + shots_in_box_away
+        shots_in_box_norm = clamp(shots_in_box_total / 10.0, 0.0, 1.0)
+        
+        save_stress = calculate_save_stress(
+            saves_home=float(get_any_metric(fixture_metrics, ["saves"], "home") or 0.0),
+            saves_away=float(get_any_metric(fixture_metrics, ["saves"], "away") or 0.0),
+            current_home_score=score_home,
+            current_away_score=score_away,
+            shots_on_target_home=shots_on_target_home,
+            shots_on_target_away=shots_on_target_away
+        )
+        save_stress_norm = clamp(save_stress, 0.0, 1.0)
+        
+        attacks_home = float(get_any_metric(fixture_metrics, ["attacks"], "home") or 0.0)
+        attacks_away = float(get_any_metric(fixture_metrics, ["attacks"], "away") or 0.0)
+        tempo = (attacks_home + attacks_away) / max(1.0, 24.0)  # attacks per minute baseline
+        tempo_norm = clamp(tempo / 2.0, 0.0, 1.0)
+        
+        total_shots_home = float(get_any_metric(fixture_metrics, ["total_shots"], "home") or 0.0)
+        total_shots_away = float(get_any_metric(fixture_metrics, ["total_shots"], "away") or 0.0)
+        total_shots = total_shots_home + total_shots_away
+        total_shots_norm = clamp(total_shots / 20.0, 0.0, 1.0)
+        
+        possession_home = float(get_any_metric(fixture_metrics, ["ball_possession", "passes_%"], "home") or 50.0)
+        possession_away = float(get_any_metric(fixture_metrics, ["ball_possession", "passes_%"], "away") or 50.0)
+        possession_diff = abs(possession_home - possession_away)
+        possession_pressure = possession_diff / 100.0 if possession_diff > 1.0 else possession_diff
+        possession_pressure_norm = clamp(possession_pressure, 0.0, 1.0)
+        
+        # Game state factor based on current score
+        score_state = f"{score_home}-{score_away}"
+        if score_state in ["1-1", "2-1", "1-2", "2-2"]:
+            game_state_factor = 1.08  # Boost for competitive scores (cooled from 1.15)
+        elif score_state in ["1-0", "0-1"]:
+            game_state_factor = 1.04  # Moderate boost for slight leads (cooled from 1.08)
+        elif score_state == "0-0":
+            # Smarter 0-0 logic based on live context
+            live_context_score = (
+                0.3 * pressure_norm +
+                0.3 * shots_on_target_norm +
+                0.2 * shots_in_box_norm +
+                0.2 * clamp(xg_total / 2.0, 0.0, 1.0)
+            )
+            if live_context_score > 0.6:
+                game_state_factor = 1.03  # Moderate boost for active 0-0 (cooled from 1.05)
+            elif live_context_score > 0.3:
+                game_state_factor = 1.0  # Neutral for moderate activity
+            else:
+                game_state_factor = 0.97  # Slight cool down for inactive 0-0 (cooled from 0.95)
+        elif score_state in ["2-0", "0-2"]:
+            game_state_factor = 0.95  # Slight cool down for 2-goal leads (cooled from 0.92)
+        elif total_goals >= 3 and xg_total < 1.5:
+            game_state_factor = 0.90  # Cool down for high scores with low xG (cooled from 0.85)
+        else:
+            game_state_factor = 1.0  # Neutral
+        
+        # Goal xG gap factor (realization gap)
+        if goal_xg_gap < -1.5:
+            goal_xg_gap_factor = 1.06  # Strong under-realization -> boost (cooled from 1.12)
+        elif goal_xg_gap < -0.5:
+            goal_xg_gap_factor = 1.03  # Moderate under-realization -> slight boost (cooled from 1.06)
+        elif goal_xg_gap > 1.5:
+            goal_xg_gap_factor = 0.94  # Strong over-realization -> cool down (cooled from 0.88)
+        elif goal_xg_gap > 0.5:
+            goal_xg_gap_factor = 0.97  # Moderate over-realization -> slight cool down (cooled from 0.94)
+        else:
+            goal_xg_gap_factor = 1.0  # Neutral
+        
+        # XG delta factor (helps matches where one team dominates)
+        if xg_delta >= 1.5:
+            xg_delta_factor = 1.08  # Strong dominance -> moderate boost
+        elif xg_delta >= 0.8:
+            xg_delta_factor = 1.04  # Moderate dominance -> slight boost
+        elif xg_delta >= 0.3:
+            xg_delta_factor = 1.02  # Slight dominance -> minimal boost
+        else:
+            xg_delta_factor = 1.0  # Balanced or close -> neutral
+        
+        # Urgency factor (smarter time-based urgency considering score)
+        score_diff = abs(score_home - score_away)
+        is_close_score = score_diff <= 1
+        is_draw = score_home == score_away
+        
+        if minute >= 75:
+            if is_close_score:
+                urgency_factor = 1.10  # High urgency in late game with close score (cooled from 1.18)
+            elif score_diff == 2:
+                urgency_factor = 1.06  # Moderate urgency for 2-goal leads (cooled from 1.12)
+            else:
+                urgency_factor = 1.04  # Lower urgency for comfortable leads (cooled from 1.08)
+        elif minute >= 60:
+            if is_draw or score_diff == 1:
+                urgency_factor = 1.05  # Moderate urgency for competitive scores (cooled from 1.10)
+            else:
+                urgency_factor = 1.02  # Slight urgency for leads (cooled from 1.05)
+        else:  # 45-59
+            urgency_factor = 1.01  # Minimal urgency early in second half (cooled from 1.02)
+        
+        # League/team context (use existing but softer)
+        team_boosts = calc_match_team_boost_v2(fixture_metrics)
+        combined_m_2h = float(team_boosts.get("combined_m", 1.0) or 1.0)
+        # Soften the league/team influence for 45+ model
+        combined_m_2h = 1.0 + (combined_m_2h - 1.0) * 0.6  # Reduce influence by 40%
+        combined_m_2h = clamp(combined_m_2h, 0.85, 1.25)
+        
+        # Live intensity base (normalized metrics combination)
+        live_intensity = (
+            0.25 * clamp(xg_total / 2.0, 0.0, 1.0) +
+            0.20 * pressure_norm +
+            0.18 * shots_on_target_norm +
+            0.15 * shots_in_box_norm +
+            0.12 * save_stress_norm +
+            0.10 * tempo_norm +  # Increased from 0.08
+            0.00 * total_shots_norm  # Reduced from 0.02, now minimal
+        )
+        
+        # Apply multipliers with softened combined boost (instead of direct multiplication)
+        # Calculate individual boost contributions (deviation from 1.0)
+        game_state_boost = game_state_factor - 1.0
+        goal_xg_gap_boost = goal_xg_gap_factor - 1.0
+        xg_delta_boost = xg_delta_factor - 1.0
+        combined_m_boost = combined_m_2h - 1.0
+        urgency_boost = urgency_factor - 1.0
+        
+        # Soften each boost by 50% and combine additively, then apply to base
+        total_boost = (
+            0.5 * game_state_boost +
+            0.4 * goal_xg_gap_boost +
+            0.3 * xg_delta_boost +
+            0.3 * combined_m_boost +
+            0.4 * urgency_boost
+        )
+        
+        # Clamp total boost to prevent extremes
+        total_boost = clamp(total_boost, -0.12, 0.18)  # Max cool down 12%, max boost 18% (narrowed from -0.3/+0.4)
+        
+        adjusted_intensity = live_intensity * (1.0 + total_boost)
+        
+        # Lambda for second half (goals per minute) - controlled scaling
+        lambda_2h = clamp(LAMBDA_2H_FLOOR + adjusted_intensity * LAMBDA_2H_SCALE, LAMBDA_2H_FLOOR, LAMBDA_2H_CAP)
+        
+        # Calculate probabilities
+        prob_next_15 = 1.0 - math.exp(-lambda_2h * 15.0)
+        prob_next_15_pct = prob_next_15 * 100.0
+        
+        # Remaining time in second half (assume 90 min total) - softened for cooling
+        remaining_minutes = max(0, 90 - minute)
+        remaining_minutes_adjusted = min(remaining_minutes, 25.0)  # Cap at 25 minutes to cool down
+        prob_second_half_remain = 1.0 - math.exp(-lambda_2h * remaining_minutes_adjusted)
+        prob_second_half_remain_pct = prob_second_half_remain * 100.0
+        
+        anti_garbage_passed = True
+
+        # Anti-garbage filter for weak matches
+        if prob_second_half_remain_pct > 80.0:
+            is_weak_match = (
+                xg_total < 1.0 or
+                shots_on_target_total < 4 or
+                shots_in_box_total < 6
+            )
+            if is_weak_match:
+                anti_garbage_passed = False
+                prob_second_half_remain_pct *= 0.75  # Cool down by 25% for weak matches
+                prob_second_half_remain_pct = min(prob_second_half_remain_pct, 85.0)  # Cap at 85%
+
+        # Legacy compat: prob_to75 / prob_to90 (explicit Poisson estimates)
+        remain_to75 = max(0.0, 75.0 - float(minute))
+        remain_to90 = max(0.0, 90.0 - float(minute))
+        prob_to75 = (1.0 - math.exp(-lambda_2h * remain_to75)) * 100.0
+        prob_to90 = (1.0 - math.exp(-lambda_2h * remain_to90)) * 100.0
+
+        logger.info(
+            f"[PROB_45+] fixture_id={get_fixture_id(fixture_metrics)} minute={minute} score_state={score_state} "
+            f"xg_source={xg_source} xg_home_source={xg_home_source} xg_away_source={xg_away_source} "
+            f"xg_home={xg_home:.2f} xg_away={xg_away:.2f} xg_total={xg_total:.2f} xg_delta={xg_delta:.2f} goal_xg_gap={goal_xg_gap:.2f} "
+            f"pressure_index={pressure_index:.2f} shots_on_target_total={shots_on_target_total:.1f} "
+            f"shots_in_box_total={shots_in_box_total:.1f} save_stress={save_stress:.3f} tempo={tempo:.2f} "
+            f"live_intensity={live_intensity:.3f} adjusted_intensity={adjusted_intensity:.3f} "
+            f"game_state_factor={game_state_factor:.3f} "
+            f"goal_xg_gap_factor={goal_xg_gap_factor:.3f} xg_delta_factor={xg_delta_factor:.3f} "
+            f"combined_m_2h={combined_m_2h:.3f} urgency_factor={urgency_factor:.3f} "
+            f"lambda_2h={lambda_2h:.4f} remaining_minutes_adjusted={remaining_minutes_adjusted:.1f} "
+            f"prob_next_15={prob_next_15_pct:.2f}% prob_second_half_remain={prob_second_half_remain_pct:.2f}%"
+        )
+        
+        return {
+            "prob_next_15": round(prob_next_15_pct, 2),
+            "prob_second_half_remain": round(prob_second_half_remain_pct, 2),
+            "prob_to75": round(prob_to75, 2),
+            "prob_to90": round(prob_to90, 2),
+            "lambda_2h": round(lambda_2h, 4),
+            "game_state_factor": round(game_state_factor, 3),
+            "goal_xg_gap_factor": round(goal_xg_gap_factor, 3),
+            "xg_delta_factor": round(xg_delta_factor, 3),
+            "combined_m_2h": round(combined_m_2h, 3),
+            "urgency_factor": round(urgency_factor, 3),
+            # Additional metadata
+            "live_intensity": round(live_intensity, 3),
+            "adjusted_intensity": round(adjusted_intensity, 3),
+            "remaining_minutes_adjusted": round(remaining_minutes_adjusted, 1),
+            "xg_total": round(xg_total, 2),
+            "xg_delta": round(xg_delta, 2),
+            "pressure_index": round(pressure_index, 2),
+            "shots_on_target_total": round(shots_on_target_total, 1),
+            "shots_in_box_total": round(shots_in_box_total, 1),
+            "save_stress": round(save_stress, 3),
+            "tempo": round(tempo, 2),
+            "total_shots": round(total_shots, 1),
+            "score_state": score_state,
+            "goal_xg_gap": round(goal_xg_gap, 2),
+            "anti_garbage_passed": anti_garbage_passed,
+        }
+        
+    except Exception:
+        logger.exception("compute_probability_45_plus")
+        return {
+            "prob_next_15": 0.0,
+            "prob_second_half_remain": 0.0,
+            "prob_to75": 0.0,
+            "prob_to90": 0.0,
+            "lambda_2h": 0.001,
+            "game_state_factor": 1.0,
+            "goal_xg_gap_factor": 1.0,
+            "xg_delta_factor": 1.0,
+            "combined_m_2h": 1.0,
+            "urgency_factor": 1.0,
+            "live_intensity": 0.0,
+            "adjusted_intensity": 0.0,
+            "remaining_minutes_adjusted": 0.0,
+            "xg_total": 0.0,
+            "xg_delta": 0.0,
+            "pressure_index": 0.0,
+            "shots_on_target_total": 0.0,
+            "shots_in_box_total": 0.0,
+            "save_stress": 0.0,
+            "tempo": 0.0,
+            "total_shots": 0.0,
+            "score_state": "0-0",
+            "goal_xg_gap": 0.0,
+            "anti_garbage_passed": False,
+        }
+
+# -------------------------
 # Monitoring & handling events after sending a signal
 # -------------------------
 def _make_event_key(ev: Dict[str, Any]) -> str:
@@ -11927,10 +12763,30 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
 
         need_refresh = can_edit_now or score_changed or is_finished
 
+        signal_meta = {}
+        with state_lock:
+            signal_meta = state.get("signal_snapshot_meta", {}).get(str(match_id), {}) or {}
+        signal_model = str(signal_meta.get("signal_model") or "")
+
         res = None
+        prob_90 = None
         if need_refresh:
-            res = compute_lambda_and_probability(fixture, minute)
-            prob_now = res.get("prob_goal_either_to75", 0.0)
+            if signal_model == "45_plus":
+                res = compute_probability_45_plus(fixture, minute)
+                prob_now = res.get("prob_second_half_remain", 0.0)
+                prob_90 = res.get("prob_to90") if res else None
+                logger.info(
+                    f"[UPDATE_47+] match={match_id} minute={minute} "
+                    f"pipeline=compute_probability_45_plus "
+                    f"live_intensity={res.get('adjusted_intensity', 0.0):.3f} "
+                    f"lambda_2h={res.get('lambda_2h', 0.0):.4f} "
+                    f"prob_next_15={res.get('prob_next_15', 0.0):.2f}% "
+                    f"prob_second_half_remain={prob_now:.2f}%"
+                )
+            else:
+                res = compute_lambda_and_probability(fixture, minute)
+                prob_now = res.get("prob_goal_either_to75", 0.0)
+                prob_90 = res.get("prob_goal_either_to90") if res else None
         else:
             with state_lock:
                 prob_now = state.setdefault("match_prob_status", {}).get(str(match_id), 0.0)
@@ -11939,7 +12795,6 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
 
         if need_refresh and not st.get("finalized", False) and not is_finished:
             is_admin_approved = st.get("approved_by_admin", False)
-            prob_90 = res.get("prob_goal_either_to90") if res else None
             main_text = render_live_message(
                 current_data=data,
                 signal_score=signal_score_snapshot,
@@ -11967,8 +12822,12 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                     state["match_goal_status"][str(match_id)]["score"] = current_score
 
                 if not is_finished:
-                    prob_next_15 = res.get("prob_next_15", 0.0) if res else 0.0
-                    prob_until_end = res.get("prob_until_end", 0.0) if res else 0.0
+                    if signal_model == "45_plus":
+                        prob_next_15 = res.get("prob_next_15", 0.0) if res else 0.0
+                        prob_until_end = res.get("prob_second_half_remain", 0.0) if res else 0.0
+                    else:
+                        prob_next_15 = res.get("prob_next_15", 0.0) if res else 0.0
+                        prob_until_end = res.get("prob_until_end", 0.0) if res else 0.0
                     save_match_to_sheet(
                         match_id,
                         data,
@@ -12780,7 +13639,10 @@ def main_loop():
     client = APISportsMetricsClient(api_key=API_FOOTBALL_KEY, host=API_FOOTBALL_HOST, cache_ttl=CACHE_TTL)
     start_monitor_daemon(client)
     start_callback_handler_daemon()  # Start callback handler for inline buttons
-    start_review_timeout_daemon()  # Start review timeout checker for auto-skip after 10 minutes
+    if ENABLE_ADMIN_REVIEW_SIGNALS:
+        start_review_timeout_daemon()  # Start review timeout checker for auto-skip after 10 minutes
+    else:
+        logger.info("[REVIEW_DISABLED] Review timeout daemon disabled - admin/review signals are turned off")
     # DISABLED: admin_review_daemon no longer needed - review messages sent once and never edited
     # start_admin_review_daemon(client)  # Start admin review updater for DM messages
     start_daily_stats_checker_daemon()  # Start daily stats checker for 23:59 rule
@@ -12871,9 +13733,20 @@ def main_loop():
                             logger.debug(f"[LOOP] Skipping early match {fixture_id} minute={minute_i} (<{MATCH_MIN_MINUTE})")
                             continue
 
-                        # Блокировать новые сигналы после MATCH_MAX_MINUTE, но НЕ для уже отслеживаемых
-                        if minute_i > MATCH_MAX_MINUTE:
-                            logger.debug(f"[LOOP] Skipping late match {fixture_id} minute={minute_i} (>{MATCH_MAX_MINUTE})")
+                        # Skip ordinary detailed processing for matches before the regular ordinary-signal window
+                        if minute_i < REGULAR_SIGNAL_MIN_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
+                            logger.info(
+                                f"[BLOCK_PRE_46] fixture_id={fixture_id} minute={minute_i} "
+                                f"reason=ordinary_signals_start_from_{REGULAR_SIGNAL_MIN_MINUTE}"
+                            )
+                            continue
+
+                        # Avoid extra fetches for post-window ordinary signals when review mode is disabled.
+                        if minute_i > REGULAR_SIGNAL_MAX_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
+                            logger.info(
+                                f"[BLOCK_POST_60] fixture_id={fixture_id} minute={minute_i} "
+                                f"reason=ordinary_signals_stop_after_{REGULAR_SIGNAL_MAX_MINUTE}"
+                            )
                             continue
 
                         data = client.collect_match_all(fixture_id)
@@ -12910,10 +13783,30 @@ def main_loop():
                                 continue
 
                         minute = int((fixture_metrics.get("elapsed") or {}).get("value") or minute_i or 0)
-                        # Блокировать новые сигналы после MATCH_MAX_MINUTE
-                        if minute > MATCH_MAX_MINUTE:
-                            logger.debug(f"[LOOP] Skipping late match {fixture_id} minute={minute} (>{MATCH_MAX_MINUTE})")
+                        # Preserve existing review/admin flow; ordinary-window blocks are enforced later.
+                        if minute > REGULAR_SIGNAL_MAX_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
+                            logger.info(
+                                f"[BLOCK_POST_60] fixture_id={fixture_id} minute={minute} "
+                                f"reason=ordinary_signals_stop_after_{REGULAR_SIGNAL_MAX_MINUTE}"
+                            )
                             continue
+
+                        if minute < REGULAR_SIGNAL_MIN_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
+                            logger.info(
+                                f"[BLOCK_PRE_46] fixture_id={fixture_id} minute={minute} "
+                                f"reason=ordinary_signals_start_from_{REGULAR_SIGNAL_MIN_MINUTE}"
+                            )
+                            continue
+
+                        # Skip the first regular 46+ evaluation if the transitional metrics are not stable yet
+                        if minute == REGULAR_SIGNAL_MIN_MINUTE:
+                            coverage, missing = compute_coverage_score(fixture_metrics)
+                            if coverage < 0.85:
+                                logger.info(
+                                    f"[TRANSITION] fixture_id={fixture_id} minute={minute} coverage={coverage:.2f} "
+                                    f"missing={missing} - skipping first regular update until stats stabilize"
+                                )
+                                continue
 
                         res = compute_lambda_and_probability(fixture_metrics, minute)
                         prob_actual = res.get("prob_goal_either_to75", 0.0)
@@ -12924,226 +13817,326 @@ def main_loop():
                         logger.info(f"[EVAL] match={fixture_id} minute={minute} prob={prob_actual}%")
                         
                         # REVIEW MODE: Check if probability is in review range (50-79.999%)
-                        if REVIEW_MIN_THRESHOLD <= prob_actual < PROB_SEND_THRESHOLD:
-                            logger.info(f"[REVIEW] match={fixture_id} prob={prob_actual:.1f}% -> REVIEW mode (queuing for admin)")
-                            # Early strict mode filter still applies to REVIEW
-                            if not check_early_strict_mode(fixture_metrics, minute):
-                                logger.info(f"[REVIEW] match={fixture_id} BLOCKED by early strict mode at minute {minute}")
+                        if minute >= REVIEW_PIPELINE_MIN_MINUTE and REVIEW_MIN_THRESHOLD <= prob_actual < PROB_SEND_THRESHOLD:
+                            if ENABLE_ADMIN_REVIEW_SIGNALS:
+                                logger.info(f"[REVIEW] match={fixture_id} prob={prob_actual:.1f}% -> REVIEW mode (queuing for admin)")
+                                # Early strict mode filter still applies to REVIEW
+                                if not check_early_strict_mode(fixture_metrics, minute):
+                                    logger.info(f"[REVIEW] match={fixture_id} BLOCKED by early strict mode at minute {minute}")
+                                    continue
+                                # Send to admin for review
+                                send_review_to_admin(fixture_id, data, prob_actual, minute)
+                                continue  # Don't auto-send, wait for admin decision
+                            else:
+                                logger.info(f"[REVIEW_DISABLED] match={fixture_id} prob={prob_actual:.1f}% -> REVIEW mode disabled, skipping to 45+ logic")
+
+                        # NEW 45+ LOGIC: ordinary signals work only inside the new 46-60 window
+                        if minute < REGULAR_SIGNAL_MIN_MINUTE:
+                            logger.info(
+                                f"[BLOCK_PRE_46] fixture_id={fixture_id} minute={minute} "
+                                f"reason=ordinary_signals_start_from_{REGULAR_SIGNAL_MIN_MINUTE}"
+                            )
+                            continue
+
+                        if minute > REGULAR_SIGNAL_MAX_MINUTE:
+                            logger.info(
+                                f"[BLOCK_POST_60] fixture_id={fixture_id} minute={minute} "
+                                f"reason=ordinary_signals_stop_after_{REGULAR_SIGNAL_MAX_MINUTE}"
+                            )
+                            continue
+
+                        # Use new 45+ probability model
+                        res_45 = compute_probability_45_plus(fixture_metrics, minute)
+                        prob_next_15 = res_45.get("prob_next_15", 0.0)
+                        prob_second_half_remain = res_45.get("prob_second_half_remain", 0.0)
+                        anti_garbage_passed = bool(res_45.get("anti_garbage_passed", True))
+
+                        live_gate_checks: Dict[str, bool] = {}
+                        live_gate_passed_count: Optional[int] = None
+                        xg_total = 0.0
+                        shots_on_target_total = 0.0
+                        shots_in_box_total = 0.0
+                        pressure_index = 0.0
+
+                        if minute <= REGULAR_SIGNAL_WINDOW_1_MAX_MINUTE:
+                            window_tag = "WINDOW_1_46_53"
+                            allow_tag = "ALLOW_WINDOW_1"
+                            block_tag = "BLOCK_WINDOW_1"
+                            threshold_next15 = WINDOW_1_NEXT_15_THRESHOLD
+                            threshold_remain = WINDOW_1_REMAIN_THRESHOLD
+                            logger.info(
+                                f"[{window_tag}] fixture_id={fixture_id} minute={minute} "
+                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
+                                f"anti_garbage_passed={anti_garbage_passed} rule_path=window_1_hard_requirements"
+                            )
+                        else:
+                            window_tag = "WINDOW_2_54_60"
+                            allow_tag = "ALLOW_WINDOW_2"
+                            block_tag = "BLOCK_WINDOW_2"
+                            threshold_next15 = WINDOW_2_NEXT_15_THRESHOLD
+                            threshold_remain = WINDOW_2_REMAIN_THRESHOLD
+                            xg_total = float(res_45.get("xg_total", 0.0) or 0.0)
+                            shots_on_target_total = float(res_45.get("shots_on_target_total", 0.0) or 0.0)
+                            shots_in_box_total = float(res_45.get("shots_in_box_total", 0.0) or 0.0)
+                            pressure_index = float(res_45.get("pressure_index", 0.0) or 0.0)
+                            live_gate_checks = {
+                                "xg_total": xg_total >= 1.10,
+                                "shots_on_target_total": shots_on_target_total >= 4.0,
+                                "shots_in_box_total": shots_in_box_total >= 7.0,
+                                "pressure_index": pressure_index >= 18.0,
+                            }
+                            live_gate_passed_count = sum(1 for passed in live_gate_checks.values() if passed)
+                            logger.info(
+                                f"[{window_tag}] fixture_id={fixture_id} minute={minute} "
+                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
+                                f"live_gate_passed_count={live_gate_passed_count} "
+                                f"anti_garbage_passed={anti_garbage_passed} rule_path=window_2_hard_requirements"
+                            )
+
+                        live_gate_log_fragment = (
+                            f" live_gate_passed_count={live_gate_passed_count}"
+                            if live_gate_passed_count is not None
+                            else ""
+                        )
+
+                        first_signal_key = str(fixture_id)
+                        with state_lock:
+                            first_signal = first_signal_key not in state.get("sent_matches", {})
+
+                        if first_signal:
+                            ready, reason = is_first_signal_snapshot_ready(
+                                fixture_metrics,
+                                minute,
+                                prob_next_15,
+                                prob_second_half_remain,
+                            )
+                            if not ready:
+                                logger.info(
+                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
+                                    f"{live_gate_log_fragment} reason=readiness readiness_reason={reason}"
+                                )
                                 continue
-                            # Send to admin for review
-                            send_review_to_admin(fixture_id, data, prob_actual, minute)
-                            continue  # Don't auto-send, wait for admin decision
-                        
-                        if should_send_signal(prob_actual, PROB_SEND_THRESHOLD, fixture_metrics):
-                            # Early strict mode filter (15-23 minute)
-                            # Check strict conditions before proceeding with signal
-                            if not check_early_strict_mode(fixture_metrics, minute):
-                                logger.info(f"[EVAL] match={fixture_id} BLOCKED by early strict mode at minute {minute}")
+                            logger.info(
+                                f"[READINESS_OK] fixture_id={fixture_id} minute={minute} "
+                                f"prob_next_15={prob_next_15:.1f}% prob_second_half_remain={prob_second_half_remain:.1f}% "
+                                f"first_signal_snapshot validated"
+                            )
+                        rule_path = ""
+
+                        if not anti_garbage_passed:
+                            logger.info(
+                                f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
+                                f"{live_gate_log_fragment} reason=anti-garbage"
+                            )
+                            continue
+
+                        if window_tag == "WINDOW_1_46_53":
+                            if prob_next_15 < threshold_next15:
+                                logger.info(
+                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
+                                    f"reason=next15"
+                                )
                                 continue
 
-                            if not validate_match_context_before_send(data):
-                                logger.info(f"[EVAL] match={fixture_id} BLOCKED by pre-send validation at minute {minute}")
+                            if prob_second_half_remain < threshold_remain:
+                                logger.info(
+                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
+                                    f"reason=remain"
+                                )
                                 continue
-                            
-                            initial_score = (int((fixture_metrics.get("score_home") or {}).get("value") or 0),
-                                             int((fixture_metrics.get("score_away") or {}).get("value") or 0))
-                            
-                            prob_actual_90 = res.get("prob_goal_either_to90", 0.0)
-                            snapshot_data = _build_signal_snapshot_data(
-                                collected=data,
-                                prob_display=prob_actual,
-                                signal_score=initial_score,
-                                signal_minute=minute,
-                                prob_display_90=prob_actual_90,
-                                is_admin_approved=False,
+
+                            rule_path = "window_1_hard_gate"
+                        else:
+                            if prob_next_15 < threshold_next15:
+                                logger.info(
+                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
+                                    f"{live_gate_log_fragment} reason=next15"
+                                )
+                                continue
+
+                            if prob_second_half_remain < threshold_remain:
+                                logger.info(
+                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
+                                    f"{live_gate_log_fragment} reason=remain"
+                                )
+                                continue
+
+                            if live_gate_passed_count is not None and live_gate_passed_count < WINDOW_2_LIVE_GATE_MIN_PASSED:
+                                logger.info(
+                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
+                                    f"live_gate_passed_count={live_gate_passed_count} reason=live-gate "
+                                    f"xg_total={xg_total:.2f} xg_total_passed={live_gate_checks['xg_total']} "
+                                    f"shots_on_target_total={shots_on_target_total:.1f} shots_on_target_total_passed={live_gate_checks['shots_on_target_total']} "
+                                    f"shots_in_box_total={shots_in_box_total:.1f} shots_in_box_total_passed={live_gate_checks['shots_in_box_total']} "
+                                    f"pressure_index={pressure_index:.2f} pressure_index_passed={live_gate_checks['pressure_index']}"
+                                )
+                                continue
+
+                            rule_path = "window_2_hard_gate"
+
+                        logger.info(
+                            f"[{allow_tag}] fixture_id={fixture_id} minute={minute} "
+                            f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                            f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
+                            f"{live_gate_log_fragment} rule_path={rule_path} lambda_2h={res_45.get('lambda_2h', 0.0):.4f} "
+                            f"pipeline=compute_probability_45_plus"
+                        )
+
+                        # Early strict mode filter still applies for 45+ signals
+                        if not check_early_strict_mode(fixture_metrics, minute):
+                            logger.info(
+                                f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
+                                f"{live_gate_log_fragment} rule_path=blocked_by_early_strict_mode"
                             )
-                            header_text = build_signal_header(snapshot_data)
-                            msg = render_live_message(
-                                current_data=data,
-                                signal_score=initial_score,
-                                prob_display=prob_actual,
-                                prob_display_90=prob_actual_90,
-                                is_admin_approved=False,
+                            continue
+
+                        if not validate_match_context_before_send(data):
+                            logger.info(
+                                f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
+                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
+                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
+                                f"{live_gate_log_fragment} rule_path=blocked_by_pre_send_validation"
                             )
-                            mid_msg = send_to_telegram(
-                                msg,
+                            continue
+
+                        initial_score = (int((fixture_metrics.get("score_home") or {}).get("value") or 0),
+                                         int((fixture_metrics.get("score_away") or {}).get("value") or 0))
+                        
+                        # Keep prob_second_half_remain as the display probability; decision logic above uses both hard gates.
+                        prob_display = prob_second_half_remain
+                        prob_display_90 = res_45.get("prob_to90", prob_second_half_remain)
+                        snapshot_data = _build_signal_snapshot_data(
+                            collected=data,
+                            prob_display=prob_display,
+                            signal_score=initial_score,
+                            signal_minute=minute,
+                            prob_display_90=prob_display_90,
+                            is_admin_approved=False,
+                        )
+                        header_text = build_signal_header(snapshot_data)
+                        msg = render_live_message(
+                            current_data=data,
+                            signal_score=initial_score,
+                            prob_display=prob_display,
+                            prob_display_90=prob_display_90,
+                            is_admin_approved=False,
+                        )
+                        mid_msg = send_to_telegram(
+                            msg,
+                            match_id=fixture_id,
+                            score_at_signal=initial_score,
+                            signal_minute=int(minute),
+                        )
+                        if mid_msg:
+                            logger.info(
+                                f"[{window_tag}] fixture_id={fixture_id} minute={minute} SENT "
+                                f"score_state={initial_score[0]}-{initial_score[1]} "
+                                f"prob_second_half_remain={prob_second_half_remain:.2f} prob_next_15={prob_next_15:.2f} "
+                                f"lambda_2h={res_45.get('lambda_2h', 0.0):.4f}"
+                            )
+                            save_signal_snapshot_state(
                                 match_id=fixture_id,
-                                score_at_signal=initial_score,
-                                signal_minute=int(minute),
+                                header_text=header_text,
+                                signal_score_home=initial_score[0],
+                                signal_score_away=initial_score[1],
+                                signal_minute=minute,
+                                message_id=int(mid_msg),
+                                chat_id=int(TELEGRAM_CHAT_ID),
+                                prob_to75=prob_second_half_remain,
+                                prob_to90=prob_display_90,
+                                signal_model="45_plus",
                             )
-                            if mid_msg:
-                                save_signal_snapshot_state(
-                                    match_id=fixture_id,
-                                    header_text=header_text,
-                                    signal_score_home=initial_score[0],
-                                    signal_score_away=initial_score[1],
-                                    signal_minute=minute,
-                                    message_id=int(mid_msg),
-                                    chat_id=int(TELEGRAM_CHAT_ID),
-                                    prob_to75=prob_actual,
-                                    prob_to90=prob_actual_90,
-                                )
-                                # Calculate initial PressureIndex
-                                fixture_data = data.get("fixture", {})
-                                initial_pressure = calculate_pressure_index(fixture_data)
-                                initial_momentum = 0.0  # First signal has 0 momentum
-                                
-                                # Extract probability values
-                                prob_next_15 = res.get("prob_next_15", prob_actual)
-                                prob_until_end = res.get("prob_until_end", prob_actual)
-                                league_factor_used = res.get("league_factor", 1.0)
-                                _score01_final, match_score_value, _score_metrics = compute_match_score_v2(fixture_metrics, league_factor_used)
-                                
-                                # Create match snapshot for JSONL logging
-                                fixture = fixture_metrics
-                                league_id = fixture.get("league_id", {}).get("value") if isinstance(fixture.get("league_id"), dict) else fixture.get("league_id")
-                                league_name = fixture.get("league_name", {}).get("value") if isinstance(fixture.get("league_name"), dict) else fixture.get("league_name")
-                                season = fixture.get("league_season", {}).get("value") if isinstance(fixture.get("league_season"), dict) else fixture.get("league_season")
-                                home_team_id = fixture.get("team_home_id", {}).get("value") if isinstance(fixture.get("team_home_id"), dict) else fixture.get("team_home_id")
-                                home_team_name = fixture.get("team_home_name", {}).get("value") if isinstance(fixture.get("team_home_name"), dict) else fixture.get("team_home_name")
-                                away_team_id = fixture.get("team_away_id", {}).get("value") if isinstance(fixture.get("team_away_id"), dict) else fixture.get("team_away_id")
-                                away_team_name = fixture.get("team_away_name", {}).get("value") if isinstance(fixture.get("team_away_name"), dict) else fixture.get("team_away_name")
-                                
-                                status_obj = fixture.get("status", {}).get("value") if isinstance(fixture.get("status"), dict) else fixture.get("status") or {}
-                                if isinstance(status_obj, dict):
-                                    status_short = str(status_obj.get("short") or "").upper()
-                                else:
-                                    status_short = ""
-                                
-                                xg_home = float(get_any_metric(fixture, ["expected_goals"], "home") or 0.0)
-                                xg_away = float(get_any_metric(fixture, ["expected_goals"], "away") or 0.0)
-                                shots_home = int(get_any_metric(fixture, ["total_shots"], "home") or 0)
-                                shots_away = int(get_any_metric(fixture, ["total_shots"], "away") or 0)
-                                shots_on_target_home = int(get_any_metric(fixture, ["shots_on_target"], "home") or 0)
-                                shots_on_target_away = int(get_any_metric(fixture, ["shots_on_target"], "away") or 0)
-                                saves_home = int(get_any_metric(fixture, ["saves"], "home") or 0)
-                                saves_away = int(get_any_metric(fixture, ["saves"], "away") or 0)
-                                shots_in_box_home = int(get_any_metric(fixture, ["shots_inside_box"], "home") or 0)
-                                shots_in_box_away = int(get_any_metric(fixture, ["shots_inside_box"], "away") or 0)
-                                corners_home = int(get_any_metric(fixture, ["corner_kicks"], "home") or 0)
-                                corners_away = int(get_any_metric(fixture, ["corner_kicks"], "away") or 0)
-                                possession_home = float(get_any_metric(fixture, ["ball_possession"], "home") or 0.0)
-                                possession_away = float(get_any_metric(fixture, ["ball_possession"], "away") or 0.0)
-                                
-                                pressure_index = calculate_pressure_index(fixture)
-                                xg_delta = xg_home - xg_away
-                                shots_ratio = (shots_on_target_home + 1.0) / (shots_on_target_away + 1.0) if shots_on_target_away + 1.0 > 0 else 1.0
-                                
-                                total_saves = saves_home + saves_away
-                                total_goals = initial_score[0] + initial_score[1]
-                                total_sot = shots_on_target_home + shots_on_target_away
-                                save_stress = calculate_save_stress(
-                                    saves_home=saves_home,
-                                    saves_away=saves_away,
-                                    current_home_score=initial_score[0],
-                                    current_away_score=initial_score[1],
-                                    shots_on_target_home=shots_on_target_home,
-                                    shots_on_target_away=shots_on_target_away
-                                )
-                                
-                                possession_diff = abs(possession_home - possession_away)
-                                if possession_diff > 1.0:
-                                    possession_pressure = possession_diff / 100.0
-                                else:
-                                    possession_pressure = possession_diff
-                                
-                                league_factor = float(res.get("league_factor", 1.0) or 1.0)
-                                team_mix_factor = float(res.get("team_mix_factor", 1.0) or 1.0)
-                                combined_M = float(res.get("combined_m", 1.0) or 1.0)
-                                
-                                snapshot = {
-                                    "match_id": fixture_id,
-                                    "league_id": league_id,
-                                    "league_name": league_name,
-                                    "season": season,
-                                    "home_team_id": home_team_id,
-                                    "home_team_name": home_team_name,
-                                    "away_team_id": away_team_id,
-                                    "away_team_name": away_team_name,
-                                    "minute": minute,
-                                    "status_short": status_short,
-                                    "signal_ts_utc": datetime.utcnow().isoformat(),
-                                    "score_home": initial_score[0],
-                                    "score_away": initial_score[1],
-                                    "xg_home": xg_home,
-                                    "xg_away": xg_away,
-                                    "shots_home": shots_home,
-                                    "shots_away": shots_away,
-                                    "shots_on_target_home": shots_on_target_home,
-                                    "shots_on_target_away": shots_on_target_away,
-                                    "saves_home": saves_home,
-                                    "saves_away": saves_away,
-                                    "shots_in_box_home": shots_in_box_home,
-                                    "shots_in_box_away": shots_in_box_away,
-                                    "corners_home": corners_home,
-                                    "corners_away": corners_away,
-                                    "possession_home": possession_home,
-                                    "possession_away": possession_away,
-                                    "pressure_index": pressure_index,
-                                    "xg_delta": xg_delta,
-                                    "shots_ratio": shots_ratio,
-                                    "save_stress": save_stress,
-                                    "possession_pressure": possession_pressure,
-                                    "prob_goal_75": prob_actual,
-                                    "prob_goal_90": prob_actual_90,
-                                    "league_factor": league_factor,
-                                    "team_mix_factor": team_mix_factor,
-                                    "combined_M": combined_M,
-                                    "match_score": match_score_value,
-                                    "signal_source": "bot",
-                                    "schema_version": "1.0",
-                                    "prob_model_version": "v2",
-                                    "match_score_version": "v2.5"
+                            # Calculate initial PressureIndex
+                            fixture_data = data.get("fixture", {})
+                            initial_pressure = calculate_pressure_index(fixture_data)
+                            initial_momentum = 0.0  # First signal has 0 momentum
+                            
+                            # Extract probability values from 45+ model
+                            prob_until_end = prob_second_half_remain
+                            league_factor_used = res_45.get("combined_m_2h", 1.0)
+                            _score01_final, match_score_value, _score_metrics = compute_match_score_v2(fixture_metrics, league_factor_used)
+
+                            signal_timestamp_utc = _utc_now_iso()
+                            signal_date = get_msk_date()
+                            training_snapshot, training_record = _build_regular_signal_training_payload(
+                                fixture_id=fixture_id,
+                                fixture_metrics=fixture_metrics,
+                                signal_minute=minute,
+                                signal_score=initial_score,
+                                signal_timestamp_utc=signal_timestamp_utc,
+                                signal_date=signal_date,
+                                telegram_message_id=mid_msg,
+                                res_45=res_45,
+                                threshold_next15=threshold_next15,
+                                threshold_remain=threshold_remain,
+                            )
+                            training_record["snapshot_saved"] = bool(save_snapshot(training_snapshot))
+                            _register_training_signal_record(training_record)
+                            
+                            # Save match data to Google Sheets (initial signal)
+                            save_match_to_sheet(
+                                fixture_id,
+                                data,
+                                minute,
+                                prob_next_15,
+                                prob_until_end,
+                                signal_sent=True,
+                                pressure_index=initial_pressure,
+                                momentum=initial_momentum,
+                                signal_source="bot",
+                                league_factor=league_factor_used,
+                                match_score=match_score_value,
+                            )
+                            
+                            with state_lock:
+                                state.setdefault("match_initial_score", {})[str(fixture_id)] = initial_score
+                                state.setdefault("match_initial_minute", {})[str(fixture_id)] = minute
+                                state.setdefault("match_goal_status", {})[str(fixture_id)] = {
+                                    "valid_goals_after_send": False,
+                                    "last_goal_time": None,
+                                    "persistent_goal_line": None,
+                                    "final_line": None,
+                                    "cancellations": [],
+                                    "score": initial_score,
+                                    "processed_ids": [],
+                                    "finalized": False,
+                                    "last_reported_minute": minute,
+                                    "last_pressure_index": initial_pressure
                                 }
-                                
-                                save_snapshot(snapshot)
-                                
-                                # Save match data to Google Sheets (initial signal)
-                                save_match_to_sheet(
-                                    fixture_id,
-                                    data,
-                                    minute,
-                                    prob_next_15,
-                                    prob_until_end,
-                                    signal_sent=True,
-                                    pressure_index=initial_pressure,
-                                    momentum=initial_momentum,
-                                    signal_source="bot",
-                                    league_factor=league_factor_used,
-                                    match_score=match_score_value,
-                                )
-                                
-                                with state_lock:
-                                    state.setdefault("match_initial_score", {})[str(fixture_id)] = initial_score
-                                    state.setdefault("match_initial_minute", {})[str(fixture_id)] = minute
-                                    state.setdefault("match_goal_status", {})[str(fixture_id)] = {
-                                        "valid_goals_after_send": False,
-                                        "last_goal_time": None,
-                                        "persistent_goal_line": None,
-                                        "final_line": None,
-                                        "cancellations": [],
-                                        "score": initial_score,
-                                        "processed_ids": [],
-                                        "finalized": False,
-                                        "last_reported_minute": minute,
-                                        "last_pressure_index": initial_pressure
-                                    }
-                                    state.setdefault("match_processed_event_ids", {})[str(fixture_id)] = []
-                                    state.setdefault("match_sent_at", {})[str(fixture_id)] = time.time()
-                                    state.setdefault("match_prob_status", {})[str(fixture_id)] = prob_actual
-                                    # Save signal date (Moscow time) and set is_finished flag
-                                    # Date is determined ONLY by signal send time, regardless of match start time
-                                    signal_date = get_msk_date()
-                                    msk_time = get_msk_datetime().strftime("%H:%M:%S")
-                                    state.setdefault("match_signal_info", {})[str(fixture_id)] = {
-                                        "signal_date": signal_date,
-                                        "is_finished": False
-                                    }
-                                    logger.info(f"[STATS] Match {fixture_id}: signal sent at {msk_time} MSK, assigned to date {signal_date}")
-                                    if fixture_id not in state.setdefault("monitored_matches", []):
-                                        state["monitored_matches"].append(fixture_id)
-                                mark_state_dirty()
-                                update_persistent_fixture_tracking(fixture_id, fixture_metrics, sent_text=msg)
+                                state.setdefault("match_processed_event_ids", {})[str(fixture_id)] = []
+                                state.setdefault("match_sent_at", {})[str(fixture_id)] = time.time()
+                                state.setdefault("match_prob_status", {})[str(fixture_id)] = prob_actual
+                                # Save signal date (Moscow time) and set is_finished flag
+                                # Date is determined ONLY by signal send time, regardless of match start time
+                                signal_date = get_msk_date()
+                                msk_time = get_msk_datetime().strftime("%H:%M:%S")
+                                state.setdefault("match_signal_info", {})[str(fixture_id)] = {
+                                    "signal_date": signal_date,
+                                    "is_finished": False
+                                }
+                                logger.info(f"[STATS] Match {fixture_id}: signal sent at {msk_time} MSK, assigned to date {signal_date}")
+                                if fixture_id not in state.setdefault("monitored_matches", []):
+                                    state["monitored_matches"].append(fixture_id)
+                            mark_state_dirty()
+                            update_persistent_fixture_tracking(fixture_id, fixture_metrics, sent_text=msg)
                     except Exception:
                         logger.exception("Error processing fixture inner")
                 time.sleep(CHECK_INTERVAL)
@@ -13175,11 +14168,7 @@ if __name__ == "__main__":
     if not API_FOOTBALL_KEY:
         logger.warning("API_FOOTBALL_KEY not set; live xG/stat fetches may fail.")
     if missing:
-        logger.error("Missing required configuration: %s", ", ".join(missing))
-        raise SystemExit(1)
-    
-    # Log configuration
-    logger.info(f"Configuration: TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} (type: {type(TELEGRAM_CHAT_ID).__name__})")
+        logger.warning("Missing Telegram configuration: %s. Telegram functionality will be disabled.", ", ".join(missing))
 
     logger.info("Starting Goal Predictor Bot (API-Football powered)...")
     try:
