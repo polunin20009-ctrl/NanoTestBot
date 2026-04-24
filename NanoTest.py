@@ -11422,9 +11422,9 @@ def is_first_signal_snapshot_ready(
     if minute < REGULAR_SIGNAL_MIN_MINUTE:
         return False, f"not yet in second half (minute={minute})"
 
-    xg_home = float(get_any_metric(fixture_metrics, ["expected_goals"], "home") or 0.0)
-    xg_away = float(get_any_metric(fixture_metrics, ["expected_goals"], "away") or 0.0)
-    xg_total = xg_home + xg_away
+    xg_info = get_xg_with_fallback(fixture_metrics)
+    xg_total = float(xg_info.get("xg_total") or 0.0)
+    xg_source = str(xg_info.get("xg_source") or "fallback_estimated")
 
     shots_on_target_home = float(get_any_metric(fixture_metrics, ["shots_on_target"], "home") or 0.0)
     shots_on_target_away = float(get_any_metric(fixture_metrics, ["shots_on_target"], "away") or 0.0)
@@ -11449,7 +11449,7 @@ def is_first_signal_snapshot_ready(
     if minute <= 48:
         if xg_total < 0.2 and total_attacks < 5:
             return False, (
-                f"transitional at 2H start: minute={minute} xg_total={xg_total:.2f} "
+                f"transitional at 2H start: minute={minute} xg_total={xg_total:.2f} xg_source={xg_source} "
                 f"attacks={total_attacks:.0f} — waiting for stable snapshot"
             )
 
@@ -11457,14 +11457,14 @@ def is_first_signal_snapshot_ready(
     if total_goals > 0 and xg_total < 0.1:
         return False, (
             f"post-goal transitional: score={score_home}-{score_away} "
-            f"but xg_total={xg_total:.2f} — stats lag after goal"
+            f"but xg_total={xg_total:.2f} xg_source={xg_source} — stats lag after goal"
         )
 
     # 5. Critically missing data (mid-game, all-zero aggregates)
     if minute >= 52 and xg_total < 0.05 and shots_on_target_total == 0 and shots_in_box_total == 0:
         return False, (
             f"critically missing data at minute={minute}: "
-            f"xg_total={xg_total:.2f} shots_on_target=0 shots_in_box=0"
+            f"xg_total={xg_total:.2f} xg_source={xg_source} shots_on_target=0 shots_in_box=0"
         )
 
     # 6. Extreme probability with weak live metrics
@@ -11856,6 +11856,39 @@ def estimate_xg_from_metrics_combined(fixture_metrics: Dict[str,Any], side: str)
     
     return xg_fallback
 
+
+def get_xg_with_fallback(fixture_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve live xG from API when available, otherwise use fallback estimates."""
+
+    def _resolve_side_xg(side: str) -> Tuple[float, str]:
+        raw_xg = get_any_metric(fixture_metrics, ["expected_goals"], side)
+        try:
+            raw_xg = float(raw_xg) if raw_xg not in (None, "", "N/A") else None
+        except (TypeError, ValueError):
+            raw_xg = None
+
+        if raw_xg is not None and raw_xg > 0.0:
+            return raw_xg, "api"
+
+        estimated_xg = max(0.0, float(estimate_xg_from_metrics_combined(fixture_metrics, side) or 0.0))
+        return estimated_xg, "fallback_estimated"
+
+    xg_home, xg_home_source = _resolve_side_xg("home")
+    xg_away, xg_away_source = _resolve_side_xg("away")
+    xg_total = xg_home + xg_away
+    xg_delta = abs(xg_home - xg_away)
+    xg_source = "api" if xg_home_source == "api" and xg_away_source == "api" else "fallback_estimated"
+
+    return {
+        "xg_home": xg_home,
+        "xg_away": xg_away,
+        "xg_total": xg_total,
+        "xg_delta": xg_delta,
+        "xg_source": xg_source,
+        "xg_home_source": xg_home_source,
+        "xg_away_source": xg_away_source,
+    }
+
 def get_metric_from_fixture(fixture: Dict[str,Any], key: str, default=None):
     v = fixture.get(key)
     if isinstance(v, dict) and "value" in v:
@@ -12065,34 +12098,14 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
     """
     try:
         # Extract basic metrics
-        raw_xg_home = get_any_metric(fixture_metrics, ["expected_goals"], "home")
-        raw_xg_away = get_any_metric(fixture_metrics, ["expected_goals"], "away")
-        try:
-            raw_xg_home = float(raw_xg_home) if raw_xg_home not in (None, "", "N/A") else None
-        except (TypeError, ValueError):
-            raw_xg_home = None
-        try:
-            raw_xg_away = float(raw_xg_away) if raw_xg_away not in (None, "", "N/A") else None
-        except (TypeError, ValueError):
-            raw_xg_away = None
-
-        if raw_xg_home is not None and raw_xg_home > 0.0:
-            xg_home = raw_xg_home
-            xg_home_source = "api"
-        else:
-            xg_home = max(0.0, float(estimate_xg_from_metrics_combined(fixture_metrics, "home") or 0.0))
-            xg_home_source = "fallback_estimated"
-
-        if raw_xg_away is not None and raw_xg_away > 0.0:
-            xg_away = raw_xg_away
-            xg_away_source = "api"
-        else:
-            xg_away = max(0.0, float(estimate_xg_from_metrics_combined(fixture_metrics, "away") or 0.0))
-            xg_away_source = "fallback_estimated"
-
-        xg_source = "api" if xg_home_source == "api" and xg_away_source == "api" else "fallback_estimated"
-        xg_total = xg_home + xg_away
-        xg_delta = abs(xg_home - xg_away)
+        xg_info = get_xg_with_fallback(fixture_metrics)
+        xg_home = float(xg_info.get("xg_home") or 0.0)
+        xg_away = float(xg_info.get("xg_away") or 0.0)
+        xg_total = float(xg_info.get("xg_total") or 0.0)
+        xg_delta = float(xg_info.get("xg_delta") or 0.0)
+        xg_source = str(xg_info.get("xg_source") or "fallback_estimated")
+        xg_home_source = str(xg_info.get("xg_home_source") or "fallback_estimated")
+        xg_away_source = str(xg_info.get("xg_away_source") or "fallback_estimated")
         
         score_home = int(get_metric_from_fixture(fixture_metrics, "score_home", 0) or 0)
         score_away = int(get_metric_from_fixture(fixture_metrics, "score_away", 0) or 0)
