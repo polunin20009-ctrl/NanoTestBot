@@ -11,20 +11,153 @@ import io
 import time
 import math
 import json
+import gzip
+import copy
 import shutil
 import hashlib
 import logging
 import threading
 import argparse
 import requests
-from collections import deque
+import subprocess
+import gc
+import sqlite3
+import tempfile
+import fcntl
+from collections import Counter, deque
 from contextlib import contextmanager
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+def _load_msk_timezone():
+    tz_name = (os.environ.get("MSK_TZ") or "Europe/Moscow").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        logging.getLogger(__name__).warning(
+            "[TIMEZONE] ZoneInfo '%s' unavailable; falling back to fixed UTC+3. Install tzdata or use the project venv for IANA timezone support.",
+            tz_name,
+        )
+        return timezone(timedelta(hours=3), name="MSK")
+
+
+MSK = _load_msk_timezone()
+
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError
+
+from second_half.factors import (
+    compute_league_2h_factor,
+    compute_score_state_factor,
+    compute_team_2h_factor,
+    load_league_2h_stats,
+    load_team_2h_stats,
+)
+from second_half.storage import (
+    collect_and_store_second_half_history,
+    load_second_half_fixture_ids,
+)
+from second_half.aggregate import aggregate_history_to_files
+from second_half.parser import (
+    IncompleteSecondHalfDataError,
+    SECOND_HALF_HISTORY_SCHEMA_VERSION,
+    SECOND_HALF_PARSER_VERSION,
+)
+from signal_reputation import (
+    ReputationConfig,
+    append_shadow_record,
+    build_reputation_model,
+    evaluate_shadow_decision,
+    load_reputation_model,
+    save_reputation_model,
+)
+from shadow_ml import (
+    ROLLING_ARTIFACT_ROLE,
+    ROLLING_ARTIFACT_TYPE,
+    ROLLING_FEATURE_PROFILE,
+    ShadowMLConfig,
+    append_prediction_record as append_shadow_ml_prediction_record,
+    load_model as load_shadow_ml_model_file,
+    prediction_input_fingerprint,
+    predict_shadow,
+    predict_shadow_rolling,
+    rolling_prediction_input_fingerprint,
+    save_model as save_shadow_ml_model_file,
+    summarize_training_data as summarize_shadow_ml_training_data,
+    summarize_rolling_training_data as summarize_shadow_rolling_training_data,
+    train_shadow_model,
+    train_shadow_rolling_model,
+)
+from shadow_ml.rolling import (
+    ROLLING_DYNAMICS_SCHEMA_VERSION,
+    RollingDynamicsTracker,
+)
+from shadow_ml.history import materialize_training_history
+from shadow_candidates import (
+    AppendOnlyCandidateJournal,
+    CandidateLayer,
+    DEFAULT_RULESET as DEFAULT_SHADOW_CANDIDATE_RULESET,
+)
+from shadow_candidates.storage import jsonl_paths as shadow_candidate_jsonl_paths
+from market_benchmark import (
+    AppendOnlyMarketJournal,
+    SNAPSHOT_RECORD_TYPE as MARKET_SNAPSHOT_RECORD_TYPE,
+    normalize_live_goal_markets,
+)
+from wide_research.controller import WideResearchController
+from market_benchmark.research import CausalQuoteCache
+from wide_research.discovery import (
+    ATOMIC_GRID_VERSION as WIDE_RESEARCH_ATOMIC_GRID_VERSION,
+    DISCOVERY_ENGINE_VERSION as WIDE_RESEARCH_DISCOVERY_ENGINE_VERSION,
+    EXTENDED_ATOMIC_GRID_VERSION as WIDE_RESEARCH_RARE_PRECISION_ATOMIC_GRID_VERSION,
+    REFINEMENT_DISCOVERY_ENGINE_VERSION as WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_ENGINE_VERSION,
+    PURGED_SPLIT_POLICY as WIDE_RESEARCH_PURGED_SPLIT_POLICY,
+    TEMPORAL_PURGE_VERSION as WIDE_RESEARCH_TEMPORAL_PURGE_VERSION,
+    TEMPORAL_PURGED_ENGINE_SUFFIX as WIDE_RESEARCH_PURGED_ENGINE_SUFFIX,
+)
+from wide_research.features import (
+    FEATURE_SCHEMA_VERSION as WIDE_RESEARCH_FEATURE_SCHEMA_VERSION,
+)
+from wide_research.live import ActiveRuleRouter, WideShadowLayer
+from wide_research.lifecycle import LifecyclePolicy
+from wide_research.store import WideResearchStore
+from wide_research.health_runtime import ResearchHealthMonitor
+from wide_research.health_snapshot import ProfileSnapshotSpec
+from match_period import (
+    EventTime,
+    GoalScope,
+    MatchPeriod,
+    OutcomeScope,
+    classify_goal_scope,
+    classify_match_period,
+    event_time_from_event,
+    format_event_minute,
+    has_normal_time_finished,
+    is_extra_time_active,
+    is_match_fully_finished,
+    is_normal_time_goal,
+    is_penalty_shootout_event,
+    is_shootout_active,
+    normalize_score_blocks,
+)
+from outcome_integrity import resolve_normal_time_outcome
+from outcome_revision import (
+    next_outcome_revision,
+    outcome_rank as outcome_record_rank,
+    outcome_revision as get_outcome_revision,
+    outcome_schema_version as get_outcome_schema_version,
+)
+
+try:
+    import telegram_analysis_ui as signal_analysis_ui
+except ImportError:
+    signal_analysis_ui = None
+    logging.getLogger(__name__).warning(
+        "[ANALYSIS_UI_ERROR] stage=module_import signal_key=unknown error_type=module_not_found; UI disabled"
+    )
 
 # Load environment variables from .env file if available
 try:
@@ -61,6 +194,43 @@ def _parse_env_int(name: str) -> Optional[int]:
         return None
 
 
+def _parse_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _parse_env_float(name: str) -> Optional[float]:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return None
+
+
+def _parse_env_int_tuple(
+    name: str, default: Tuple[int, ...]
+) -> Tuple[int, ...]:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return tuple(default)
+    try:
+        values = tuple(int(item.strip()) for item in raw.split(","))
+    except ValueError:
+        return tuple(default)
+    if not values or any(value <= 0 for value in values):
+        return tuple(default)
+    return values
+
+
 # -------------------------
 # Configuration (embedded per user request)
 # -------------------------
@@ -78,6 +248,14 @@ CHANNEL_ID = _parse_env_int("CHANNEL_ID") or TELEGRAM_CHAT_ID
 REVIEW_TARGET_CHAT = _parse_env_str("REVIEW_TARGET_CHAT")
 STATS_MESSAGE_ID = _parse_env_int("STATS_MESSAGE_ID")
 BOT_USERNAME = _parse_env_str("BOT_USERNAME")
+ENABLE_SIGNAL_ANALYSIS_UI = _parse_env_bool("ENABLE_SIGNAL_ANALYSIS_UI", False)
+NORMAL_TIME_BOUNDARY_MODE = (os.environ.get("NORMAL_TIME_BOUNDARY_MODE", "strict").strip().lower() or "strict")
+if NORMAL_TIME_BOUNDARY_MODE not in {"strict", "legacy"}:
+    NORMAL_TIME_BOUNDARY_MODE = "strict"
+SIGNAL_ANALYSIS_CALLBACK_PREFIX = os.environ.get("SIGNAL_ANALYSIS_CALLBACK_PREFIX", "analysis").strip() or "analysis"
+SIGNAL_ANALYSIS_CACHE_TTL_SECONDS = int(os.environ.get("SIGNAL_ANALYSIS_CACHE_TTL_SECONDS", "21600"))
+SIGNAL_ANALYSIS_UI_MODE = os.environ.get("SIGNAL_ANALYSIS_UI_MODE", "private_deeplink").strip() or "private_deeplink"
+SIGNAL_ANALYSIS_INDEX_FILE = os.environ.get("SIGNAL_ANALYSIS_INDEX_FILE", os.path.join("data", "signal_analysis_index.json"))
 
 GOAL_LOG_FILE = _parse_env_str("LOG_FILE") or "test_goal_predictor.log"
 
@@ -291,6 +469,193 @@ WINDOW_2_NEXT_15_THRESHOLD = 35.0
 WINDOW_2_REMAIN_THRESHOLD = 70.0
 WINDOW_2_LIVE_GATE_MIN_PASSED = 2
 
+# Authoritative channel-publication rule.  The environment keys are new on
+# purpose: legacy CHANNEL_SIGNAL_* values described the retired p90/xG/SOT
+# filter and must not silently override this BASE contract.
+CHANNEL_SIGNAL_MIN_PROB_TO90 = float(
+    os.environ.get("BASE_SIGNAL_MIN_PROB_TO90", "75.0")
+)
+CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP = float(
+    os.environ.get("BASE_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP", "1.5")
+)
+CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY = float(
+    os.environ.get("BASE_SIGNAL_MIN_ADJUSTED_INTENSITY", "0.55")
+)
+CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR = float(
+    os.environ.get("BASE_SIGNAL_MIN_SEASON_CONTEXT_FACTOR", "1.02")
+)
+CHANNEL_SIGNAL_FILTER_VERSION = "base_rep15_int055_season102_p90_75_v1"
+
+# Presentation only.  Every sent signal already passed the BASE rule above;
+# Premium freezes the score state at publication and changes only the title.
+PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT = 2
+PREMIUM_BADGE_RULE_VERSION = "base_p90_75_goals_le2_v1"
+
+# Legacy minute-aware thresholds retained only for shadow comparison/audit.
+# They no longer gate Telegram publication and cannot activate Rescue.
+ENABLE_DYNAMIC_PROB_TO90_THRESHOLD = _parse_env_bool("ENABLE_DYNAMIC_PROB_TO90_THRESHOLD", True)
+DYNAMIC_TO90_THRESHOLD_46_49 = float(os.environ.get("DYNAMIC_TO90_THRESHOLD_46_49", "82.0"))
+DYNAMIC_TO90_THRESHOLD_50_53 = float(os.environ.get("DYNAMIC_TO90_THRESHOLD_50_53", "81.0"))
+DYNAMIC_TO90_THRESHOLD_54_57 = float(os.environ.get("DYNAMIC_TO90_THRESHOLD_54_57", "80.0"))
+DYNAMIC_TO90_THRESHOLD_58_60 = float(os.environ.get("DYNAMIC_TO90_THRESHOLD_58_60", "79.0"))
+
+# Legacy Rescue scoring remains available for historical audit/tests, but it no
+# longer participates in publication now that BASE+p90 is authoritative.
+ENABLE_RESCUE_SIGNALS = _parse_env_bool("ENABLE_RESCUE_SIGNALS", False)
+RESCUE_MAX_THRESHOLD_SHORTFALL_PP = float(os.environ.get("RESCUE_MAX_THRESHOLD_SHORTFALL_PP", "5.0"))
+RESCUE_MIN_CONTROLLER_SCORE = float(os.environ.get("RESCUE_MIN_CONTROLLER_SCORE", "88.0"))
+RESCUE_MIN_RELIABILITY = float(os.environ.get("RESCUE_MIN_RELIABILITY", "0.75"))
+RESCUE_CONFIRMATION_OBSERVATIONS = max(1, int(os.environ.get("RESCUE_CONFIRMATION_OBSERVATIONS", "2")))
+RESCUE_INSTANT_CONTROLLER_SCORE = float(os.environ.get("RESCUE_INSTANT_CONTROLLER_SCORE", "94.0"))
+
+
+def get_prob_to90_decision_threshold(minute: int, window_name: str) -> dict:
+    """Select the ordinary 45+ prob_to90 gate without changing probability inputs."""
+    normalized_window = str(window_name or "").upper()
+    fallback_threshold = (
+        WINDOW_2_REMAIN_THRESHOLD
+        if "WINDOW_2" in normalized_window
+        else WINDOW_1_REMAIN_THRESHOLD
+    )
+    if not ENABLE_DYNAMIC_PROB_TO90_THRESHOLD:
+        return {
+            "threshold": float(fallback_threshold),
+            "source": "fixed_config",
+            "minute_bucket": None,
+            "dynamic_enabled": False,
+            "fallback_threshold": float(fallback_threshold),
+        }
+
+    minute_int = int(minute)
+    buckets = (
+        (46, 49, "46_49", DYNAMIC_TO90_THRESHOLD_46_49),
+        (50, 53, "50_53", DYNAMIC_TO90_THRESHOLD_50_53),
+        (54, 57, "54_57", DYNAMIC_TO90_THRESHOLD_54_57),
+        (58, 60, "58_60", DYNAMIC_TO90_THRESHOLD_58_60),
+    )
+    for start, end, bucket, threshold in buckets:
+        if start <= minute_int <= end:
+            return {
+                "threshold": float(threshold),
+                "source": "dynamic_minute_bucket",
+                "minute_bucket": bucket,
+                "dynamic_enabled": True,
+                "fallback_threshold": float(fallback_threshold),
+            }
+    return {
+        "threshold": float(fallback_threshold),
+        "source": "fixed_fallback",
+        "minute_bucket": None,
+        "dynamic_enabled": True,
+        "fallback_threshold": float(fallback_threshold),
+    }
+
+
+def evaluate_rescue_controller(
+    *,
+    prob_to90: float,
+    selected_threshold: float,
+    prob_next_15: float,
+    threshold_next15: float,
+    probability_result: Dict[str, Any],
+    live_gate_passed_count: Optional[int],
+) -> Dict[str, Any]:
+    """Score a dynamic-threshold near miss without relaxing any other hard gate.
+
+    ``controller_score`` is a transparent 0..100 quality index, not a second
+    model probability. The score combines proximity to the primary threshold
+    with independent live evidence and data reliability.
+    """
+    prob_to90_value = float(prob_to90)
+    selected_threshold_value = max(float(selected_threshold), 0.01)
+    shortfall = selected_threshold_value - prob_to90_value
+    dynamic_source = str(probability_result.get("threshold_source") or "") == "dynamic_minute_bucket"
+    candidate = (
+        ENABLE_RESCUE_SIGNALS
+        and dynamic_source
+        and 0.0 < shortfall <= RESCUE_MAX_THRESHOLD_SHORTFALL_PP
+    )
+
+    xg_confidence = clamp(_safe_float(probability_result.get("xg_confidence"), 0.0), 0.0, 1.0)
+    raw_xg_total = _safe_float(probability_result.get("xg_total"), 0.0)
+    xg_total = max(0.0, _safe_float(probability_result.get("xg_total_effective"), raw_xg_total))
+    shots_on_target = max(0.0, _safe_float(probability_result.get("shots_on_target_total"), 0.0))
+    shots_in_box = max(0.0, _safe_float(probability_result.get("shots_in_box_total"), 0.0))
+    pressure = max(0.0, _safe_float(probability_result.get("pressure_index"), 0.0))
+    tempo_confidence = clamp(_safe_float(probability_result.get("tempo_confidence"), 0.0), 0.0, 1.0)
+
+    live_strength_count = (
+        int(live_gate_passed_count)
+        if live_gate_passed_count is not None
+        else sum((
+            xg_total >= 1.10,
+            shots_on_target >= 4.0,
+            shots_in_box >= 7.0,
+            pressure >= 18.0,
+        ))
+    )
+    live_strength = clamp(live_strength_count / 4.0, 0.0, 1.0)
+    probability_proximity = clamp(prob_to90_value / selected_threshold_value, 0.0, 1.0)
+    next15_strength = clamp(float(prob_next_15) / max(float(threshold_next15), 0.01), 0.0, 1.0)
+    pressure_strength = clamp(pressure / 20.0, 0.0, 1.0)
+
+    controller_score = clamp(
+        55.0 * probability_proximity
+        + 15.0 * next15_strength
+        + 12.0 * live_strength
+        + 8.0 * xg_confidence
+        + 7.0 * pressure_strength
+        + 3.0 * tempo_confidence,
+        0.0,
+        100.0,
+    )
+    present_metrics = sum((
+        xg_total > 0.0,
+        shots_on_target > 0.0,
+        shots_in_box > 0.0,
+        pressure > 0.0,
+    ))
+    metric_coverage = present_metrics / 4.0
+    reliability = clamp(
+        0.45 * xg_confidence
+        + 0.35 * metric_coverage
+        + 0.20 * max(tempo_confidence, live_strength),
+        0.0,
+        1.0,
+    )
+
+    if not ENABLE_RESCUE_SIGNALS:
+        reason = "disabled"
+    elif not dynamic_source:
+        reason = "not_dynamic_threshold"
+    elif shortfall <= 0.0:
+        reason = "primary_gate_passed"
+    elif shortfall > RESCUE_MAX_THRESHOLD_SHORTFALL_PP:
+        reason = "threshold_shortfall"
+    elif reliability < RESCUE_MIN_RELIABILITY:
+        reason = "low_reliability"
+    elif controller_score < RESCUE_MIN_CONTROLLER_SCORE:
+        reason = "low_controller_score"
+    else:
+        reason = "quality_passed"
+
+    quality_passed = reason == "quality_passed"
+    return {
+        "enabled": bool(ENABLE_RESCUE_SIGNALS),
+        "candidate": bool(candidate),
+        "quality_passed": bool(quality_passed),
+        "reason": reason,
+        "controller_score": round(controller_score, 2),
+        "minimum_controller_score": float(RESCUE_MIN_CONTROLLER_SCORE),
+        "reliability": round(reliability, 4),
+        "minimum_reliability": float(RESCUE_MIN_RELIABILITY),
+        "threshold_shortfall_pp": round(shortfall, 2),
+        "maximum_shortfall_pp": float(RESCUE_MAX_THRESHOLD_SHORTFALL_PP),
+        "live_strength_count": int(live_strength_count),
+        "confirmation_observations_required": int(RESCUE_CONFIRMATION_OBSERVATIONS),
+        "instant_score_threshold": float(RESCUE_INSTANT_CONTROLLER_SCORE),
+    }
+
 # New 45+ model constants
 LAMBDA_2H_SCALE = 0.055  # Scaling factor for lambda_2h calculation (cooled from 0.4)
 LAMBDA_2H_FLOOR = 0.001  # Minimum lambda value
@@ -304,6 +669,12 @@ ENABLE_ADMIN_REVIEW_SIGNALS = _parse_env_str("ENABLE_ADMIN_REVIEW_SIGNALS") == "
 ADMIN_REVIEW_EDIT_GUARD = 55  # minimum seconds between edits
 TG_EDIT_GLOBAL_LIMIT_PER_MIN = int(os.environ.get("TG_EDIT_GLOBAL_LIMIT_PER_MIN", "30"))
 TG_EDIT_PER_MESSAGE_SECONDS = int(os.environ.get("TG_EDIT_PER_MESSAGE_SECONDS", "60"))
+TG_EDIT_CACHE_TTL_SECONDS = max(
+    3600, int(os.environ.get("TG_EDIT_CACHE_TTL_SECONDS", "86400"))
+)
+TG_EDIT_CACHE_MAX_ENTRIES = max(
+    128, int(os.environ.get("TG_EDIT_CACHE_MAX_ENTRIES", "4096"))
+)
 PERSIST_DIR = os.environ.get("PERSIST_DIR", "test_zzz.json")
 CORE_PATH = os.path.join(PERSIST_DIR, "persist_state.json")
 MATCHES_PATH = os.path.join(PERSIST_DIR, "persist_matches.json")
@@ -311,11 +682,900 @@ PERSIST_LEAGUES_PATH = os.path.join(PERSIST_DIR, "persist_leagues.json")
 PERSIST_TEAMS_PATH = os.path.join(PERSIST_DIR, "persist_teams.json")
 MATCH_SNAPSHOTS_JSONL_PATH = os.environ.get("MATCH_SNAPSHOTS_JSONL_PATH", os.path.join(PERSIST_DIR, "test_match_snapshots.jsonl"))
 MATCH_OUTCOMES_JSONL_PATH = os.environ.get("MATCH_OUTCOMES_JSONL_PATH", os.path.join(PERSIST_DIR, "test_match_outcomes.jsonl"))
+ENABLE_DECISION_SNAPSHOTS = _parse_env_bool("ENABLE_DECISION_SNAPSHOTS", True)
+DECISION_SNAPSHOTS_FILE = os.environ.get("DECISION_SNAPSHOTS_FILE", os.path.join("data", "decision_snapshots.jsonl"))
+DECISION_SNAPSHOT_SCHEMA_VERSION = max(
+    3, int(os.environ.get("DECISION_SNAPSHOT_SCHEMA_VERSION", "3"))
+)
+DECISION_OUTCOME_SCHEMA_VERSION = max(
+    4, int(os.environ.get("DECISION_OUTCOME_SCHEMA_VERSION", "4"))
+)
+# Zero keeps the complete on-disk key set. A finite limit is available for very
+# constrained deployments, but can permit duplicates when old fixtures replay.
+DECISION_SNAPSHOT_DEDUPE_MAX_KEYS = int(os.environ.get("DECISION_SNAPSHOT_DEDUPE_MAX_KEYS", "0"))
+DECISION_SNAPSHOT_ROTATE_MAX_BYTES = int(os.environ.get("DECISION_SNAPSHOT_ROTATE_MAX_BYTES", str(10 * 1024 * 1024)))
+DECISION_OUTCOME_RECONCILE_EVERY_CYCLES = max(1, int(os.environ.get("DECISION_OUTCOME_RECONCILE_EVERY_CYCLES", "5")))
+DECISION_OUTCOME_RECONCILE_LIMIT = max(1, int(os.environ.get("DECISION_OUTCOME_RECONCILE_LIMIT", "20")))
+DECISION_OUTCOME_RECHECK_SECONDS = max(30, int(os.environ.get("DECISION_OUTCOME_RECHECK_SECONDS", "300")))
+# A provider may reuse the same fixture id after a started match is abandoned
+# and moved to a new date. In that case its status can eventually become NS
+# again, so waiting for FT would attach the replayed match to old live
+# observations. Treat a sufficiently large forward kickoff shift as a void.
+DECISION_OUTCOME_RESCHEDULE_MIN_SHIFT_SECONDS = max(
+    3600,
+    int(
+        os.environ.get(
+            "DECISION_OUTCOME_RESCHEDULE_MIN_SHIFT_SECONDS",
+            "21600",
+        )
+    ),
+)
+SECOND_HALF_INCOMPLETE_RETRY_BASE_SECONDS = max(
+    DECISION_OUTCOME_RECHECK_SECONDS,
+    int(os.environ.get("SECOND_HALF_INCOMPLETE_RETRY_BASE_SECONDS", "1800")),
+)
+SECOND_HALF_INCOMPLETE_RETRY_MAX_SECONDS = max(
+    SECOND_HALF_INCOMPLETE_RETRY_BASE_SECONDS,
+    int(os.environ.get("SECOND_HALF_INCOMPLETE_RETRY_MAX_SECONDS", "21600")),
+)
+ENABLE_OBSERVATION_HISTORY = _parse_env_bool("ENABLE_OBSERVATION_HISTORY", True)
+OBSERVATION_HISTORY_FILE = os.environ.get(
+    "OBSERVATION_HISTORY_FILE", os.path.join("data", "observation_history.jsonl")
+)
+OBSERVATION_SCHEMA_VERSION = max(1, int(os.environ.get("OBSERVATION_SCHEMA_VERSION", "1")))
+OBSERVATION_OUTCOME_SCHEMA_VERSION = max(
+    1, int(os.environ.get("OBSERVATION_OUTCOME_SCHEMA_VERSION", "1"))
+)
+ENABLE_OUTCOME_CORRECTION_RECHECK = _parse_env_bool(
+    "ENABLE_OUTCOME_CORRECTION_RECHECK", True
+)
+OUTCOME_CORRECTION_RECHECK_SECONDS = max(
+    300, int(os.environ.get("OUTCOME_CORRECTION_RECHECK_SECONDS", "1800"))
+)
+OUTCOME_CORRECTION_LOOKBACK_HOURS = max(
+    1, int(os.environ.get("OUTCOME_CORRECTION_LOOKBACK_HOURS", "168"))
+)
+OUTCOME_CORRECTION_RECHECK_LIMIT = max(
+    1, int(os.environ.get("OUTCOME_CORRECTION_RECHECK_LIMIT", "5"))
+)
+OBSERVATION_ROTATE_MAX_BYTES = max(
+    0, int(os.environ.get("OBSERVATION_ROTATE_MAX_BYTES", str(50 * 1024 * 1024)))
+)
+ENABLE_SHADOW_ML = _parse_env_bool("ENABLE_SHADOW_ML", True)
+ENABLE_SHADOW_ML_ROLLING_CHALLENGER = _parse_env_bool(
+    "ENABLE_SHADOW_ML_ROLLING_CHALLENGER", True
+)
+ENABLE_ROLLING_DYNAMICS_SHADOW = _parse_env_bool(
+    "ENABLE_ROLLING_DYNAMICS_SHADOW", True
+)
+ROLLING_DYNAMICS_MAX_EXTRA_MINUTES = max(
+    0, int(os.environ.get("ROLLING_DYNAMICS_MAX_EXTRA_MINUTES", "2"))
+)
+ROLLING_DYNAMICS_SEED_MAX_FETCH_ATTEMPTS = max(
+    1,
+    min(
+        2,
+        int(os.environ.get("ROLLING_DYNAMICS_SEED_MAX_FETCH_ATTEMPTS", "2")),
+    ),
+)
+ROLLING_DYNAMICS_SEED_WORKERS = max(
+    1,
+    min(16, int(os.environ.get("ROLLING_DYNAMICS_SEED_WORKERS", "8"))),
+)
+SHADOW_ML_AUTO_RETRAIN = _parse_env_bool("SHADOW_ML_AUTO_RETRAIN", True)
+SHADOW_ML_ROLLING_AUTO_RETRAIN = _parse_env_bool(
+    "SHADOW_ML_ROLLING_AUTO_RETRAIN", True
+)
+SHADOW_ML_MODEL_FILE = os.environ.get(
+    "SHADOW_ML_MODEL_FILE", os.path.join("stats", "shadow_ml_model.json")
+)
+SHADOW_ML_ROLLING_MODEL_FILE = os.environ.get(
+    "SHADOW_ML_ROLLING_MODEL_FILE",
+    os.path.join("stats", "shadow_ml_rolling_model.json"),
+)
+SHADOW_ML_PREDICTIONS_FILE = os.environ.get(
+    "SHADOW_ML_PREDICTIONS_FILE",
+    os.path.join("data", "shadow_ml_predictions.jsonl"),
+)
+SHADOW_ML_ROLLING_PREDICTIONS_FILE = os.environ.get(
+    "SHADOW_ML_ROLLING_PREDICTIONS_FILE",
+    os.path.join("data", "shadow_ml_rolling_predictions.jsonl"),
+)
+SHADOW_ML_PREDICTION_ROTATE_MAX_BYTES = max(
+    0,
+    int(
+        os.environ.get(
+            "SHADOW_ML_PREDICTION_ROTATE_MAX_BYTES",
+            str(50 * 1024 * 1024),
+        )
+    ),
+)
+SHADOW_ML_ROLLING_PREDICTION_ROTATE_MAX_BYTES = max(
+    0,
+    int(
+        os.environ.get(
+            "SHADOW_ML_ROLLING_PREDICTION_ROTATE_MAX_BYTES",
+            str(50 * 1024 * 1024),
+        )
+    ),
+)
+# Independent, shadow-only live market benchmark.  It records a causal market
+# quote beside each frozen bot/ML decision and can never alter publication.
+ENABLE_MARKET_BENCHMARK = _parse_env_bool("ENABLE_MARKET_BENCHMARK", True)
+MARKET_BENCHMARK_JOURNAL_FILE = os.environ.get(
+    "MARKET_BENCHMARK_JOURNAL_FILE",
+    os.path.join("data", "market_benchmark.jsonl"),
+)
+MARKET_BENCHMARK_INDEX_FILE = os.environ.get(
+    "MARKET_BENCHMARK_INDEX_FILE",
+    MARKET_BENCHMARK_JOURNAL_FILE + ".index.sqlite3",
+)
+MARKET_BENCHMARK_ROTATE_MAX_BYTES = max(
+    0,
+    int(
+        os.environ.get(
+            "MARKET_BENCHMARK_ROTATE_MAX_BYTES",
+            str(50 * 1024 * 1024),
+        )
+    ),
+)
+MARKET_BENCHMARK_POLL_SECONDS = max(
+    15.0, float(os.environ.get("MARKET_BENCHMARK_POLL_SECONDS", "60"))
+)
+MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS = max(
+    1.0,
+    float(os.environ.get("MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS", "120")),
+)
+MARKET_BENCHMARK_MIN_MINUTE = max(
+    1, int(os.environ.get("MARKET_BENCHMARK_MIN_MINUTE", "35"))
+)
+MARKET_BENCHMARK_MAX_MINUTE = min(
+    90, int(os.environ.get("MARKET_BENCHMARK_MAX_MINUTE", "90"))
+)
+MARKET_BENCHMARK_QUEUE_MAX = max(
+    64, int(os.environ.get("MARKET_BENCHMARK_QUEUE_MAX", "2000"))
+)
+MARKET_BENCHMARK_OUTCOME_QUEUE_RESERVE = max(
+    1,
+    min(
+        MARKET_BENCHMARK_QUEUE_MAX - 1,
+        int(
+            os.environ.get(
+                "MARKET_BENCHMARK_OUTCOME_QUEUE_RESERVE",
+                str(max(16, MARKET_BENCHMARK_QUEUE_MAX // 4)),
+            )
+        ),
+    ),
+)
+MARKET_BENCHMARK_POLL_BUFFER_MAX = max(
+    1, min(2, int(os.environ.get("MARKET_BENCHMARK_POLL_BUFFER_MAX", "1")))
+)
+MARKET_BENCHMARK_WRITE_BATCH = max(
+    1,
+    min(
+        MARKET_BENCHMARK_QUEUE_MAX,
+        int(os.environ.get("MARKET_BENCHMARK_WRITE_BATCH", "500")),
+    ),
+)
+MARKET_BENCHMARK_CACHE_QUOTES_PER_FIXTURE = max(
+    2,
+    min(
+        10,
+        int(
+            os.environ.get(
+                "MARKET_BENCHMARK_CACHE_QUOTES_PER_FIXTURE",
+                "4",
+            )
+        ),
+    ),
+)
+ENABLE_SHADOW_CANDIDATE_LAYER = _parse_env_bool(
+    "ENABLE_SHADOW_CANDIDATE_LAYER", True
+)
+SHADOW_CANDIDATE_JOURNAL_FILE = os.environ.get(
+    "SHADOW_CANDIDATE_JOURNAL_FILE",
+    os.path.join("data", "shadow_candidates.jsonl"),
+)
+SHADOW_CANDIDATE_INDEX_FILE = os.environ.get(
+    "SHADOW_CANDIDATE_INDEX_FILE",
+    SHADOW_CANDIDATE_JOURNAL_FILE + ".index.sqlite3",
+)
+SHADOW_CANDIDATE_ROTATE_MAX_BYTES = max(
+    0,
+    int(
+        os.environ.get(
+            "SHADOW_CANDIDATE_ROTATE_MAX_BYTES",
+            str(10 * 1024 * 1024),
+        )
+    ),
+)
+SHADOW_CANDIDATE_PROSPECTIVE_START_UTC = os.environ.get(
+    "SHADOW_CANDIDATE_PROSPECTIVE_START_UTC",
+    "2026-08-22T19:00:00+00:00",
+)
+SHADOW_CANDIDATE_SETTLE_SECONDS = max(
+    0.0,
+    float(os.environ.get("SHADOW_CANDIDATE_SETTLE_SECONDS", "0")),
+)
+SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS = max(
+    0.0,
+    float(
+        os.environ.get(
+            "SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS",
+            "300",
+        )
+    ),
+)
+ENABLE_WIDE_RESEARCH = _parse_env_bool("ENABLE_WIDE_RESEARCH", True)
+ENABLE_RESEARCH_HEALTH_MONITOR = _parse_env_bool("ENABLE_RESEARCH_HEALTH_MONITOR", True)
+RESEARCH_HEALTH_INTERVAL_SECONDS = max(60, int(os.environ.get("RESEARCH_HEALTH_INTERVAL_SECONDS", "300")))
+RESEARCH_HEALTH_REPORT_FILE = os.environ.get("RESEARCH_HEALTH_REPORT_FILE", "stats/research_health.json")
+RESEARCH_HEALTH_ALERT_STATE_FILE = os.environ.get("RESEARCH_HEALTH_ALERT_STATE_FILE", "stats/research_health_alert_state.json")
+WIDE_RESEARCH_DB_FILE = os.environ.get(
+    "WIDE_RESEARCH_DB_FILE",
+    os.path.join("data", "wide_research.sqlite3"),
+)
+WIDE_RESEARCH_ACTIVE_MANIFEST_FILE = os.environ.get(
+    "WIDE_RESEARCH_ACTIVE_MANIFEST_FILE",
+    os.path.join("stats", "wide_research_active.json"),
+)
+WIDE_RESEARCH_DISCOVERY_FILE = os.environ.get(
+    "WIDE_RESEARCH_DISCOVERY_FILE",
+    os.path.join("stats", "wide_research_discovery.json"),
+)
+WIDE_RESEARCH_OUTPUT_DIR = os.environ.get(
+    "WIDE_RESEARCH_OUTPUT_DIR",
+    os.path.join("reports", "wide_research"),
+)
+WIDE_RESEARCH_PROSPECTIVE_START_UTC = os.environ.get(
+    "WIDE_RESEARCH_PROSPECTIVE_START_UTC",
+    "2026-08-28T00:00:00+00:00",
+)
+WIDE_RESEARCH_AUTO_DISCOVERY = _parse_env_bool(
+    "WIDE_RESEARCH_AUTO_DISCOVERY", True
+)
+WIDE_RESEARCH_TEMPORAL_PURGE = _parse_env_bool(
+    "WIDE_RESEARCH_TEMPORAL_PURGE", True
+)
+WIDE_RESEARCH_TEMPORAL_EMBARGO_SECONDS = max(
+    0, int(os.environ.get("WIDE_RESEARCH_TEMPORAL_EMBARGO_SECONDS", "300"))
+)
+WIDE_RESEARCH_AUTO_LIFECYCLE = _parse_env_bool(
+    "WIDE_RESEARCH_AUTO_LIFECYCLE", True
+)
+# The complete router is exercised in shadow first.  Turning this on permits a
+# statistically READY champion to replace the current publication filter.
+WIDE_RESEARCH_PRODUCTION_APPLY = _parse_env_bool(
+    "WIDE_RESEARCH_PRODUCTION_APPLY", False
+)
+WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS = max(
+    86400,
+    int(os.environ.get("WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS", "604800")),
+)
+WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS = max(
+    300,
+    int(os.environ.get("WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS", "900")),
+)
+WIDE_RESEARCH_PHASE_REFRESH_SECONDS = max(
+    5,
+    int(os.environ.get("WIDE_RESEARCH_PHASE_REFRESH_SECONDS", "60")),
+)
+WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS = max(
+    300,
+    int(os.environ.get("WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS", "1800")),
+)
+WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB = max(
+    512,
+    int(os.environ.get("WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB", "3072")),
+)
+WIDE_RESEARCH_MAX_SHADOW_RULES = max(
+    1, min(20, int(os.environ.get("WIDE_RESEARCH_MAX_SHADOW_RULES", "10")))
+)
+WIDE_RESEARCH_MAX_DB_BYTES = max(
+    10 * 1024 * 1024,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_MAX_DB_BYTES",
+            str(2 * 1024 * 1024 * 1024),
+        )
+    ),
+)
+# A physically separate, permanently shadow-only search for exact four-clause
+# rules.  It has its own evidence store and artifacts so experimental rules can
+# neither evict nor be promoted by the production-capable three-factor layer.
+ENABLE_WIDE_RESEARCH_FOUR_FACTOR = _parse_env_bool(
+    "ENABLE_WIDE_RESEARCH_FOUR_FACTOR", True
+)
+WIDE_RESEARCH_FOUR_FACTOR_DB_FILE = os.environ.get(
+    "WIDE_RESEARCH_FOUR_FACTOR_DB_FILE",
+    os.path.join("data", "wide_research_4f.sqlite3"),
+)
+WIDE_RESEARCH_FOUR_FACTOR_ACTIVE_MANIFEST_FILE = os.environ.get(
+    "WIDE_RESEARCH_FOUR_FACTOR_ACTIVE_MANIFEST_FILE",
+    os.path.join("stats", "wide_research_4f_active.json"),
+)
+WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_FILE = os.environ.get(
+    "WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_FILE",
+    os.path.join("stats", "wide_research_4f_discovery.json"),
+)
+WIDE_RESEARCH_FOUR_FACTOR_OUTPUT_DIR = os.environ.get(
+    "WIDE_RESEARCH_FOUR_FACTOR_OUTPUT_DIR",
+    os.path.join("reports", "wide_research_4f"),
+)
+WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC = os.environ.get(
+    "WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC",
+    "2026-09-03T17:05:31+00:00",
+)
+WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY = _parse_env_bool(
+    "WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY", True
+)
+# Hard-coded by design: this profile is research-only and its phases remain
+# SHADOW even if they accumulate enough prospective evidence for readiness.
+WIDE_RESEARCH_FOUR_FACTOR_AUTO_LIFECYCLE = False
+WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS = max(
+    86400,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS",
+            str(WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS),
+        )
+    ),
+)
+WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES = max(
+    1,
+    min(
+        10,
+        int(os.environ.get("WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES", "10")),
+    ),
+)
+WIDE_RESEARCH_FOUR_FACTOR_BEAM_WIDTH = max(
+    4,
+    min(
+        128,
+        int(os.environ.get("WIDE_RESEARCH_FOUR_FACTOR_BEAM_WIDTH", "32")),
+    ),
+)
+WIDE_RESEARCH_FOUR_FACTOR_EVALUATION_BUDGET = max(
+    1000,
+    min(
+        100000,
+        int(
+            os.environ.get(
+                "WIDE_RESEARCH_FOUR_FACTOR_EVALUATION_BUDGET", "40000"
+            )
+        ),
+    ),
+)
+WIDE_RESEARCH_FOUR_FACTOR_MIN_TRAIN_SUPPORT = max(
+    1,
+    int(os.environ.get("WIDE_RESEARCH_FOUR_FACTOR_MIN_TRAIN_SUPPORT", "60")),
+)
+WIDE_RESEARCH_FOUR_FACTOR_MIN_VALIDATION_SUPPORT = max(
+    1,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_FOUR_FACTOR_MIN_VALIDATION_SUPPORT", "20"
+        )
+    ),
+)
+WIDE_RESEARCH_FOUR_FACTOR_MIN_HOLDOUT_SUPPORT = max(
+    1,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_FOUR_FACTOR_MIN_HOLDOUT_SUPPORT", "20"
+        )
+    ),
+)
+WIDE_RESEARCH_FOUR_FACTOR_MAX_DB_BYTES = max(
+    10 * 1024 * 1024,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_FOUR_FACTOR_MAX_DB_BYTES",
+            str(2 * 1024 * 1024 * 1024),
+        )
+    ),
+)
+# A broader precision-first laboratory.  It searches all reviewed causal
+# features across 2-8 clause rules and builds a validation-only portfolio with
+# at least 10 signals/week.  The 10-15 band is a reporting preference, not a
+# ceiling: higher cadence remains eligible when precision is stronger.  This
+# profile is physically incapable of routing Telegram or changing production
+# decisions.
+ENABLE_WIDE_RESEARCH_PRECISION = _parse_env_bool(
+    "ENABLE_WIDE_RESEARCH_PRECISION", True
+)
+WIDE_RESEARCH_PRECISION_DB_FILE = os.environ.get(
+    "WIDE_RESEARCH_PRECISION_DB_FILE",
+    os.path.join("data", "wide_research_precision.sqlite3"),
+)
+WIDE_RESEARCH_PRECISION_ACTIVE_MANIFEST_FILE = os.environ.get(
+    "WIDE_RESEARCH_PRECISION_ACTIVE_MANIFEST_FILE",
+    os.path.join("stats", "wide_research_precision_active.json"),
+)
+WIDE_RESEARCH_PRECISION_DISCOVERY_FILE = os.environ.get(
+    "WIDE_RESEARCH_PRECISION_DISCOVERY_FILE",
+    os.path.join("stats", "wide_research_precision_discovery.json"),
+)
+WIDE_RESEARCH_PRECISION_OUTPUT_DIR = os.environ.get(
+    "WIDE_RESEARCH_PRECISION_OUTPUT_DIR",
+    os.path.join("reports", "wide_research_precision"),
+)
+WIDE_RESEARCH_PRECISION_PROSPECTIVE_START_UTC = os.environ.get(
+    "WIDE_RESEARCH_PRECISION_PROSPECTIVE_START_UTC",
+    "2026-09-04T00:00:00+00:00",
+)
+WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY = _parse_env_bool(
+    "WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY", True
+)
+WIDE_RESEARCH_PRECISION_AUTO_LIFECYCLE = _parse_env_bool(
+    "WIDE_RESEARCH_PRECISION_AUTO_LIFECYCLE", True
+)
+WIDE_RESEARCH_PRECISION_DISCOVERY_INTERVAL_SECONDS = max(
+    86400,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_PRECISION_DISCOVERY_INTERVAL_SECONDS",
+            str(WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS),
+        )
+    ),
+)
+WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES = max(
+    1,
+    min(
+        64,
+        int(
+            os.environ.get(
+                "WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES", "40"
+            )
+        ),
+    ),
+)
+WIDE_RESEARCH_PRECISION_DISCOVERY_TOP_N = max(
+    1,
+    min(
+        20,
+        int(
+            os.environ.get(
+                "WIDE_RESEARCH_PRECISION_DISCOVERY_TOP_N", "20"
+            )
+        ),
+    ),
+)
+WIDE_RESEARCH_PRECISION_BEAM_WIDTH = max(
+    16,
+    min(
+        128,
+        int(os.environ.get("WIDE_RESEARCH_PRECISION_BEAM_WIDTH", "96")),
+    ),
+)
+WIDE_RESEARCH_PRECISION_MAX_CONJUNCTION_SIZE = max(
+    4,
+    min(
+        8,
+        int(
+            os.environ.get(
+                "WIDE_RESEARCH_PRECISION_MAX_CONJUNCTION_SIZE", "8"
+            )
+        ),
+    ),
+)
+WIDE_RESEARCH_PRECISION_EVALUATION_BUDGET = max(
+    10000,
+    min(
+        200000,
+        int(
+            os.environ.get(
+                "WIDE_RESEARCH_PRECISION_EVALUATION_BUDGET", "100000"
+            )
+        ),
+    ),
+)
+WIDE_RESEARCH_PRECISION_DEPTH_BUDGETS = _parse_env_int_tuple(
+    "WIDE_RESEARCH_PRECISION_DEPTH_BUDGETS",
+    (1000, 15000, 16000, 16000, 14000, 13000, 13000, 12000),
+)
+WIDE_RESEARCH_PRECISION_MIN_TRAIN_SUPPORT = max(
+    1,
+    int(os.environ.get("WIDE_RESEARCH_PRECISION_MIN_TRAIN_SUPPORT", "12")),
+)
+WIDE_RESEARCH_PRECISION_MIN_VALIDATION_SUPPORT = max(
+    1,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_PRECISION_MIN_VALIDATION_SUPPORT", "4"
+        )
+    ),
+)
+WIDE_RESEARCH_PRECISION_MIN_HOLDOUT_SUPPORT = max(
+    1,
+    int(
+        os.environ.get("WIDE_RESEARCH_PRECISION_MIN_HOLDOUT_SUPPORT", "4")
+    ),
+)
+WIDE_RESEARCH_PRECISION_MIN_SIGNALS_PER_WEEK = max(
+    0.0,
+    float(
+        os.environ.get(
+            "WIDE_RESEARCH_PRECISION_MIN_SIGNALS_PER_WEEK", "10.0"
+        )
+    ),
+)
+WIDE_RESEARCH_PRECISION_PREFERRED_SIGNALS_PER_WEEK = max(
+    WIDE_RESEARCH_PRECISION_MIN_SIGNALS_PER_WEEK,
+    float(
+        os.environ.get(
+            "WIDE_RESEARCH_PRECISION_PREFERRED_SIGNALS_PER_WEEK", "12.5"
+        )
+    ),
+)
+WIDE_RESEARCH_PRECISION_MAX_SIGNALS_PER_WEEK = max(
+    WIDE_RESEARCH_PRECISION_PREFERRED_SIGNALS_PER_WEEK,
+    float(
+        os.environ.get(
+            "WIDE_RESEARCH_PRECISION_MAX_SIGNALS_PER_WEEK", "15.0"
+        )
+    ),
+)
+WIDE_RESEARCH_PRECISION_PORTFOLIO_MAX_RULES = max(
+    1,
+    min(
+        10,
+        int(
+            os.environ.get(
+                "WIDE_RESEARCH_PRECISION_PORTFOLIO_MAX_RULES", "10"
+            )
+        ),
+    ),
+)
+WIDE_RESEARCH_PRECISION_PORTFOLIO_BEAM_WIDTH = max(
+    8,
+    min(
+        256,
+        int(
+            os.environ.get(
+                "WIDE_RESEARCH_PRECISION_PORTFOLIO_BEAM_WIDTH", "128"
+            )
+        ),
+    ),
+)
+WIDE_RESEARCH_PRECISION_MAX_DB_BYTES = max(
+    10 * 1024 * 1024,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_PRECISION_MAX_DB_BYTES",
+            str(2 * 1024 * 1024 * 1024),
+        )
+    ),
+)
+# A separate rare/high-precision laboratory.  It intentionally has a larger
+# prospective pool and no cadence floor: candidates are frozen when discovered
+# and judged only on future observations in this profile's own evidence store.
+# This profile has no production router and cannot affect Telegram decisions.
+ENABLE_WIDE_RESEARCH_RARE_PRECISION = _parse_env_bool(
+    "ENABLE_WIDE_RESEARCH_RARE_PRECISION", True
+)
+WIDE_RESEARCH_RARE_PRECISION_DB_FILE = os.environ.get(
+    "WIDE_RESEARCH_RARE_PRECISION_DB_FILE",
+    os.path.join("data", "wide_research_rare_precision.sqlite3"),
+)
+WIDE_RESEARCH_RARE_PRECISION_ACTIVE_MANIFEST_FILE = os.environ.get(
+    "WIDE_RESEARCH_RARE_PRECISION_ACTIVE_MANIFEST_FILE",
+    os.path.join("stats", "wide_research_rare_precision_active.json"),
+)
+WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE = os.environ.get(
+    "WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE",
+    os.path.join("stats", "wide_research_rare_precision_discovery.json"),
+)
+WIDE_RESEARCH_RARE_PRECISION_OUTPUT_DIR = os.environ.get(
+    "WIDE_RESEARCH_RARE_PRECISION_OUTPUT_DIR",
+    os.path.join("reports", "wide_research_rare_precision"),
+)
+WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC = os.environ.get(
+    "WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC",
+    "2026-09-10T08:16:59+00:00",
+)
+WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY = _parse_env_bool(
+    "WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY", True
+)
+WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE = _parse_env_bool(
+    "WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE", True
+)
+WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_INTERVAL_SECONDS = max(
+    86400,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_INTERVAL_SECONDS",
+            str(WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS),
+        )
+    ),
+)
+WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES = 64
+WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_TOP_N = 8
+WIDE_RESEARCH_RARE_PRECISION_BEAM_WIDTH = 128
+WIDE_RESEARCH_RARE_PRECISION_MAX_CONJUNCTION_SIZE = 8
+WIDE_RESEARCH_RARE_PRECISION_EVALUATION_BUDGET = 180000
+WIDE_RESEARCH_RARE_PRECISION_DEPTH_BUDGETS = (
+    4000,
+    28000,
+    30000,
+    28000,
+    25000,
+    23000,
+    22000,
+    20000,
+)
+WIDE_RESEARCH_RARE_PRECISION_MIN_TRAIN_SUPPORT = max(
+    1,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_RARE_PRECISION_MIN_TRAIN_SUPPORT", "12"
+        )
+    ),
+)
+WIDE_RESEARCH_RARE_PRECISION_MIN_VALIDATION_SUPPORT = max(
+    1,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_RARE_PRECISION_MIN_VALIDATION_SUPPORT", "4"
+        )
+    ),
+)
+WIDE_RESEARCH_RARE_PRECISION_MIN_HOLDOUT_SUPPORT = max(
+    1,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_RARE_PRECISION_MIN_HOLDOUT_SUPPORT", "4"
+        )
+    ),
+)
+WIDE_RESEARCH_RARE_PRECISION_MIN_SIGNALS_PER_WEEK = 0.0
+WIDE_RESEARCH_RARE_PRECISION_PREFERRED_SIGNALS_PER_WEEK = 0.0
+WIDE_RESEARCH_RARE_PRECISION_MAX_SIGNALS_PER_WEEK = 0.0
+WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_MAX_RULES = 1
+WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_BEAM_WIDTH = 128
+WIDE_RESEARCH_RARE_PRECISION_ALLOW_FEATURE_RANGES = True
+WIDE_RESEARCH_RARE_PRECISION_VALIDATION_WINDOW_COUNT = 4
+WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY = LifecyclePolicy(
+    min_resolved=200,
+    min_triggers_per_week=0.0,
+    allowed_looks=(50, 100, 200),
+)
+WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES = max(
+    10 * 1024 * 1024,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES",
+            str(2 * 1024 * 1024 * 1024),
+        )
+    ),
+)
+SHADOW_ML_RETRAIN_CHECK_SECONDS = max(
+    300, int(os.environ.get("SHADOW_ML_RETRAIN_CHECK_SECONDS", "21600"))
+)
+SHADOW_ML_MODEL_REFRESH_SECONDS = max(
+    10, int(os.environ.get("SHADOW_ML_MODEL_REFRESH_SECONDS", "60"))
+)
+SHADOW_ML_MIN_NEW_FIXTURES = max(
+    1, int(os.environ.get("SHADOW_ML_MIN_NEW_FIXTURES", "25"))
+)
+SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS = max(
+    300,
+    int(
+        os.environ.get(
+            "SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS",
+            "3600",
+        )
+    ),
+)
+SHADOW_ML_WEEKLY_MIN_NEW_FIXTURES = max(
+    1, int(os.environ.get("SHADOW_ML_WEEKLY_MIN_NEW_FIXTURES", "5"))
+)
+SHADOW_ML_WEEKLY_RETRAIN_SECONDS = max(
+    86400, int(os.environ.get("SHADOW_ML_WEEKLY_RETRAIN_SECONDS", "604800"))
+)
+SHADOW_ML_ISOLATED_TRAINING_ENABLED = _parse_env_bool(
+    "SHADOW_ML_ISOLATED_TRAINING_ENABLED", True
+)
+SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS = max(
+    60,
+    int(
+        os.environ.get(
+            "SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS",
+            "900",
+        )
+    ),
+)
+SHADOW_ML_WORKER_MEMORY_LIMIT_MB = max(
+    512,
+    int(os.environ.get("SHADOW_ML_WORKER_MEMORY_LIMIT_MB", "3072")),
+)
+SHADOW_ML_CANDIDATE_MIN_FIXTURES = max(
+    20, int(os.environ.get("SHADOW_ML_CANDIDATE_MIN_FIXTURES", "150"))
+)
+SHADOW_ML_OFFLINE_READY_MIN_FIXTURES = max(
+    SHADOW_ML_CANDIDATE_MIN_FIXTURES,
+    int(os.environ.get("SHADOW_ML_OFFLINE_READY_MIN_FIXTURES", "500")),
+)
+SHADOW_ML_OFFLINE_READY_MIN_HISTORY_DAYS = max(
+    1.0,
+    float(os.environ.get("SHADOW_ML_OFFLINE_READY_MIN_HISTORY_DAYS", "56")),
+)
+SHADOW_ML_OFFLINE_READY_MIN_SPLIT_FIXTURES = max(
+    10,
+    int(os.environ.get("SHADOW_ML_OFFLINE_READY_MIN_SPLIT_FIXTURES", "75")),
+)
+SHADOW_ML_OFFLINE_READY_MIN_ROWS = max(
+    100,
+    int(os.environ.get("SHADOW_ML_OFFLINE_READY_MIN_ROWS", "3000")),
+)
+SHADOW_ML_OFFLINE_READY_MIN_CLASS_FIXTURES = max(
+    10,
+    int(
+        os.environ.get(
+            "SHADOW_ML_OFFLINE_READY_MIN_CLASS_FIXTURES",
+            "100",
+        )
+    ),
+)
+SHADOW_ML_OFFLINE_READY_MAX_NEXT15_UNKNOWN_FRACTION = min(
+    1.0,
+    max(
+        0.0,
+        float(
+            os.environ.get(
+                "SHADOW_ML_OFFLINE_READY_MAX_NEXT15_UNKNOWN_FRACTION",
+                "0.02",
+            )
+        ),
+    ),
+)
+SHADOW_ML_OFFLINE_READY_MIN_CORE_AVAILABILITY = min(
+    1.0,
+    max(
+        0.0,
+        float(
+            os.environ.get(
+                "SHADOW_ML_OFFLINE_READY_MIN_CORE_AVAILABILITY",
+                "0.85",
+            )
+        ),
+    ),
+)
+SHADOW_ML_READINESS_MIN_LOGLOSS_IMPROVEMENT = max(
+    0.0,
+    float(
+        os.environ.get(
+            "SHADOW_ML_READINESS_MIN_LOGLOSS_IMPROVEMENT",
+            "0.001",
+        )
+    ),
+)
+SHADOW_ML_READINESS_MIN_BRIER_IMPROVEMENT = max(
+    0.0,
+    float(
+        os.environ.get(
+            "SHADOW_ML_READINESS_MIN_BRIER_IMPROVEMENT",
+            "0.0005",
+        )
+    ),
+)
+ENABLE_SIGNAL_REPUTATION_SHADOW = _parse_env_bool("ENABLE_SIGNAL_REPUTATION_SHADOW", True)
+ENABLE_SIGNAL_REPUTATION_AUTO_APPLY = _parse_env_bool(
+    "ENABLE_SIGNAL_REPUTATION_AUTO_APPLY", True
+)
+ENABLE_SIGNAL_REPUTATION_EXPANDED_SHADOW = _parse_env_bool(
+    "ENABLE_SIGNAL_REPUTATION_EXPANDED_SHADOW", True
+)
+ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY = _parse_env_bool(
+    "ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY", False
+)
+SIGNAL_REPUTATION_BLEND_TELEGRAM_WEIGHT = min(
+    1.0,
+    max(
+        0.0,
+        float(os.environ.get("SIGNAL_REPUTATION_BLEND_TELEGRAM_WEIGHT", "0.75")),
+    ),
+)
+SIGNAL_REPUTATION_BLEND_NEXT15_TELEGRAM_WEIGHT = min(
+    1.0,
+    max(
+        0.0,
+        float(
+            os.environ.get(
+                "SIGNAL_REPUTATION_BLEND_NEXT15_TELEGRAM_WEIGHT",
+                "1.00",
+            )
+        ),
+    ),
+)
+SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES = max(
+    1, int(os.environ.get("SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES", "50"))
+)
+SIGNAL_REPUTATION_AUTO_STAGE_2_FIXTURES = max(
+    SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES + 1,
+    int(os.environ.get("SIGNAL_REPUTATION_AUTO_STAGE_2_FIXTURES", "150")),
+)
+SIGNAL_REPUTATION_AUTO_STAGE_3_FIXTURES = max(
+    SIGNAL_REPUTATION_AUTO_STAGE_2_FIXTURES + 1,
+    int(os.environ.get("SIGNAL_REPUTATION_AUTO_STAGE_3_FIXTURES", "300")),
+)
+SIGNAL_REPUTATION_MODEL_FILE = os.environ.get(
+    "SIGNAL_REPUTATION_MODEL_FILE", os.path.join("stats", "signal_reputation.json")
+)
+SIGNAL_REPUTATION_SHADOW_FILE = os.environ.get(
+    "SIGNAL_REPUTATION_SHADOW_FILE", os.path.join("data", "signal_reputation_shadow.jsonl")
+)
+SIGNAL_REPUTATION_REFRESH_SECONDS = max(
+    30, int(os.environ.get("SIGNAL_REPUTATION_REFRESH_SECONDS", "900"))
+)
+SIGNAL_REPUTATION_MIN_REBUILD_SECONDS = max(
+    30,
+    int(os.environ.get("SIGNAL_REPUTATION_MIN_REBUILD_SECONDS", "300")),
+)
+SIGNAL_REPUTATION_ISOLATED_REFRESH_ENABLED = _parse_env_bool(
+    "SIGNAL_REPUTATION_ISOLATED_REFRESH_ENABLED", True
+)
+SIGNAL_REPUTATION_SUBPROCESS_TIMEOUT_SECONDS = max(
+    30,
+    int(os.environ.get("SIGNAL_REPUTATION_SUBPROCESS_TIMEOUT_SECONDS", "300")),
+)
+SIGNAL_REPUTATION_ROTATE_MAX_BYTES = max(
+    0, int(os.environ.get("SIGNAL_REPUTATION_ROTATE_MAX_BYTES", str(10 * 1024 * 1024)))
+)
+SIGNAL_REPUTATION_HALF_LIFE_DAYS = max(
+    1.0, float(os.environ.get("SIGNAL_REPUTATION_HALF_LIFE_DAYS", "90"))
+)
+SIGNAL_REPUTATION_PRIOR_GLOBAL = max(
+    0.0, float(os.environ.get("SIGNAL_REPUTATION_PRIOR_GLOBAL", "12"))
+)
+SIGNAL_REPUTATION_PRIOR_LEAGUE = max(
+    0.0, float(os.environ.get("SIGNAL_REPUTATION_PRIOR_LEAGUE", "20"))
+)
+SIGNAL_REPUTATION_PRIOR_TEAM = max(
+    0.0, float(os.environ.get("SIGNAL_REPUTATION_PRIOR_TEAM", "30"))
+)
+SIGNAL_REPUTATION_PRIOR_TEAM_LEAGUE = max(
+    0.0, float(os.environ.get("SIGNAL_REPUTATION_PRIOR_TEAM_LEAGUE", "40"))
+)
+SIGNAL_REPUTATION_PRIOR_ROLE = max(
+    0.0, float(os.environ.get("SIGNAL_REPUTATION_PRIOR_ROLE", "45"))
+)
+SECOND_HALF_HISTORY_PATH = os.environ.get("SECOND_HALF_HISTORY_PATH", os.path.join("data", "second_half_history.jsonl"))
+TEAM_2H_STATS_PATH = os.environ.get("TEAM_2H_STATS_PATH", os.path.join("stats", "team_2h_stats.json"))
+LEAGUE_2H_STATS_PATH = os.environ.get("LEAGUE_2H_STATS_PATH", os.path.join("stats", "league_2h_stats.json"))
+ENABLE_2H_COLLECTION = _parse_env_bool("ENABLE_2H_COLLECTION", True)
+AUTO_AGGREGATE_2H_STATS = _parse_env_bool("AUTO_AGGREGATE_2H_STATS", True)
+SECOND_HALF_ALL_MATCHES_SINCE_UTC = (
+    os.environ.get("SECOND_HALF_ALL_MATCHES_SINCE_UTC", "").strip()
+)
+ENABLE_2H_FACTORS = _parse_env_bool("ENABLE_2H_FACTORS", True)
+ENABLE_2H_SOFT_APPLY = _parse_env_bool("ENABLE_2H_SOFT_APPLY", True)
+DEBUG_2H_LOGS = _parse_env_bool("DEBUG_2H_LOGS", True)
+LOG_PROB_HORIZON = _parse_env_bool("LOG_PROB_HORIZON", True)
+LOG_PROB_COMPONENTS = _parse_env_bool("LOG_PROB_COMPONENTS", True)
+LOG_LIVE_GATE_DETAILS = _parse_env_bool("LOG_LIVE_GATE_DETAILS", True)
+ENABLE_FACTOR_CONTEXT_LOGS = _parse_env_bool("ENABLE_FACTOR_CONTEXT_LOGS", True)
+PRESSURE_AUX_MODE = _parse_env_bool("PRESSURE_AUX_MODE", False)
+LIVE_GATE_GARBAGE_ONLY = _parse_env_bool("LIVE_GATE_GARBAGE_ONLY", False)
+SOFT_APPLY_MAX_ANTIBOOST_PCT = _parse_env_float(
+    "SOFT_APPLY_MAX_ANTIBOOST_PCT"
+)
+if SOFT_APPLY_MAX_ANTIBOOST_PCT is None:
+    SOFT_APPLY_MAX_ANTIBOOST_PCT = 0.04
+SOFT_APPLY_MAX_BOOST_PCT = _parse_env_float("SOFT_APPLY_MAX_BOOST_PCT")
+if SOFT_APPLY_MAX_BOOST_PCT is None:
+    SOFT_APPLY_MAX_BOOST_PCT = 0.05
+# Deprecated compatibility alias for integrations that only display one value.
+SOFT_APPLY_MAX_DELTA_PCT = max(
+    float(SOFT_APPLY_MAX_ANTIBOOST_PCT),
+    float(SOFT_APPLY_MAX_BOOST_PCT),
+)
 LEAGUES_PATH = PERSIST_LEAGUES_PATH
 PERSIST_STATE_PATH = CORE_PATH
 TEMP_STATE_PATH = os.environ.get("STATE_FILE", "test_bot_state.json")
 STATE_FILE = os.environ.get("STATE_FILE", TEMP_STATE_PATH)
 GOAL_CONFIRM_SECONDS = int(os.environ.get("GOAL_CONFIRM_SECONDS", "25"))
+GOAL_CONFIRM_ACTIVE = False
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
 LEAGUE_FACTOR_TTL_DAYS = 7
@@ -333,8 +1593,6 @@ TEAM_STATS_SAMPLE_SIZE = 10
 TEAM_STATS_TTL_DAYS = 8
 TEAM_STATS_COOLDOWN_HOURS = 24
 
-MSK = ZoneInfo("Europe/Moscow")
-
 
 def now_msk() -> datetime:
     return datetime.now(MSK)
@@ -350,10 +1608,14 @@ ACTIVE_FIXTURES: Set[int] = set()
 API_RETRY_COUNT = int(os.environ.get("API_RETRY_COUNT", "3"))
 API_BACKOFF_FACTOR = float(os.environ.get("API_BACKOFF_FACTOR", "1.0"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
+CACHE_MAX_ENTRIES = max(32, int(os.environ.get("CACHE_MAX_ENTRIES", "512")))
+MEMORY_TELEMETRY_INTERVAL_SECONDS = max(
+    60,
+    int(os.environ.get("MEMORY_TELEMETRY_INTERVAL_SECONDS", "300")),
+)
 SAVE_INTERVAL = int(os.environ.get("SAVE_INTERVAL", "30"))
 
-# Temporary global switch to disable any auto-cleanup behavior
-ENABLE_CLEANUP = False
+ENABLE_CLEANUP = _parse_env_bool("ENABLE_CLEANUP", False)
 
 HEURISTIC_BOOST = float(os.environ.get("HEURISTIC_BOOST", "1.6"))
 
@@ -466,6 +1728,311 @@ def setup_logging():
 
 # Initialize logger (will be properly configured when setup_logging() is called)
 logger = logging.getLogger("mat")
+
+
+def log_feature_flags() -> None:
+    logger.info(
+        "[FEATURE_FLAGS] ENABLE_2H_FACTORS=%s ENABLE_2H_SOFT_APPLY=%s AUTO_AGGREGATE_2H_STATS=%s SOFT_APPLY_MAX_ANTIBOOST_PCT=%.3f SOFT_APPLY_MAX_BOOST_PCT=%.3f ENABLE_CLEANUP=%s PRESSURE_AUX_MODE=%s LIVE_GATE_GARBAGE_ONLY=%s GOAL_CONFIRM_SECONDS=%s GOAL_CONFIRM_ACTIVE=%s",
+        ENABLE_2H_FACTORS,
+        ENABLE_2H_SOFT_APPLY,
+        AUTO_AGGREGATE_2H_STATS,
+        float(SOFT_APPLY_MAX_ANTIBOOST_PCT),
+        float(SOFT_APPLY_MAX_BOOST_PCT),
+        ENABLE_CLEANUP,
+        PRESSURE_AUX_MODE,
+        LIVE_GATE_GARBAGE_ONLY,
+        GOAL_CONFIRM_SECONDS,
+        GOAL_CONFIRM_ACTIVE,
+    )
+    logger.info(
+        "[CHANNEL_SIGNAL_FILTER_CONFIG] version=%s min_prob_to90=%.2f "
+        "min_reputation_delta_to90_pp=%.2f min_adjusted_intensity=%.3f "
+        "min_season_context_factor=%.3f premium_rule=%s "
+        "premium_max_goals_at_snapshot=%s legacy_rescue_publication=false",
+        CHANNEL_SIGNAL_FILTER_VERSION,
+        CHANNEL_SIGNAL_MIN_PROB_TO90,
+        CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP,
+        CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY,
+        CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR,
+        PREMIUM_BADGE_RULE_VERSION,
+        PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT,
+    )
+    logger.info(
+        "[DECISION_SNAPSHOT_CONFIG] enabled=%s decision_schema=%s outcome_schema=%s rotate_max_bytes=%s dedupe_max_keys=%s reconcile_every_cycles=%s reconcile_limit=%s recheck_seconds=%s reschedule_min_shift_seconds=%s file=%s",
+        ENABLE_DECISION_SNAPSHOTS,
+        DECISION_SNAPSHOT_SCHEMA_VERSION,
+        DECISION_OUTCOME_SCHEMA_VERSION,
+        DECISION_SNAPSHOT_ROTATE_MAX_BYTES,
+        DECISION_SNAPSHOT_DEDUPE_MAX_KEYS,
+        DECISION_OUTCOME_RECONCILE_EVERY_CYCLES,
+        DECISION_OUTCOME_RECONCILE_LIMIT,
+        DECISION_OUTCOME_RECHECK_SECONDS,
+        DECISION_OUTCOME_RESCHEDULE_MIN_SHIFT_SECONDS,
+        DECISION_SNAPSHOTS_FILE,
+    )
+    logger.info(
+        "[2H_COLLECTION_CONFIG] enabled=%s all_matches_since_utc=%s history_file=%s auto_aggregate=%s",
+        ENABLE_2H_COLLECTION,
+        SECOND_HALF_ALL_MATCHES_SINCE_UTC or "pending_only",
+        SECOND_HALF_HISTORY_PATH,
+        AUTO_AGGREGATE_2H_STATS,
+    )
+    logger.info(
+        "[OBSERVATION_CONFIG] enabled=%s schema=%s outcome_schema=%s rotate_max_bytes=%s file=%s config_hash=%s correction_recheck=%s correction_interval_seconds=%s correction_lookback_hours=%s correction_limit=%s",
+        ENABLE_OBSERVATION_HISTORY,
+        OBSERVATION_SCHEMA_VERSION,
+        OBSERVATION_OUTCOME_SCHEMA_VERSION,
+        OBSERVATION_ROTATE_MAX_BYTES,
+        OBSERVATION_HISTORY_FILE,
+        _observation_config_snapshot().get("config_hash"),
+        ENABLE_OUTCOME_CORRECTION_RECHECK,
+        OUTCOME_CORRECTION_RECHECK_SECONDS,
+        OUTCOME_CORRECTION_LOOKBACK_HOURS,
+        OUTCOME_CORRECTION_RECHECK_LIMIT,
+    )
+    logger.info(
+        "[MARKET_BENCHMARK_CONFIG] enabled=%s shadow_only=true "
+        "production_apply=false endpoint=odds/live endpoint_filter=none "
+        "preferred_bet_id=%s fallback_bet_id=36 "
+        "minute_range=%s-%s poll_seconds=%.1f max_quote_age_seconds=%.1f "
+        "queue_max=%s outcome_queue_reserve=%s poll_buffer_max=%s "
+        "write_batch=%s cache_quotes_per_fixture=%s "
+        "journal=%s index=%s",
+        ENABLE_MARKET_BENCHMARK,
+        25,
+        MARKET_BENCHMARK_MIN_MINUTE,
+        MARKET_BENCHMARK_MAX_MINUTE,
+        MARKET_BENCHMARK_POLL_SECONDS,
+        MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS,
+        MARKET_BENCHMARK_QUEUE_MAX,
+        MARKET_BENCHMARK_OUTCOME_QUEUE_RESERVE,
+        MARKET_BENCHMARK_POLL_BUFFER_MAX,
+        MARKET_BENCHMARK_WRITE_BATCH,
+        MARKET_BENCHMARK_CACHE_QUOTES_PER_FIXTURE,
+        MARKET_BENCHMARK_JOURNAL_FILE,
+        MARKET_BENCHMARK_INDEX_FILE,
+    )
+    logger.info(
+        "[WIDE_RESEARCH_CONFIG] enabled=%s auto_discovery=%s "
+        "auto_lifecycle=%s production_apply=%s prospective_start_utc=%s "
+        "max_shadow_rules=%s discovery_interval_seconds=%s "
+        "lifecycle_interval_seconds=%s worker_memory_limit_mb=%s "
+        "temporal_purge=%s temporal_embargo_seconds=%s "
+        "db=%s active_manifest=%s latest=%s",
+        ENABLE_WIDE_RESEARCH,
+        WIDE_RESEARCH_AUTO_DISCOVERY,
+        WIDE_RESEARCH_AUTO_LIFECYCLE,
+        WIDE_RESEARCH_PRODUCTION_APPLY,
+        WIDE_RESEARCH_PROSPECTIVE_START_UTC,
+        WIDE_RESEARCH_MAX_SHADOW_RULES,
+        WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS,
+        WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS,
+        WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB,
+        WIDE_RESEARCH_TEMPORAL_PURGE,
+        WIDE_RESEARCH_TEMPORAL_EMBARGO_SECONDS,
+        WIDE_RESEARCH_DB_FILE,
+        WIDE_RESEARCH_ACTIVE_MANIFEST_FILE,
+        WIDE_RESEARCH_DISCOVERY_FILE,
+    )
+    logger.info(
+        "[RESEARCH_HEALTH_CONFIG] enabled=%s interval_seconds=%s "
+        "report=%s alert_state=%s retry_interval_seconds=60",
+        ENABLE_RESEARCH_HEALTH_MONITOR,
+        RESEARCH_HEALTH_INTERVAL_SECONDS,
+        RESEARCH_HEALTH_REPORT_FILE,
+        RESEARCH_HEALTH_ALERT_STATE_FILE,
+    )
+    logger.info(
+        "[WIDE_RESEARCH_4F_CONFIG] enabled=%s auto_discovery=%s "
+        "auto_lifecycle=%s production_apply=false hard_shadow_only=true "
+        "prospective_start_utc=%s exact_conjunction_size=4 "
+        "max_shadow_rules=%s beam_width=%s evaluation_budget=%s "
+        "min_support=%s/%s/%s discovery_interval_seconds=%s "
+        "db=%s latest=%s",
+        ENABLE_WIDE_RESEARCH_FOUR_FACTOR,
+        WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY,
+        WIDE_RESEARCH_FOUR_FACTOR_AUTO_LIFECYCLE,
+        WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC,
+        WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES,
+        WIDE_RESEARCH_FOUR_FACTOR_BEAM_WIDTH,
+        WIDE_RESEARCH_FOUR_FACTOR_EVALUATION_BUDGET,
+        WIDE_RESEARCH_FOUR_FACTOR_MIN_TRAIN_SUPPORT,
+        WIDE_RESEARCH_FOUR_FACTOR_MIN_VALIDATION_SUPPORT,
+        WIDE_RESEARCH_FOUR_FACTOR_MIN_HOLDOUT_SUPPORT,
+        WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS,
+        WIDE_RESEARCH_FOUR_FACTOR_DB_FILE,
+        WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_FILE,
+    )
+    logger.info(
+        "[WIDE_RESEARCH_PRECISION_CONFIG] enabled=%s auto_discovery=%s "
+        "auto_lifecycle=%s production_apply=false hard_shadow_only=true "
+        "prospective_start_utc=%s conjunction_size=2..%s "
+        "max_shadow_rules=%s discovery_top_n=%s beam_width=%s evaluation_budget=%s "
+        "depth_budgets=%s min_support=%s/%s/%s cadence=%s/%s/%s "
+        "portfolio_max_rules=%s portfolio_beam_width=%s "
+        "discovery_interval_seconds=%s db=%s latest=%s",
+        ENABLE_WIDE_RESEARCH_PRECISION,
+        WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY,
+        WIDE_RESEARCH_PRECISION_AUTO_LIFECYCLE,
+        WIDE_RESEARCH_PRECISION_PROSPECTIVE_START_UTC,
+        WIDE_RESEARCH_PRECISION_MAX_CONJUNCTION_SIZE,
+        WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES,
+        WIDE_RESEARCH_PRECISION_DISCOVERY_TOP_N,
+        WIDE_RESEARCH_PRECISION_BEAM_WIDTH,
+        WIDE_RESEARCH_PRECISION_EVALUATION_BUDGET,
+        WIDE_RESEARCH_PRECISION_DEPTH_BUDGETS,
+        WIDE_RESEARCH_PRECISION_MIN_TRAIN_SUPPORT,
+        WIDE_RESEARCH_PRECISION_MIN_VALIDATION_SUPPORT,
+        WIDE_RESEARCH_PRECISION_MIN_HOLDOUT_SUPPORT,
+        WIDE_RESEARCH_PRECISION_MIN_SIGNALS_PER_WEEK,
+        WIDE_RESEARCH_PRECISION_PREFERRED_SIGNALS_PER_WEEK,
+        WIDE_RESEARCH_PRECISION_MAX_SIGNALS_PER_WEEK,
+        WIDE_RESEARCH_PRECISION_PORTFOLIO_MAX_RULES,
+        WIDE_RESEARCH_PRECISION_PORTFOLIO_BEAM_WIDTH,
+        WIDE_RESEARCH_PRECISION_DISCOVERY_INTERVAL_SECONDS,
+        WIDE_RESEARCH_PRECISION_DB_FILE,
+        WIDE_RESEARCH_PRECISION_DISCOVERY_FILE,
+    )
+    logger.info(
+        "[WIDE_RESEARCH_RARE_PRECISION_CONFIG] enabled=%s "
+        "auto_discovery=%s auto_lifecycle=%s production_apply=false "
+        "hard_shadow_only=true prospective_start_utc=%s "
+        "conjunction_size=2..%s max_shadow_rules=%s discovery_top_n=%s "
+        "beam_width=%s evaluation_budget=%s depth_budgets=%s "
+        "min_support=%s/%s/%s cadence=0 allow_feature_ranges=%s "
+        "validation_windows=%s terminal_review=200 "
+        "extended_features=true scopes=general_nonlinear,causal_market "
+        "max_total_evaluations=400000 error_refinement=true max_children_per_scope=4 "
+        "market_history_seconds=720 market_cache_quotes=64 "
+        "discovery_interval_seconds=%s db=%s latest=%s",
+        ENABLE_WIDE_RESEARCH_RARE_PRECISION,
+        WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY,
+        WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE,
+        WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC,
+        WIDE_RESEARCH_RARE_PRECISION_MAX_CONJUNCTION_SIZE,
+        WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES,
+        WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_TOP_N,
+        WIDE_RESEARCH_RARE_PRECISION_BEAM_WIDTH,
+        WIDE_RESEARCH_RARE_PRECISION_EVALUATION_BUDGET,
+        WIDE_RESEARCH_RARE_PRECISION_DEPTH_BUDGETS,
+        WIDE_RESEARCH_RARE_PRECISION_MIN_TRAIN_SUPPORT,
+        WIDE_RESEARCH_RARE_PRECISION_MIN_VALIDATION_SUPPORT,
+        WIDE_RESEARCH_RARE_PRECISION_MIN_HOLDOUT_SUPPORT,
+        WIDE_RESEARCH_RARE_PRECISION_ALLOW_FEATURE_RANGES,
+        WIDE_RESEARCH_RARE_PRECISION_VALIDATION_WINDOW_COUNT,
+        WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_INTERVAL_SECONDS,
+        WIDE_RESEARCH_RARE_PRECISION_DB_FILE,
+        WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE,
+    )
+    logger.info(
+        "[ROLLING_DYNAMICS_CONFIG] enabled=%s shadow_only=true production_apply=false schema=%s windows=5,10 max_extra_minutes=%s seed_minutes=36,39,41,44 seed_max_fetch_attempts=%s seed_workers=%s",
+        ENABLE_ROLLING_DYNAMICS_SHADOW,
+        ROLLING_DYNAMICS_SCHEMA_VERSION,
+        ROLLING_DYNAMICS_MAX_EXTRA_MINUTES,
+        ROLLING_DYNAMICS_SEED_MAX_FETCH_ATTEMPTS,
+        ROLLING_DYNAMICS_SEED_WORKERS,
+    )
+    logger.info(
+        "[SHADOW_ML_CONFIG] enabled=%s shadow_only=true production_apply=false auto_retrain=%s candidate_min_fixtures=%s offline_ready_min_fixtures=%s offline_ready_min_history_days=%.1f offline_ready_min_split_fixtures=%s offline_ready_min_rows=%s offline_ready_min_class_fixtures=%s max_next15_unknown_fraction=%.4f min_core_availability=%.4f min_logloss_improvement=%.6f min_brier_improvement=%.6f retrain_check_seconds=%s min_new_fixtures=%s noop_scan_cooldown_seconds=%s weekly_min_new_fixtures=%s model_file=%s predictions_file=%s rotate_max_bytes=%s",
+        ENABLE_SHADOW_ML,
+        SHADOW_ML_AUTO_RETRAIN,
+        SHADOW_ML_CANDIDATE_MIN_FIXTURES,
+        SHADOW_ML_OFFLINE_READY_MIN_FIXTURES,
+        SHADOW_ML_OFFLINE_READY_MIN_HISTORY_DAYS,
+        SHADOW_ML_OFFLINE_READY_MIN_SPLIT_FIXTURES,
+        SHADOW_ML_OFFLINE_READY_MIN_ROWS,
+        SHADOW_ML_OFFLINE_READY_MIN_CLASS_FIXTURES,
+        SHADOW_ML_OFFLINE_READY_MAX_NEXT15_UNKNOWN_FRACTION,
+        SHADOW_ML_OFFLINE_READY_MIN_CORE_AVAILABILITY,
+        SHADOW_ML_READINESS_MIN_LOGLOSS_IMPROVEMENT,
+        SHADOW_ML_READINESS_MIN_BRIER_IMPROVEMENT,
+        SHADOW_ML_RETRAIN_CHECK_SECONDS,
+        SHADOW_ML_MIN_NEW_FIXTURES,
+        SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS,
+        SHADOW_ML_WEEKLY_MIN_NEW_FIXTURES,
+        SHADOW_ML_MODEL_FILE,
+        SHADOW_ML_PREDICTIONS_FILE,
+        SHADOW_ML_PREDICTION_ROTATE_MAX_BYTES,
+    )
+    logger.info(
+        "[SHADOW_ML_ROLLING_CONFIG] enabled=%s shadow_only=true production_apply=false auto_retrain=%s feature_profile=%s rolling_schema=%s windows=5,10 model_file=%s predictions_file=%s rotate_max_bytes=%s",
+        ENABLE_SHADOW_ML_ROLLING_CHALLENGER,
+        SHADOW_ML_ROLLING_AUTO_RETRAIN,
+        ROLLING_FEATURE_PROFILE,
+        ROLLING_DYNAMICS_SCHEMA_VERSION,
+        SHADOW_ML_ROLLING_MODEL_FILE,
+        SHADOW_ML_ROLLING_PREDICTIONS_FILE,
+        SHADOW_ML_ROLLING_PREDICTION_ROTATE_MAX_BYTES,
+    )
+    logger.info(
+        "[SHADOW_CANDIDATE_CONFIG] enabled=%s shadow_only=true "
+        "production_apply=false semantics=%s ruleset=%s "
+        "prospective_start_utc=%s settle_seconds=%.1f "
+        "max_prediction_lag_seconds=%.1f rotate_max_bytes=%s "
+        "journal_file=%s index_file=%s",
+        ENABLE_SHADOW_CANDIDATE_LAYER,
+        DEFAULT_SHADOW_CANDIDATE_RULESET.semantics,
+        DEFAULT_SHADOW_CANDIDATE_RULESET.version,
+        SHADOW_CANDIDATE_PROSPECTIVE_START_UTC,
+        SHADOW_CANDIDATE_SETTLE_SECONDS,
+        SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS,
+        SHADOW_CANDIDATE_ROTATE_MAX_BYTES,
+        SHADOW_CANDIDATE_JOURNAL_FILE,
+        SHADOW_CANDIDATE_INDEX_FILE,
+    )
+    logger.info("[NORMAL_TIME_BOUNDARY_MODE] mode=%s", NORMAL_TIME_BOUNDARY_MODE)
+    if NORMAL_TIME_BOUNDARY_MODE == "legacy":
+        logger.warning(
+            "[LEGACY_EXTRA_TIME_OUTCOME_MODE] Extra-time goals may affect normal-time outcomes"
+        )
+    logger.info(
+        "[SIGNAL_REPUTATION_CONFIG] shadow_enabled=%s auto_apply_enabled=%s production_cohort=%s expanded_shadow_enabled=%s expanded_cohort=expanded_blend expanded_production_apply=%s expanded_next15_telegram_weight=%.2f expanded_to90_telegram_weight=%.2f expanded_recommended_caps_pp=1/2 auto_stages_fixtures=%s/%s/%s auto_caps_pp=1/2/3 half_life_days=%.1f refresh_seconds=%s rotate_max_bytes=%s model_file=%s shadow_file=%s priors=%s/%s/%s/%s/%s",
+        ENABLE_SIGNAL_REPUTATION_SHADOW,
+        ENABLE_SIGNAL_REPUTATION_AUTO_APPLY,
+        (
+            "expanded_blend"
+            if ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY
+            else "telegram_signals"
+        ),
+        ENABLE_SIGNAL_REPUTATION_EXPANDED_SHADOW,
+        ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY,
+        SIGNAL_REPUTATION_BLEND_NEXT15_TELEGRAM_WEIGHT,
+        SIGNAL_REPUTATION_BLEND_TELEGRAM_WEIGHT,
+        SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES,
+        SIGNAL_REPUTATION_AUTO_STAGE_2_FIXTURES,
+        SIGNAL_REPUTATION_AUTO_STAGE_3_FIXTURES,
+        SIGNAL_REPUTATION_HALF_LIFE_DAYS,
+        SIGNAL_REPUTATION_REFRESH_SECONDS,
+        SIGNAL_REPUTATION_ROTATE_MAX_BYTES,
+        SIGNAL_REPUTATION_MODEL_FILE,
+        SIGNAL_REPUTATION_SHADOW_FILE,
+        SIGNAL_REPUTATION_PRIOR_GLOBAL,
+        SIGNAL_REPUTATION_PRIOR_LEAGUE,
+        SIGNAL_REPUTATION_PRIOR_TEAM,
+        SIGNAL_REPUTATION_PRIOR_TEAM_LEAGUE,
+        SIGNAL_REPUTATION_PRIOR_ROLE,
+    )
+    logger.info(
+        "[MEMORY_CONFIG] api_cache_max_entries=%s cache_ttl_seconds=%s "
+        "tg_cache_max_entries=%s tg_cache_ttl_seconds=%s telemetry_seconds=%s "
+        "shadow_ml_isolated=%s shadow_ml_worker_timeout_seconds=%s "
+        "shadow_ml_worker_memory_limit_mb=%s "
+        "shadow_ml_noop_scan_cooldown_seconds=%s "
+        "reputation_isolated=%s reputation_min_rebuild_seconds=%s "
+        "reputation_worker_timeout_seconds=%s",
+        CACHE_MAX_ENTRIES,
+        CACHE_TTL,
+        TG_EDIT_CACHE_MAX_ENTRIES,
+        TG_EDIT_CACHE_TTL_SECONDS,
+        MEMORY_TELEMETRY_INTERVAL_SECONDS,
+        SHADOW_ML_ISOLATED_TRAINING_ENABLED,
+        SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS,
+        SHADOW_ML_WORKER_MEMORY_LIMIT_MB,
+        SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS,
+        SIGNAL_REPUTATION_ISOLATED_REFRESH_ENABLED,
+        SIGNAL_REPUTATION_MIN_REBUILD_SECONDS,
+        SIGNAL_REPUTATION_SUBPROCESS_TIMEOUT_SECONDS,
+    )
 
 # -------------------------
 # Google Sheets integration
@@ -840,35 +2407,75 @@ def calculate_goal_probability(
         "prob_until_90": prob_until_90
     }
 
-def calculate_save_stress(saves_home: float, saves_away: float, current_home_score: float, current_away_score: float, shots_on_target_home: float, shots_on_target_away: float) -> float:
+def smooth_saturation(value: Any, half_saturation: float, exponent: float = 2.0) -> float:
+    """Map a non-negative value to 0..1 without a hard ceiling."""
+    numeric = max(0.0, safe_float(value, 0.0))
+    half = max(1e-9, float(half_saturation))
+    power = max(1.0, float(exponent))
+    if numeric <= 0.0:
+        return 0.0
+    numerator = numeric ** power
+    return clamp(numerator / (numerator + half ** power), 0.0, 1.0)
+
+
+def calculate_save_stress_details(
+    saves_home: float,
+    saves_away: float,
+    current_home_score: float,
+    current_away_score: float,
+    shots_on_target_home: float,
+    shots_on_target_away: float,
+) -> Dict[str, float]:
     """
-    Calculate the main save_stress value used across all scoring and admin logic.
-    
-    Formula:
-    - total_saves = saves_home + saves_away
-    - total_goals = current_home_score + current_away_score
-    - total_sot = shots_on_target_home + shots_on_target_away
-    
-    if total_sot <= 1.0:
-        save_stress = 0.0
-    else:
-        save_raw = (total_saves + 0.5 * total_goals) / 4.0
-        volume_factor_saves = min(1.0, total_sot / 4.0)
-        save_stress = min(save_raw * volume_factor_saves, 1.0)
-    
-    Returns:
-        float save_stress value (0.0 to 1.0)
+    Smooth goalkeeper workload based on saves, not conceded goals.
+
+    Save volume uses a Hill curve with 4 saves as the half-saturation point.
+    Shots on target only confirm that the volume is credible; their main
+    positive influence remains in the dedicated SOT component.
     """
     total_saves = max(0.0, float(saves_home) + float(saves_away))
     total_goals = max(0.0, float(current_home_score) + float(current_away_score))
     total_sot = max(0.0, float(shots_on_target_home) + float(shots_on_target_away))
-    
+
     if total_sot <= 1.0:
-        return 0.0
+        volume_factor = 0.0
+        save_volume_norm = 0.0
+        save_share = 0.0
+        save_stress = 0.0
     else:
-        save_raw = (total_saves + 0.5 * total_goals) / 4.0
-        volume_factor_saves = min(1.0, total_sot / 4.0)
-        return min(save_raw * volume_factor_saves, 1.0)
+        save_volume_norm = smooth_saturation(total_saves, 4.0, 2.0)
+        volume_factor = clamp((total_sot - 1.0) / 3.0, 0.0, 1.0)
+        save_share = clamp(total_saves / total_sot, 0.0, 1.0)
+        resistance_factor = 0.75 + 0.25 * save_share
+        save_stress = clamp(
+            save_volume_norm * volume_factor * resistance_factor,
+            0.0,
+            1.0,
+        )
+
+    return {
+        "save_stress": save_stress,
+        "total_saves": total_saves,
+        "total_goals": total_goals,
+        "total_sot": total_sot,
+        "save_volume_norm": save_volume_norm,
+        "volume_factor": volume_factor,
+        "save_share": save_share,
+    }
+
+
+def calculate_save_stress(saves_home: float, saves_away: float, current_home_score: float, current_away_score: float, shots_on_target_home: float, shots_on_target_away: float) -> float:
+    """Return the smooth 0..1 save-stress scalar for legacy callers."""
+    return float(
+        calculate_save_stress_details(
+            saves_home,
+            saves_away,
+            current_home_score,
+            current_away_score,
+            shots_on_target_home,
+            shots_on_target_away,
+        )["save_stress"]
+    )
 
 
 def calculate_derived_metrics(
@@ -946,7 +2553,7 @@ def calculate_derived_metrics(
         if any(v is None or v == "" for v in required_save_stress_inputs):
             save_stress_value = 0.0
         else:
-            save_stress_value = calculate_save_stress(
+            save_stress_details = calculate_save_stress_details(
                 saves_home=saves_h,
                 saves_away=saves_a,
                 current_home_score=score_h,
@@ -954,17 +2561,20 @@ def calculate_derived_metrics(
                 shots_on_target_home=shots_on_h,
                 shots_on_target_away=shots_on_a
             )
+            save_stress_value = float(save_stress_details["save_stress"])
 
         save_stress = f"{save_stress_value:.4f}"
-        logger.info(
-            "[SAVE_STRESS] "
-            f"saves={saves_h + saves_a}, "
-            f"goals={score_h + score_a}, "
-            f"sot_total={shots_on_h + shots_on_a}, "
-            f"raw={raw:.4f}, "
-            f"volume_factor={volume_factor:.4f}, "
-            f"save_stress={save_stress}"
-        )
+        if not any(v is None or v == "" for v in required_save_stress_inputs):
+            logger.info(
+                "[SAVE_STRESS] saves=%.1f goals=%.1f sot_total=%.1f save_volume_norm=%.4f volume_factor=%.4f save_share=%.4f save_stress=%s",
+                saves_h + saves_a,
+                score_h + score_a,
+                shots_on_h + shots_on_a,
+                float(save_stress_details["save_volume_norm"]),
+                float(save_stress_details["volume_factor"]),
+                float(save_stress_details["save_share"]),
+                save_stress,
+            )
         
         # possession_pressure = normalized possession dominance (0..1 range for ML)
         # Formula: abs(possession_home - possession_away) / 100.0
@@ -1034,6 +2644,28 @@ def get_fixture_id(obj: Any) -> Optional[int]:
                 return fid
 
     return None
+
+
+def _merge_fixture_payload_with_live_fallback(primary: Any, fallback: Any) -> Any:
+    """Fill missing fixture payload fields without replacing fresh API values."""
+    if isinstance(primary, dict) and isinstance(fallback, dict):
+        merged: Dict[str, Any] = {}
+        for key in fallback.keys() | primary.keys():
+            if key in primary and key in fallback:
+                merged[key] = _merge_fixture_payload_with_live_fallback(
+                    primary.get(key),
+                    fallback.get(key),
+                )
+            elif key in primary:
+                merged[key] = primary.get(key)
+            else:
+                merged[key] = fallback.get(key)
+        return merged
+    if primary is None or primary == "":
+        return fallback
+    if isinstance(primary, (dict, list)) and not primary:
+        return fallback
+    return primary
 
 
 def has_stats_data(fixture_metrics: Dict[str, Any]) -> bool:
@@ -1502,7 +3134,222 @@ def save_match_to_sheet(match_id: int, data: Dict[str, Any], minute: int, prob_n
     except Exception as e:
         logger.exception(f"[GSHEETS] Failed to save signal for match {match_id}: {e}")
 
-def _extract_counted_goals_after_signal(events: List[Dict[str, Any]], signal_minute: int, match_id: int) -> Tuple[List[int], Optional[int], Optional[str]]:
+def _fixture_event_context(raw_fixture: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw_fixture = raw_fixture or {}
+    fixture_obj = raw_fixture.get("fixture") if isinstance(raw_fixture.get("fixture"), dict) else raw_fixture
+    status_obj = fixture_obj.get("status") if isinstance(fixture_obj, dict) else {}
+    status_short = status_obj.get("short") if isinstance(status_obj, dict) else status_obj
+    return {"status_short": str(status_short or "").upper(), "status": str(status_short or "").upper()}
+
+
+def _classified_goals_after_signal(
+    events: List[Dict[str, Any]], signal_minute: int, fixture_context: Dict[str, Any],
+    snapshot_score: Optional[Tuple[int, int]] = None,
+) -> Dict[str, List[Tuple[EventTime, Dict[str, Any]]]]:
+    """Classify goals after a snapshot without leaking goals from the same minute.
+
+    When the score captured in the snapshot is available, the corresponding
+    prefix of normal-time goal events is treated as already observed. This is
+    more precise than comparing integer clock minutes (for example 45+1 and a
+    snapshot at minute 46). Legacy callers without a score retain the previous
+    minute-based behaviour.
+    """
+    result: Dict[str, List[Tuple[EventTime, Dict[str, Any]]]] = {
+        "normal_time": [], "extra_time": [], "shootout": [], "unknown": []
+    }
+    classified: List[Tuple[GoalScope, EventTime, Dict[str, Any]]] = []
+    for event in events or []:
+        scope = classify_goal_scope(event, fixture_context)
+        event_time = _extract_event_time(event, fixture_context)
+        if scope == GoalScope.INVALID_OR_CANCELLED:
+            continue
+        classified.append((scope, event_time, event))
+
+    classified.sort(
+        key=lambda item: item[1].clock_minute if item[1].clock_minute is not None else 10_000
+    )
+    observed_normal_goal_count: Optional[int] = None
+    if snapshot_score is not None:
+        try:
+            observed_normal_goal_count = max(0, int(snapshot_score[0]) + int(snapshot_score[1]))
+        except (TypeError, ValueError, IndexError):
+            observed_normal_goal_count = None
+    normal_seen = 0
+    normal_available = sum(
+        1 for scope, _, _ in classified
+        if scope in {GoalScope.FIRST_HALF, GoalScope.SECOND_HALF_NORMAL_TIME}
+    )
+    use_score_prefix = (
+        observed_normal_goal_count is not None
+        and normal_available >= observed_normal_goal_count
+    )
+
+    for scope, event_time, event in classified:
+        if scope in {GoalScope.FIRST_HALF, GoalScope.SECOND_HALF_NORMAL_TIME}:
+            if use_score_prefix:
+                normal_seen += 1
+                if normal_seen <= int(observed_normal_goal_count or 0):
+                    continue
+            elif event_time.clock_minute is not None:
+                # If a score was supplied but the event feed is incomplete,
+                # equality is ambiguous. Prefer a conservative false negative
+                # over leaking a goal that was already visible in the snapshot.
+                boundary = int(signal_minute)
+                if snapshot_score is not None and event_time.clock_minute <= boundary:
+                    continue
+                if snapshot_score is None and event_time.clock_minute < boundary:
+                    continue
+            result["normal_time"].append((event_time, event))
+        elif scope == GoalScope.EXTRA_TIME:
+            result["extra_time"].append((event_time, event))
+        elif scope == GoalScope.PENALTY_SHOOTOUT:
+            result["shootout"].append((event_time, event))
+        else:
+            result["unknown"].append((event_time, event))
+    return result
+
+
+def resolve_goal_within_horizon(
+    signal_minute: int,
+    snapshot_score: Tuple[int, int],
+    horizon_minutes: int,
+    exact_goal_clocks: Optional[List[int]] = None,
+    score_timeline: Optional[List[Dict[str, Any]]] = None,
+    normal_time_score: Optional[Tuple[int, int]] = None,
+    exact_goal_count_after_signal: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Resolve a goal horizon as true, false, or unknown.
+
+    Exact goal events have priority. Score observations can prove that a goal
+    was already visible by the horizon, or that the baseline score survived
+    through it. If the final score increased but neither source locates the
+    increase relative to the boundary, the correct label is ``None``.
+    """
+    signal_minute_i = max(0, _safe_int(signal_minute, 0))
+    horizon_minutes_i = max(0, _safe_int(horizon_minutes, 0))
+    horizon_end = signal_minute_i + horizon_minutes_i
+    baseline_total = _safe_int(snapshot_score[0], 0) + _safe_int(snapshot_score[1], 0)
+    clocks = sorted(
+        _safe_int(clock, -1)
+        for clock in (exact_goal_clocks or [])
+        if _safe_int(clock, -1) >= 0
+    )
+
+    inside = [clock for clock in clocks if clock <= horizon_end]
+    if inside:
+        return {
+            "value": True,
+            "source": "event_exact",
+            "quality": "exact",
+            "horizon_end_minute": horizon_end,
+            "goal_interval_start_minute": inside[0],
+            "goal_interval_end_minute": inside[0],
+        }
+
+    final_total: Optional[int] = None
+    if normal_time_score is not None:
+        final_total = (
+            _safe_int(normal_time_score[0], 0)
+            + _safe_int(normal_time_score[1], 0)
+        )
+        if final_total <= baseline_total:
+            return {
+                "value": False,
+                "source": "final_score_no_change",
+                "quality": "score_confirmed",
+                "horizon_end_minute": horizon_end,
+                "goal_interval_start_minute": None,
+                "goal_interval_end_minute": None,
+            }
+
+    score_delta = (
+        max(0, int(final_total) - baseline_total)
+        if final_total is not None
+        else None
+    )
+    exact_count = (
+        max(0, _safe_int(exact_goal_count_after_signal, 0))
+        if exact_goal_count_after_signal is not None
+        else len(clocks)
+    )
+    if score_delta and exact_count >= score_delta:
+        return {
+            "value": False,
+            "source": "event_exact_complete",
+            "quality": "exact",
+            "horizon_end_minute": horizon_end,
+            "goal_interval_start_minute": clocks[0] if clocks else None,
+            "goal_interval_end_minute": clocks[0] if clocks else None,
+        }
+
+    observations: List[Dict[str, int]] = []
+    for raw in score_timeline or []:
+        if not isinstance(raw, dict):
+            continue
+        minute = _safe_int(raw.get("minute"), -1)
+        if minute < signal_minute_i:
+            continue
+        home = _safe_int(raw.get("home"), -1)
+        away = _safe_int(raw.get("away"), -1)
+        if home < 0 or away < 0:
+            continue
+        observations.append({"minute": minute, "total": home + away})
+    observations.sort(key=lambda item: item["minute"])
+
+    previous_baseline_minute = signal_minute_i
+    first_increase_after_horizon: Optional[Dict[str, int]] = None
+    for observation in observations:
+        minute = observation["minute"]
+        total = observation["total"]
+        if minute <= horizon_end and total == baseline_total:
+            previous_baseline_minute = max(previous_baseline_minute, minute)
+        if total > baseline_total:
+            if minute <= horizon_end and (final_total is None or final_total > baseline_total):
+                return {
+                    "value": True,
+                    "source": "score_timeline",
+                    "quality": "inferred",
+                    "horizon_end_minute": horizon_end,
+                    "goal_interval_start_minute": previous_baseline_minute,
+                    "goal_interval_end_minute": minute,
+                }
+            if minute > horizon_end and first_increase_after_horizon is None:
+                first_increase_after_horizon = observation
+        if minute >= horizon_end and total == baseline_total:
+            return {
+                "value": False,
+                "source": "score_timeline_no_change",
+                "quality": "inferred",
+                "horizon_end_minute": horizon_end,
+                "goal_interval_start_minute": None,
+                "goal_interval_end_minute": None,
+            }
+
+    if first_increase_after_horizon is not None:
+        return {
+            "value": None,
+            "source": "score_timeline_boundary_gap",
+            "quality": "unknown",
+            "horizon_end_minute": horizon_end,
+            "goal_interval_start_minute": previous_baseline_minute,
+            "goal_interval_end_minute": first_increase_after_horizon["minute"],
+        }
+
+    return {
+        "value": None,
+        "source": "unknown_timing",
+        "quality": "unknown",
+        "horizon_end_minute": horizon_end,
+        "goal_interval_start_minute": None,
+        "goal_interval_end_minute": None,
+    }
+
+
+def _extract_counted_goals_after_signal(
+    events: List[Dict[str, Any]], signal_minute: int, match_id: int,
+    fixture_context: Optional[Dict[str, Any]] = None,
+    outcome_scope: OutcomeScope = OutcomeScope.FULL_MATCH_EXCLUDING_SHOOTOUT,
+) -> Tuple[List[int], Optional[int], Optional[str]]:
     """
     Extract counted goal minutes after signal_minute from match events.
     
@@ -1535,14 +3382,22 @@ def _extract_counted_goals_after_signal(events: List[Dict[str, Any]], signal_min
     else:
         logger.warning(f"[OUTCOME] match={match_id} NO EVENTS returned from API")
     
+    fixture_context = fixture_context or {}
     # Process all events
     for ev in events:
         # Check if this is a valid counted goal
         if not _is_valid_counted_goal(ev):
             continue
         
-        # Extract minute using correct field structure
-        ev_minute = _extract_event_minute(ev)
+        scope = classify_goal_scope(ev, fixture_context)
+        if scope in {GoalScope.INVALID_OR_CANCELLED, GoalScope.PENALTY_SHOOTOUT, GoalScope.UNKNOWN}:
+            continue
+        if outcome_scope == OutcomeScope.TO_90_NORMAL_TIME and scope not in {
+            GoalScope.FIRST_HALF, GoalScope.SECOND_HALF_NORMAL_TIME
+        }:
+            continue
+
+        ev_minute = _extract_event_time(ev, fixture_context).clock_minute
         
         if ev_minute is None:
             logger.warning(f"[OUTCOME] match={match_id} Goal event has no minute: {ev}")
@@ -1655,6 +3510,10 @@ def finalize_match_outcomes(match_id: int, client):
         except Exception as e:
             logger.error(f"[GSHEETS] Failed to fetch events for match {match_id}: {e}")
             events = []
+        try:
+            outcome_fixture_context = _fixture_event_context(client.fetch_fixture(match_id) or {})
+        except Exception:
+            outcome_fixture_context = {}
 
         # Get outcome column indices (Russian names)
         col_goal_after_15 = header_map.get("Гол после 15 минут")
@@ -1677,7 +3536,11 @@ def finalize_match_outcomes(match_id: int, client):
 
             logger.info(f"[OUTCOME] Starting finalize for match={match_id} signal_minute={signal_minute} row={row_number}")
 
-            goal_minutes, first_goal_minute, first_goal_team = _extract_counted_goals_after_signal(events, signal_minute, match_id)
+            goal_minutes, first_goal_minute, first_goal_team = _extract_counted_goals_after_signal(
+                events, signal_minute, match_id,
+                fixture_context=outcome_fixture_context,
+                outcome_scope=OutcomeScope.TO_90_NORMAL_TIME,
+            )
 
             if first_goal_minute is not None:
                 goal_to_ft = 1
@@ -1743,6 +3606,43 @@ def finalize_match_outcomes(match_id: int, client):
     except Exception as e:
         logger.exception(f"[GSHEETS] finalize_match_outcomes failed for match {match_id}: {e}")
 
+def _resolve_outcome_integrity(
+    *,
+    fixture_id: int,
+    signal_score: Tuple[int, int],
+    normal_time_score: Optional[Tuple[int, int]],
+    normal_time_event_count: int,
+    previously_confirmed_win: bool = False,
+):
+    integrity = resolve_normal_time_outcome(
+        signal_score,
+        normal_time_score,
+        normal_time_event_count=normal_time_event_count,
+        previously_confirmed_win=previously_confirmed_win,
+    )
+    if integrity.conflict or integrity.status == "quarantine":
+        logging.getLogger("mat").warning(
+            "[OUTCOME_INTEGRITY] fixture_id=%s signal_score=%s-%s "
+            "normal_time_score=%s event_count=%s status=%s result=%s "
+            "source=%s conflict=%s details=%s",
+            fixture_id,
+            signal_score[0],
+            signal_score[1],
+            (
+                f"{normal_time_score[0]}-{normal_time_score[1]}"
+                if normal_time_score is not None
+                else "unknown"
+            ),
+            normal_time_event_count,
+            integrity.status,
+            integrity.normal_time_result,
+            integrity.goal_result_source,
+            integrity.conflict,
+            integrity.conflict_details,
+        )
+    return integrity
+
+
 def process_match_outcomes_for_jsonl(match_id: int, client):
     records = _get_training_signal_records_for_fixture(match_id)
     if not records:
@@ -1771,6 +3671,18 @@ def process_match_outcomes_for_jsonl(match_id: int, client):
     final_home_team = str(((teams_obj.get("home") or {}).get("name")) or "")
     final_away_team = str(((teams_obj.get("away") or {}).get("name")) or "")
     final_league_name = str(league_obj.get("name") or "")
+    fixture_context = _fixture_event_context(raw_fixture)
+    score_blocks = normalize_score_blocks(raw_fixture)
+    normal_score = score_blocks.get("normal_time") or {}
+    after_et_score = score_blocks.get("after_extra_time") or {}
+    penalty_score = score_blocks.get("penalty") or {}
+
+    logger.info(
+        "[NORMAL_TIME_SCORE_SOURCE] fixture_id=%s status=%s source=%s normal_time_score=%s-%s after_extra_time_score=%s-%s penalty_score=%s-%s",
+        match_id, fixture_context.get("status_short"), score_blocks.get("normal_time_source"),
+        normal_score.get("home"), normal_score.get("away"), after_et_score.get("home"),
+        after_et_score.get("away"), penalty_score.get("home"), penalty_score.get("away"),
+    )
 
     for record in records:
         signal_id = str(record.get("signal_id") or "").strip()
@@ -1780,17 +3692,54 @@ def process_match_outcomes_for_jsonl(match_id: int, client):
             continue
 
         signal_minute = _safe_int(record.get("signal_minute"), 0)
-        goal_minutes, first_goal_minute, _first_goal_team = _extract_counted_goals_after_signal(events, signal_minute, match_id)
-        goals_after_signal_count = len(goal_minutes)
-        signal_total_goals = _safe_int(record.get("signal_score_home"), 0) + _safe_int(record.get("signal_score_away"), 0)
-
-        if not events and final_total_goals > signal_total_goals:
-            logger.error(
-                "[JSONL_ERROR] cannot save outcome without events fixture_id=%s signal_id=%s",
-                match_id,
-                signal_id,
-            )
-            continue
+        signal_score_home = _safe_int(record.get("signal_score_home"), 0)
+        signal_score_away = _safe_int(record.get("signal_score_away"), 0)
+        signal_score = (signal_score_home, signal_score_away)
+        classified = _classified_goals_after_signal(
+            events, signal_minute, fixture_context, snapshot_score=signal_score
+        )
+        normal_goals = classified["normal_time"]
+        extra_goals = classified["extra_time"]
+        shootout_events = classified["shootout"]
+        goal_minutes = [item[0].clock_minute for item in normal_goals if item[0].clock_minute is not None]
+        first_goal_time = normal_goals[0][0] if normal_goals else None
+        first_extra_time = extra_goals[0][0] if extra_goals else None
+        first_goal_minute = first_goal_time.clock_minute if first_goal_time else None
+        signal_total_goals = signal_score_home + signal_score_away
+        normal_score_home = normal_score.get("home")
+        normal_score_away = normal_score.get("away")
+        if normal_score_home is None or normal_score_away is None:
+            if str(fixture_context.get("status_short") or "").upper() == "FT":
+                normal_score_home, normal_score_away = final_score_home, final_score_away
+        normal_time_score_tuple = (
+            (int(normal_score_home), int(normal_score_away))
+            if normal_score_home is not None and normal_score_away is not None
+            else None
+        )
+        integrity = _resolve_outcome_integrity(
+            fixture_id=match_id,
+            signal_score=signal_score,
+            normal_time_score=normal_time_score_tuple,
+            normal_time_event_count=len(normal_goals),
+        )
+        has_normal_time_goal = integrity.goal_to90_normal_time is True
+        goals_after_signal_count = int(
+            integrity.normal_time_goal_count_after_signal or 0
+        )
+        goal_result_source = integrity.goal_result_source
+        score_timeline = get_score_timeline(match_id)
+        next_15_label = resolve_goal_within_horizon(
+            signal_minute, signal_score, 15, goal_minutes, score_timeline,
+            normal_time_score_tuple, len(normal_goals),
+        )
+        next_25_label = resolve_goal_within_horizon(
+            signal_minute, signal_score, 25, goal_minutes, score_timeline,
+            normal_time_score_tuple, len(normal_goals),
+        )
+        before_75_label = resolve_goal_within_horizon(
+            signal_minute, signal_score, max(0, 75 - signal_minute), goal_minutes,
+            score_timeline, normal_time_score_tuple, len(normal_goals),
+        )
 
         outcome = {
             "_training_jsonl": True,
@@ -1801,19 +3750,57 @@ def process_match_outcomes_for_jsonl(match_id: int, client):
             "away_team": str(record.get("away_team") or final_away_team),
             "league_name": str(record.get("league_name") or final_league_name),
             "signal_minute": signal_minute,
-            "signal_score_home": _safe_int(record.get("signal_score_home"), 0),
-            "signal_score_away": _safe_int(record.get("signal_score_away"), 0),
+            "signal_score_home": signal_score_home,
+            "signal_score_away": signal_score_away,
             "prob_next_15_at_signal": round(_safe_float(record.get("prob_next_15_at_signal"), 0.0), 2),
             "prob_second_half_remain_at_signal": round(_safe_float(record.get("prob_second_half_remain_at_signal"), 0.0), 2),
             "lambda_2h_at_signal": round(_safe_float(record.get("lambda_2h_at_signal"), 0.0), 4),
+            "outcome_schema_version": 3,
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
             "final_score_home": final_score_home,
             "final_score_away": final_score_away,
             "final_total_goals": final_total_goals,
-            "goal_after_signal": 1 if goals_after_signal_count > 0 else 0,
-            "goal_in_next_15": 1 if any(goal_minute <= signal_minute + 15 for goal_minute in goal_minutes) else 0,
+            "goal_after_signal": 1 if has_normal_time_goal else 0,
+            "legacy_alias_for": "goal_after_signal_normal_time",
+            "goal_after_signal_normal_time": has_normal_time_goal,
+            "goal_after_signal_extra_time": bool(extra_goals),
+            "goal_after_signal_all_periods_excluding_shootout": bool(has_normal_time_goal or extra_goals),
+            "goal_in_next_15": (
+                None if next_15_label["value"] is None
+                else int(bool(next_15_label["value"]))
+            ),
+            "goal_in_next_15_normal_time": next_15_label["value"],
+            "goal_in_next_15_source": next_15_label["source"],
+            "goal_in_next_15_quality": next_15_label["quality"],
+            "goal_in_next_15_interval_start_minute": next_15_label["goal_interval_start_minute"],
+            "goal_in_next_15_interval_end_minute": next_15_label["goal_interval_end_minute"],
+            "goal_in_next_25_normal_time": next_25_label["value"],
+            "goal_in_next_25_source": next_25_label["source"],
+            "goal_in_next_25_quality": next_25_label["quality"],
+            "goal_before_75_normal_time": before_75_label["value"],
+            "goal_before_75_source": before_75_label["source"],
+            "goal_to90_normal_time": has_normal_time_goal,
+            "goal_result_source": goal_result_source,
             "goals_after_signal_count": goals_after_signal_count,
+            "normal_time_goal_count_after_signal": goals_after_signal_count,
+            "extra_time_goal_count_after_signal": len(extra_goals),
+            "shootout_event_count_excluded": len(shootout_events),
             "first_goal_after_signal_minute": first_goal_minute,
-            "goal_by_90": 1 if any(goal_minute <= 90 for goal_minute in goal_minutes) else 0,
+            "first_normal_time_goal_after_signal": first_goal_time.to_dict() if first_goal_time else None,
+            "first_extra_time_goal_after_signal": first_extra_time.to_dict() if first_extra_time else None,
+            "goal_by_90": 1 if has_normal_time_goal else 0,
+            "normal_time_final_score_home": normal_score_home,
+            "normal_time_final_score_away": normal_score_away,
+            "after_extra_time_score_home": after_et_score.get("home"),
+            "after_extra_time_score_away": after_et_score.get("away"),
+            "penalty_score_home": penalty_score.get("home"),
+            "penalty_score_away": penalty_score.get("away"),
+            "normal_time_resolved_at_utc": _utc_now_iso(),
+            "match_fully_resolved_at_utc": _utc_now_iso(),
+            "normal_time_result": integrity.normal_time_result,
+            "outcome_integrity_status": integrity.status,
+            "outcome_integrity_conflict": integrity.conflict,
+            "outcome_integrity_conflict_details": integrity.conflict_details,
             "model_version": str(record.get("model_version") or "v2"),
             "signal_model": str(record.get("signal_model") or "45_plus"),
             "outcome_saved_utc": _utc_now_iso(),
@@ -1821,6 +3808,117 @@ def process_match_outcomes_for_jsonl(match_id: int, client):
 
         if save_outcome(outcome):
             _mark_training_signal_outcome_saved(signal_id)
+
+
+def process_normal_time_outcomes_for_jsonl(
+    match_id: int,
+    events: List[Dict[str, Any]],
+    fixture_context: Dict[str, Any],
+    normal_time_score: Tuple[int, int],
+    resolved_at_utc: str,
+) -> int:
+    """Resolve training outcomes at the normal-time boundary without waiting for AET."""
+    written = 0
+    for record in _get_training_signal_records_for_fixture(match_id):
+        signal_id = str(record.get("signal_id") or "").strip()
+        if not signal_id or bool(record.get("outcome_saved", False)):
+            continue
+        signal_minute = _safe_int(record.get("signal_minute"), 0)
+        signal_score_home = _safe_int(record.get("signal_score_home"), 0)
+        signal_score_away = _safe_int(record.get("signal_score_away"), 0)
+        signal_score = (signal_score_home, signal_score_away)
+        classified = _classified_goals_after_signal(
+            events, signal_minute, fixture_context, snapshot_score=signal_score
+        )
+        normal, extra, shootout = classified["normal_time"], classified["extra_time"], classified["shootout"]
+        clocks = [item[0].clock_minute for item in normal if item[0].clock_minute is not None]
+        first_normal = normal[0][0] if normal else None
+        first_extra = extra[0][0] if extra else None
+        integrity = _resolve_outcome_integrity(
+            fixture_id=match_id,
+            signal_score=signal_score,
+            normal_time_score=normal_time_score,
+            normal_time_event_count=len(normal),
+        )
+        has_normal_time_goal = integrity.goal_to90_normal_time is True
+        normal_goal_count = int(
+            integrity.normal_time_goal_count_after_signal or 0
+        )
+        goal_result_source = integrity.goal_result_source
+        score_timeline = get_score_timeline(match_id)
+        next_15_label = resolve_goal_within_horizon(
+            signal_minute, signal_score, 15, clocks, score_timeline,
+            normal_time_score, len(normal),
+        )
+        next_25_label = resolve_goal_within_horizon(
+            signal_minute, signal_score, 25, clocks, score_timeline,
+            normal_time_score, len(normal),
+        )
+        before_75_label = resolve_goal_within_horizon(
+            signal_minute, signal_score, max(0, 75 - signal_minute), clocks,
+            score_timeline, normal_time_score, len(normal),
+        )
+        outcome = {
+            "_training_jsonl": True,
+            "signal_id": signal_id,
+            "fixture_id": _safe_int(record.get("fixture_id"), match_id),
+            "timestamp_utc": str(record.get("timestamp_utc") or ""),
+            "home_team": str(record.get("home_team") or ""),
+            "away_team": str(record.get("away_team") or ""),
+            "league_name": str(record.get("league_name") or ""),
+            "signal_minute": signal_minute,
+            "signal_score_home": signal_score_home,
+            "signal_score_away": signal_score_away,
+            "prob_next_15_at_signal": round(_safe_float(record.get("prob_next_15_at_signal"), 0.0), 2),
+            "prob_second_half_remain_at_signal": round(_safe_float(record.get("prob_second_half_remain_at_signal"), 0.0), 2),
+            "prob_to90_at_signal": round(_safe_float(record.get("prob_to90_at_signal"), 0.0), 2),
+            "lambda_2h_at_signal": round(_safe_float(record.get("lambda_2h_at_signal"), 0.0), 4),
+            "outcome_schema_version": 3,
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "goal_after_signal": 1 if has_normal_time_goal else 0,
+            "legacy_alias_for": "goal_after_signal_normal_time",
+            "goal_after_signal_normal_time": has_normal_time_goal,
+            "goal_after_signal_extra_time": bool(extra),
+            "goal_after_signal_all_periods_excluding_shootout": bool(has_normal_time_goal or extra),
+            "goal_in_next_15": (
+                None if next_15_label["value"] is None
+                else int(bool(next_15_label["value"]))
+            ),
+            "goal_in_next_15_normal_time": next_15_label["value"],
+            "goal_in_next_15_source": next_15_label["source"],
+            "goal_in_next_15_quality": next_15_label["quality"],
+            "goal_in_next_15_interval_start_minute": next_15_label["goal_interval_start_minute"],
+            "goal_in_next_15_interval_end_minute": next_15_label["goal_interval_end_minute"],
+            "goal_in_next_25_normal_time": next_25_label["value"],
+            "goal_in_next_25_source": next_25_label["source"],
+            "goal_in_next_25_quality": next_25_label["quality"],
+            "goal_before_75_normal_time": before_75_label["value"],
+            "goal_before_75_source": before_75_label["source"],
+            "goal_to90_normal_time": has_normal_time_goal,
+            "goal_by_90": 1 if has_normal_time_goal else 0,
+            "goal_result_source": goal_result_source,
+            "normal_time_goal_count_after_signal": normal_goal_count,
+            "extra_time_goal_count_after_signal": len(extra),
+            "shootout_event_count_excluded": len(shootout),
+            "first_goal_after_signal_minute": first_normal.clock_minute if first_normal else None,
+            "first_normal_time_goal_after_signal": first_normal.to_dict() if first_normal else None,
+            "first_extra_time_goal_after_signal": first_extra.to_dict() if first_extra else None,
+            "normal_time_final_score_home": int(normal_time_score[0]),
+            "normal_time_final_score_away": int(normal_time_score[1]),
+            "normal_time_resolved_at_utc": resolved_at_utc,
+            "match_fully_resolved_at_utc": None,
+            "normal_time_result": integrity.normal_time_result,
+            "outcome_integrity_status": integrity.status,
+            "outcome_integrity_conflict": integrity.conflict,
+            "outcome_integrity_conflict_details": integrity.conflict_details,
+            "model_version": str(record.get("model_version") or "v2"),
+            "signal_model": str(record.get("signal_model") or "45_plus"),
+            "outcome_saved_utc": resolved_at_utc,
+        }
+        if save_outcome(outcome):
+            _mark_training_signal_outcome_saved(signal_id)
+            written += 1
+    return written
 
 def label_match_rows(match_id: int, goals_minutes: List[int]):
     """
@@ -1915,6 +4013,11 @@ def label_match_rows(match_id: int, goals_minutes: List[int]):
 # -------------------------
 # Goal validation helper (used by labeler and monitoring)
 # -------------------------
+def _extract_event_time(ev: Dict[str, Any], fixture_context: Optional[Dict[str, Any]] = None) -> EventTime:
+    """Return one lossless event-time representation for raw and normalized events."""
+    return event_time_from_event(ev, fixture_context)
+
+
 def _extract_event_minute(ev: Dict[str, Any]) -> Optional[int]:
     """
     Extract event minute from API-Sports event data.
@@ -1933,46 +4036,16 @@ def _extract_event_minute(ev: Dict[str, Any]) -> Optional[int]:
     Returns:
         Event minute as integer, or None if cannot be determined
     """
-    try:
-        time_data = ev.get("time", {})
-        
-        # Try multiple fields for elapsed time
-        elapsed = time_data.get("elapsed")
-        if elapsed is None:
-            elapsed = time_data.get("value")
-        if elapsed is None:
-            elapsed = ev.get("minute")  # Fallback for normalized events
-        
-        if elapsed is None:
-            return None
-        
-        try:
-            elapsed = int(elapsed)
-        except (ValueError, TypeError):
-            return None
-        
-        # Check for extra time
-        extra = time_data.get("extra")
-        if extra is not None:
-            try:
-                extra = int(extra)
-                return elapsed + extra
-            except (ValueError, TypeError):
-                pass
-        
-        return elapsed
-        
-    except Exception:
-        return None
+    return _extract_event_time(ev).clock_minute
 
 def _is_valid_counted_goal(ev: Dict[str, Any]) -> bool:
     """
     Check if event is a valid counted goal (not cancelled by VAR/offside).
-    
+
     A goal is counted ONLY if:
     - event.type is "Goal" or contains "goal" (case-insensitive)
     - event detail does NOT contain cancellation keywords
-    
+
     Args:
         ev: Event dictionary with normalized fields
         
@@ -2055,11 +4128,17 @@ def fetch_counted_goal_minutes(match_id: int, client: APISportsMetricsClient) ->
         # Normalize if needed (events might already be normalized)
         if events and not isinstance(events[0].get("type"), str):
             events = client._normalize_events(events)
+        try:
+            fixture_context = _fixture_event_context(client.fetch_fixture(match_id) or {})
+        except Exception:
+            fixture_context = {}
         
         goal_minutes = []
         for ev in events:
             # Use existing validation function
-            if _is_valid_counted_goal(ev):
+            if _is_valid_counted_goal(ev) and (
+                NORMAL_TIME_BOUNDARY_MODE == "legacy" or is_normal_time_goal(ev, fixture_context)
+            ):
                 # Use new extraction function that handles extra time
                 minute = _extract_event_minute(ev)
                 if minute is not None:
@@ -2783,58 +4862,136 @@ def start_daily_cleanup_daemon(client: APISportsMetricsClient):
 # -------------------------
 # Match metrics calculation (PressureIndex & Momentum)
 # -------------------------
-def calculate_pressure_index(fixture: Dict[str, Any]) -> float:
+def calculate_pressure_index_details(fixture: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calculate PressureIndex based on match statistics.
-    
-    Formula:
-    PressureIndex = (xG_home + xG_away) * 2
-                  + (shots_on_target_home + shots_on_target_away) * 1.5
-                  + (corners_home + corners_away) * 0.5
-                  + ((possession_home + possession_away) / 10)
-    
-    Args:
-        fixture: Match fixture data with statistics
-        
-    Returns:
-        Rounded PressureIndex value (2 decimal places)
+    Calculate smooth PressureIndex v3 on a stable 0..25 scale.
+
+    The index intentionally excludes positive xG and shots-on-target terms:
+    both already have dedicated weights in the 45+ probability model.  It
+    measures complementary territorial pressure instead:
+
+    - non-target attempt pace: 0..12
+    - corner pace: 0..5
+    - territorial dominance: 0..5
+    - offside pace: 0..3
+
+    Cumulative counters are divided by elapsed match time so the same totals at
+    minute 25 and minute 60 no longer represent the same pressure.
     """
     try:
-        # Extract xG values
-        xg_home = get_any_metric(fixture, ["expected_goals"], "home") or 0.0
-        xg_away = get_any_metric(fixture, ["expected_goals"], "away") or 0.0
-        
-        # If xG is 0, estimate it
-        if xg_home == 0:
-            xg_home = estimate_xg_from_metrics_combined(fixture, "home")
-        if xg_away == 0:
-            xg_away = estimate_xg_from_metrics_combined(fixture, "away")
-        
-        # Extract shots on target
-        shots_on_h = int(get_any_metric(fixture, ["shots_on_target"], "home") or 0)
-        shots_on_a = int(get_any_metric(fixture, ["shots_on_target"], "away") or 0)
-        
-        # Extract corners
-        corners_h = int(get_any_metric(fixture, ["corner_kicks", "corners"], "home") or 0)
-        corners_a = int(get_any_metric(fixture, ["corner_kicks", "corners"], "away") or 0)
-        
-        # Extract possession
-        possession_h = float(get_any_metric(fixture, ["ball_possession", "passes_%"], "home") or 0)
-        possession_a = float(get_any_metric(fixture, ["ball_possession", "passes_%"], "away") or 0)
-        
-        # Calculate PressureIndex
-        pressure_index = (
-            (xg_home + xg_away) * 2.0 +
-            (shots_on_h + shots_on_a) * 1.5 +
-            (corners_h + corners_a) * 0.5 +
-            ((possession_h + possession_a) / 10.0)
+        elapsed = _safe_float(get_metric_from_fixture(fixture, "elapsed", 0), 0.0)
+        if elapsed <= 0.0:
+            elapsed = 45.0
+        elapsed = clamp(elapsed, 1.0, 120.0)
+
+        total_shots_home = max(0.0, _safe_float(get_any_metric(fixture, ["total_shots"], "home"), 0.0))
+        total_shots_away = max(0.0, _safe_float(get_any_metric(fixture, ["total_shots"], "away"), 0.0))
+        shots_on_target_home = max(0.0, _safe_float(get_any_metric(fixture, ["shots_on_target"], "home"), 0.0))
+        shots_on_target_away = max(0.0, _safe_float(get_any_metric(fixture, ["shots_on_target"], "away"), 0.0))
+        shots_off_target_home = max(0.0, _safe_float(get_any_metric(fixture, ["shots_off_target"], "home"), 0.0))
+        shots_off_target_away = max(0.0, _safe_float(get_any_metric(fixture, ["shots_off_target"], "away"), 0.0))
+        blocked_shots_home = max(0.0, _safe_float(get_any_metric(fixture, ["blocked_shots"], "home"), 0.0))
+        blocked_shots_away = max(0.0, _safe_float(get_any_metric(fixture, ["blocked_shots"], "away"), 0.0))
+
+        # Prefer the internally consistent total-SOT count, while explicit
+        # off-target/blocked counters recover pressure when total shots is absent.
+        non_target_attempts_home = max(
+            0.0,
+            total_shots_home - shots_on_target_home,
+            shots_off_target_home + blocked_shots_home,
         )
-        
-        return round(pressure_index, 2)
-        
+        non_target_attempts_away = max(
+            0.0,
+            total_shots_away - shots_on_target_away,
+            shots_off_target_away + blocked_shots_away,
+        )
+        non_target_attempts_total = non_target_attempts_home + non_target_attempts_away
+        non_target_rate = non_target_attempts_total / elapsed
+        attempt_pace_norm = smooth_saturation(non_target_rate, 0.11, 2.0)
+        attempt_component = 12.0 * attempt_pace_norm
+
+        corners_home = max(0.0, _safe_float(get_any_metric(fixture, ["corner_kicks", "corners"], "home"), 0.0))
+        corners_away = max(0.0, _safe_float(get_any_metric(fixture, ["corner_kicks", "corners"], "away"), 0.0))
+        corners_total = corners_home + corners_away
+        corner_rate = corners_total / elapsed
+        corner_pace_norm = smooth_saturation(corner_rate, 0.07, 2.0)
+        corner_component = 5.0 * corner_pace_norm
+
+        possession_home = clamp(
+            _safe_float(get_any_metric(fixture, ["ball_possession", "passes_%"], "home"), 0.0),
+            0.0,
+            100.0,
+        )
+        possession_away = clamp(
+            _safe_float(get_any_metric(fixture, ["ball_possession", "passes_%"], "away"), 0.0),
+            0.0,
+            100.0,
+        )
+        possession_total = possession_home + possession_away
+        possession_available = 80.0 <= possession_total <= 120.0
+        possession_dominance_norm = (
+            clamp(abs(possession_home - possession_away) / 50.0, 0.0, 1.0)
+            if possession_available
+            else 0.0
+        )
+        attempt_imbalance_norm = (
+            abs(non_target_attempts_home - non_target_attempts_away) / non_target_attempts_total
+            if non_target_attempts_total > 0.0
+            else 0.0
+        )
+        territorial_dominance_norm = clamp(
+            0.60 * possession_dominance_norm + 0.40 * attempt_imbalance_norm,
+            0.0,
+            1.0,
+        )
+        dominance_component = 5.0 * territorial_dominance_norm
+
+        offsides_home = max(0.0, _safe_float(get_any_metric(fixture, ["offsides", "offside"], "home"), 0.0))
+        offsides_away = max(0.0, _safe_float(get_any_metric(fixture, ["offsides", "offside"], "away"), 0.0))
+        offsides_total = offsides_home + offsides_away
+        offside_rate = offsides_total / elapsed
+        offside_pace_norm = smooth_saturation(offside_rate, 0.035, 2.0)
+        offside_component = 3.0 * offside_pace_norm
+
+        pressure_index = clamp(
+            attempt_component + corner_component + dominance_component + offside_component,
+            0.0,
+            25.0,
+        )
+        return {
+            "pressure_index": round(pressure_index, 2),
+            "pressure_index_version": "v3_smooth",
+            "elapsed": round(elapsed, 1),
+            "attempt_component": round(attempt_component, 3),
+            "corner_component": round(corner_component, 3),
+            "dominance_component": round(dominance_component, 3),
+            "offside_component": round(offside_component, 3),
+            "attempt_pace_norm": round(attempt_pace_norm, 4),
+            "corner_pace_norm": round(corner_pace_norm, 4),
+            "territorial_dominance_norm": round(territorial_dominance_norm, 4),
+            "offside_pace_norm": round(offside_pace_norm, 4),
+            "non_target_attempts_total": round(non_target_attempts_total, 2),
+            "corners_total": round(corners_total, 2),
+            "offsides_total": round(offsides_total, 2),
+            "possession_dominance_norm": round(possession_dominance_norm, 4),
+            "attempt_imbalance_norm": round(attempt_imbalance_norm, 4),
+        }
     except Exception as e:
         logger.exception(f"[METRICS] Failed to calculate PressureIndex: {e}")
-        return 0.0
+        return {
+            "pressure_index": 0.0,
+            "pressure_index_version": "v3_smooth_error",
+            "elapsed": 0.0,
+            "attempt_component": 0.0,
+            "corner_component": 0.0,
+            "dominance_component": 0.0,
+            "offside_component": 0.0,
+        }
+
+
+def calculate_pressure_index(fixture: Dict[str, Any]) -> float:
+    """Return the smooth PressureIndex v3 scalar for legacy callers."""
+    return float(calculate_pressure_index_details(fixture).get("pressure_index", 0.0) or 0.0)
 
 def calculate_momentum(previous_pressure: float, current_pressure: float) -> float:
     """
@@ -2858,25 +5015,61 @@ def calculate_momentum(previous_pressure: float, current_pressure: float) -> flo
         return 0.0
 
 # -------------------------
-# Simple TTL cache (in-memory)
+# Bounded TTL cache (in-memory)
 # -------------------------
-_cache: Dict[str, Tuple[float, Any]] = {}
+_cache: Dict[str, Tuple[float, float, Any]] = {}
 _cache_lock = threading.RLock()
+
+
+def cache_prune(
+    *,
+    now_ts: Optional[float] = None,
+    max_entries: Optional[int] = None,
+) -> int:
+    """Remove all expired entries and cap the cache, even for unread keys."""
+    current = float(time.time() if now_ts is None else now_ts)
+    limit = max(1, int(CACHE_MAX_ENTRIES if max_entries is None else max_entries))
+    removed = 0
+    with _cache_lock:
+        expired = [
+            key
+            for key, entry in _cache.items()
+            if len(entry) >= 2 and float(entry[1]) <= current
+        ]
+        for key in expired:
+            if _cache.pop(key, None) is not None:
+                removed += 1
+        overflow = len(_cache) - limit
+        if overflow > 0:
+            oldest = sorted(
+                _cache.items(),
+                key=lambda item: float(item[1][0]),
+            )[:overflow]
+            for key, _entry in oldest:
+                if _cache.pop(key, None) is not None:
+                    removed += 1
+    return removed
+
 
 def cache_get(key: str, ttl: int) -> Optional[Any]:
     with _cache_lock:
         ent = _cache.get(key)
         if not ent:
             return None
-        t, val = ent
-        if time.time() - t > ttl:
+        inserted_at, expires_at, val = ent
+        current = time.time()
+        if expires_at <= current or current - inserted_at > max(0, int(ttl)):
             _cache.pop(key, None)
             return None
         return val
 
-def cache_set(key: str, val: Any) -> None:
+
+def cache_set(key: str, val: Any, ttl: Optional[int] = None) -> None:
+    effective_ttl = max(1, int(CACHE_TTL if ttl is None else ttl))
+    current = time.time()
     with _cache_lock:
-        _cache[key] = (time.time(), val)
+        _cache[key] = (current, current + effective_ttl, val)
+        cache_prune(now_ts=current)
 
 # -------------------------
 # HTTP helpers with retry/backoff
@@ -2924,8 +5117,9 @@ class APISportsMetricsClient:
     def _get(self, path: str, params: Optional[Dict]=None,
              cache: bool=False, cache_key: Optional[str]=None, ttl: Optional[int]=None) -> Dict[str,Any]:
         key = cache_key or f"{path}:{json.dumps(params or {}, sort_keys=True)}"
+        effective_ttl = int(ttl if ttl is not None else self.cache_ttl)
         if cache:
-            val = cache_get(key, ttl or self.cache_ttl)
+            val = cache_get(key, effective_ttl)
             if val is not None:
                 return val
         url = f"{self.base}/{path}"
@@ -2938,7 +5132,7 @@ class APISportsMetricsClient:
             logger.debug(f"[API] Non-JSON response from {url}")
             data = {}
         if cache:
-            cache_set(key, data)
+            cache_set(key, data, effective_ttl)
         return data
 
     def fetch_fixture(self, fixture_id: int) -> Dict[str,Any]:
@@ -2950,12 +5144,25 @@ class APISportsMetricsClient:
         return data.get("response") or []
 
     def fetch_fixture_events(self, fixture_id: int) -> List[Dict[str,Any]]:
-        data = self._get("fixtures/events", params={"fixture": fixture_id}, cache=False)
-        if data.get("response"):
-            return data.get("response")
+        data = self.fetch_fixture_events_response(fixture_id)
+        if data is not None:
+            return data
         f = self.fetch_fixture(fixture_id)
         events = f.get("events") or f.get("fixture",{}).get("events") or []
         return events
+
+    def fetch_fixture_events_response(self, fixture_id: int) -> Optional[List[Dict[str,Any]]]:
+        data = self._get("fixtures/events", params={"fixture": fixture_id}, cache=False)
+        # API-Football error payloads can still contain ``response: []``.
+        # Treating that as authoritative zero-event evidence would let a
+        # correction sweep erase valid timing labels after a rate-limit or
+        # provider error.
+        if data.get("errors"):
+            return None
+        if "response" in data:
+            response = data.get("response")
+            return response if isinstance(response, list) else None
+        return None
 
     def fetch_players(self, fixture_id: int) -> List[Dict[str,Any]]:
         data = self._get("players", params={"fixture": fixture_id}, cache=False)
@@ -2968,6 +5175,16 @@ class APISportsMetricsClient:
     def fetch_odds(self, fixture_id: int) -> List[Dict[str,Any]]:
         data = self._get("odds", params={"fixture": fixture_id}, cache=True, cache_key=f"odds:{fixture_id}", ttl=self.cache_ttl)
         return data.get("response") or []
+
+    def fetch_live_odds_payload(
+        self, *, bet_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Fetch the live market feed without the pre-match odds cache."""
+        return self._get(
+            "odds/live",
+            params=(None if bet_id is None else {"bet": int(bet_id)}),
+            cache=False,
+        )
 
     def fetch_lineups(self, fixture_id: int) -> List[Dict[str,Any]]:
         data = self._get("fixtures/lineups", params={"fixture": fixture_id}, cache=True, cache_key=f"lineups:{fixture_id}", ttl=self.cache_ttl)
@@ -3055,15 +5272,20 @@ class APISportsMetricsClient:
 
     def _map_stat_name(self, key: str) -> str:
         k = (key or "").lower()
-        if "shots on target" in k or "shots_on_target" in k or "shots_on_goal" in k:
+        if (
+            "shots on goal" in k
+            or "shots on target" in k
+            or "shots_on_goal" in k
+            or "shots_on_target" in k
+        ):
             return "shots_on_target"
         if "shots" in k and "total" in k:
             return "total_shots"
-        if "inside" in k and ("box" in k or "penalty" in k or "pen area" in k or "penalty area" in k or "inside the box" in k):
-            return "shots_inside_box"
         if "shots inside" in k or "insidebox" in k or "inside_box" in k:
             return "shots_inside_box"
-        if "off target" in k or "shots_off_target" in k:
+        if "inside" in k and ("box" in k or "penalty" in k or "pen area" in k or "penalty area" in k or "inside the box" in k):
+            return "shots_inside_box"
+        if "off target" in k or "shots off goal" in k or "shots_off_goal" in k or "shots_off_target" in k:
             return "shots_off_target"
         if "big chances" in k or "big_chances" in k:
             return "big_chances"
@@ -3073,31 +5295,161 @@ class APISportsMetricsClient:
             return "ball_possession"
         if "corner" in k or "corners" in k:
             return "corner_kicks"
-        if "expected" in k and "goal" in k:
+        if ("expected" in k and "goal" in k) or k in ("xg", "x_g"):
             return "expected_goals"
         if "save" in k or "saves" in k or "saves_total" in k:
             return "saves"
-        if "attack" in k or k == "attacks":
-            return "attacks"
         if "dangerous" in k:
             return "dangerous_attacks"
+        if "attack" in k or k == "attacks":
+            return "attacks"
         if "ppda" in k:
             return "ppda"
         return key.replace(" ", "_").replace(".", "").replace("/", "_")
 
-    def _normalize_statistics(self, raw_stats: List[Dict[str,Any]], raw_fixture: Dict[str,Any]) -> Dict[str,Any]:
+    def _stat_id_text(self, value: Any) -> str:
+        if isinstance(value, dict):
+            value = value.get("value") or value.get("id")
+        try:
+            if value is None or value == "":
+                return ""
+            return str(int(float(value)))
+        except Exception:
+            return str(value or "").strip()
+
+    def _extract_stats_team_ids(
+        self,
+        raw_fixture: Dict[str, Any],
+        fixture_metrics: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str]:
+        fixture_metrics = fixture_metrics if isinstance(fixture_metrics, dict) else {}
+        teams = raw_fixture.get("teams") if isinstance(raw_fixture, dict) else {}
+        teams = teams if isinstance(teams, dict) else {}
+        home = teams.get("home") if isinstance(teams.get("home"), dict) else {}
+        away = teams.get("away") if isinstance(teams.get("away"), dict) else {}
+
+        home_id = (
+            self._stat_id_text(home.get("id"))
+            or self._stat_id_text(fixture_metrics.get("team_home_id"))
+            or self._stat_id_text(fixture_metrics.get("home_team_id"))
+        )
+        away_id = (
+            self._stat_id_text(away.get("id"))
+            or self._stat_id_text(fixture_metrics.get("team_away_id"))
+            or self._stat_id_text(fixture_metrics.get("away_team_id"))
+        )
+        return home_id, away_id
+
+    def _resolve_stats_side(
+        self,
+        raw_team_id: Any,
+        raw_index: int,
+        home_id: str,
+        away_id: str,
+    ) -> Tuple[str, str]:
+        raw_id = self._stat_id_text(raw_team_id)
+        if raw_id and home_id and raw_id == home_id:
+            return "home", "fixture_team_id"
+        if raw_id and away_id and raw_id == away_id:
+            return "away", "fixture_team_id"
+        if not home_id and not away_id:
+            if raw_index == 0:
+                return "home", "raw_order"
+            if raw_index == 1:
+                return "away", "raw_order"
+        return "unknown", "unknown"
+
+    def _log_raw_stats_types(
+        self,
+        fixture_id: Any,
+        raw_stats: List[Dict[str, Any]],
+        home_id: str,
+        away_id: str,
+    ) -> None:
+        try:
+            teams = []
+            for idx, entry in enumerate((raw_stats or [])[:2], start=1):
+                team = entry.get("team") or {}
+                stats_block = entry.get("statistics") or []
+                types = []
+                for stat in stats_block or []:
+                    stat_type = str(stat.get("type") or stat.get("name") or stat.get("label") or "").strip()
+                    if stat_type:
+                        types.append(stat_type)
+                teams.append(
+                    'team_%s_id=%s team_%s_name="%s" team_%s_types="%s"'
+                    % (
+                        idx,
+                        self._stat_id_text(team.get("id")) or "unknown",
+                        idx,
+                        str(team.get("name") or "unknown").strip() or "unknown",
+                        idx,
+                        "|".join(types[:30]),
+                    )
+                )
+            logger.info(
+                "[RAW_STATS_TYPES] fixture_id=%s raw_stats_team_count=%s home_team_id=%s away_team_id=%s %s",
+                fixture_id,
+                len(raw_stats or []),
+                home_id or "unknown",
+                away_id or "unknown",
+                " ".join(teams),
+            )
+        except Exception:
+            logger.exception("[RAW_STATS_TYPES_ERR] fixture_id=%s", fixture_id)
+
+    def _write_normalized_stat(self, out: Dict[str, Any], canon: str, side: str, value: Any) -> None:
+        if side not in ("home", "away"):
+            return
+        # API-Sports can include the expected_goals statistic with a null value.
+        # Keep that distinct from a real numeric 0.00 so the probability model
+        # can use its estimated-xG fallback instead of trusting missing data.
+        if canon == "expected_goals" and (
+            value is None
+            or (isinstance(value, str) and value.strip().lower() in {"", "n/a", "null", "none", "-"})
+        ):
+            return
+        wrapped = self._wrap(value, "api_sports")
+        out[f"{canon}_{side}"] = wrapped
+        if canon == "shots_on_target":
+            out.setdefault(f"Shots_on_Goal_{side}", wrapped)
+            out.setdefault(f"shots_on_goal_{side}", wrapped)
+        elif canon == "shots_inside_box":
+            out.setdefault(f"shots_insidebox_{side}", wrapped)
+            out.setdefault(f"inside_box_{side}", wrapped)
+        elif canon == "expected_goals":
+            out.setdefault(f"xg_{side}", wrapped)
+        elif canon == "dangerous_attacks":
+            out.setdefault(f"attacks_{side}", wrapped)
+            out.setdefault(f"Dangerous_attacks_{side}", wrapped)
+
+    def _normalize_statistics(
+        self,
+        raw_stats: List[Dict[str,Any]],
+        raw_fixture: Dict[str,Any],
+        fixture_metrics: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str,Any]:
         out={}
         try:
-            home_id = raw_fixture.get("teams",{}).get("home",{}).get("id")
-            away_id = raw_fixture.get("teams",{}).get("away",{}).get("id")
-            for entry in raw_stats:
+            fixture_id = get_fixture_id(fixture_metrics or {}) or get_fixture_id(raw_fixture)
+            home_id, away_id = self._extract_stats_team_ids(raw_fixture, fixture_metrics)
+            self._log_raw_stats_types(fixture_id, raw_stats, home_id, away_id)
+            for idx, entry in enumerate(raw_stats or []):
                 team = entry.get("team") or {}
                 t_id = team.get("id")
-                side = "home" if t_id == home_id else "away"
+                side, side_source = self._resolve_stats_side(t_id, idx, home_id, away_id)
+                logger.info(
+                    "[STATS_SIDE_MAP] fixture_id=%s raw_team_id=%s raw_team_name=\"%s\" mapped_side=%s side_source=%s",
+                    fixture_id,
+                    self._stat_id_text(t_id) or "unknown",
+                    str(team.get("name") or "unknown").strip() or "unknown",
+                    side,
+                    side_source,
+                )
                 stats_block = entry.get("statistics") or entry.get("statistics", []) or []
                 for s in stats_block or []:
                     key_raw = (s.get("type") or s.get("name") or s.get("label") or "").strip()
-                    if not key_raw:
+                    if not key_raw or side not in ("home", "away"):
                         continue
                     canon = self._map_stat_name(key_raw)
                     val = s.get("value")
@@ -3110,26 +5462,23 @@ class APISportsMetricsClient:
                             vnum = val.get(side) if side in val else next(iter(val.values()), None)
                     else:
                         vnum = val
-                    out_key = f"{canon}_{side}"
-                    out[out_key] = self._wrap(vnum, "api_sports")
-                    if canon == "expected_goals":
-                        out[f"expected_goals_{side}"] = self._wrap(vnum, "api_sports")
+                    self._write_normalized_stat(out, canon, side, vnum)
             try:
                 ff_stats = raw_fixture.get("statistics") or []
                 if isinstance(ff_stats, list):
-                    for entry in ff_stats:
+                    for idx, entry in enumerate(ff_stats):
                         team = entry.get("team") or {}
                         t_id = team.get("id")
-                        side = "home" if t_id == home_id else "away"
+                        side, _side_source = self._resolve_stats_side(t_id, idx, home_id, away_id)
                         for s in entry.get("statistics", []) or []:
                             key_raw = (s.get("type") or s.get("name") or "").strip()
-                            if not key_raw:
+                            if not key_raw or side not in ("home", "away"):
                                 continue
                             canon = self._map_stat_name(key_raw)
                             val = s.get("value")
                             out_key = f"{canon}_{side}"
                             if out_key not in out:
-                                out[out_key] = self._wrap(val, "api_sports")
+                                self._write_normalized_stat(out, canon, side, val)
                 teams_block = raw_fixture.get("teams") or {}
                 for side_name in ("home","away"):
                     tblock = teams_block.get(side_name) or {}
@@ -3142,7 +5491,7 @@ class APISportsMetricsClient:
                         val = s.get("value")
                         out_key = f"{canon}_{side_name}"
                         if out_key not in out:
-                            out[out_key] = self._wrap(val, "api_sports")
+                            self._write_normalized_stat(out, canon, side_name, val)
             except Exception:
                 logger.debug("secondary statistics scan failed")
         except Exception:
@@ -3158,12 +5507,28 @@ class APISportsMetricsClient:
             f["timestamp"] = self._wrap(fixture.get("timestamp") or raw.get("fixture",{}).get("timestamp"))
             status = fixture.get("status") or {}
             f["status"] = {"value": status, "source":"api_sports"}
+            f["status_short"] = self._wrap(status.get("short") if isinstance(status, dict) else str(status or ""))
             minute = status.get("elapsed") if isinstance(status, dict) else raw.get("elapsed") or 0
             f["elapsed"] = self._wrap(minute)
             f["elapsed_label"] = {"value": status.get("short") or status.get("long") or "", "source":"api_sports"}
             # Extract extra/added time if available
             extra_time = status.get("extra") if isinstance(status, dict) else 0
             f["extra_time"] = self._wrap(extra_time or 0)
+            period = classify_match_period(
+                fixture_status_short=status.get("short") if isinstance(status, dict) else str(status or ""),
+                elapsed=minute,
+                extra=extra_time,
+            )
+            f["match_period"] = self._wrap(period.value, "derived_period")
+            f["display_minute"] = self._wrap(
+                f"{int(minute)}+{int(extra_time)}" if minute is not None and extra_time else str(minute or 0),
+                "derived_period",
+            )
+            f["clock_minute"] = self._wrap(
+                (int(minute) + int(extra_time or 0)) if minute is not None else None,
+                "derived_period",
+            )
+            f["score"] = normalize_score_blocks(raw)
             venue = fixture.get("venue") or raw.get("venue") or {}
             venue_value = {"name": venue.get("name"), "city": venue.get("city")}
             if venue.get("country"):
@@ -3200,7 +5565,7 @@ class APISportsMetricsClient:
             logger.exception("normalize_fixture_basic error")
         return f
 
-    def _normalize_events(self, raw_events: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+    def _normalize_events(self, raw_events: List[Dict[str,Any]], fixture_context: Optional[Dict[str, Any]] = None) -> List[Dict[str,Any]]:
         out=[]
         try:
             if not raw_events:
@@ -3210,10 +5575,14 @@ class APISportsMetricsClient:
                 e["event_id"] = ev.get("id") or ev.get("event_id")
                 time_obj = ev.get("time") or {}
                 if isinstance(time_obj, dict):
-                    e["minute"] = self._to_num(time_obj.get("elapsed"))
-                    e["second"] = self._to_num(time_obj.get("extra"))
+                    e["elapsed"] = self._to_num(time_obj.get("elapsed"))
+                    e["extra"] = self._to_num(time_obj.get("extra"))
+                    e["minute"] = e["elapsed"]
+                    e["second"] = e["extra"]
                 else:
-                    e["minute"] = self._to_num(ev.get("minute") or ev.get("time"))
+                    e["elapsed"] = self._to_num(ev.get("elapsed") or ev.get("minute") or ev.get("time"))
+                    e["extra"] = self._to_num(ev.get("extra"))
+                    e["minute"] = e["elapsed"]
                     e["second"] = None
                 typ = (ev.get("type") or ev.get("detail") or ev.get("event") or "").lower()
                 e["type"] = self._map_event_type(typ, ev)
@@ -3233,6 +5602,10 @@ class APISportsMetricsClient:
                 e["note"] = ev.get("detail") or ev.get("comments") or ev.get("note") or ev.get("description") or ""
                 e["raw"] = ev
                 e["source"] = "api_sports"
+                event_time = event_time_from_event(e, fixture_context)
+                e["clock_minute"] = event_time.clock_minute
+                e["display_minute"] = event_time.display_minute
+                e["period"] = event_time.period.value
                 out.append(e)
         except Exception:
             logger.exception("_normalize_events")
@@ -3412,9 +5785,39 @@ class APISportsMetricsClient:
             logger.exception("_postprocess_fixture")
         return f
 
-    def collect_match_all(self, fixture_id: int) -> Dict[str,Any]:
+    def collect_match_all(
+        self,
+        fixture_id: int,
+        live_fixture: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str,Any]:
         out = {"fixture":{}, "events":[], "shotmap":[], "players":{}, "prematch":{}}
-        raw_fixture = self.fetch_fixture(fixture_id) or {}
+        fetched_fixture = self.fetch_fixture(fixture_id) or {}
+        raw_fixture = _merge_fixture_payload_with_live_fallback(
+            fetched_fixture,
+            live_fixture or {},
+        )
+        fetched_teams = fetched_fixture.get("teams") if isinstance(fetched_fixture, dict) else {}
+        fetched_league = fetched_fixture.get("league") if isinstance(fetched_fixture, dict) else {}
+        context_was_incomplete = (
+            get_fixture_id(fetched_fixture) is None
+            or not isinstance(fetched_teams, dict)
+            or not fetched_teams.get("home")
+            or not fetched_teams.get("away")
+            or not isinstance(fetched_league, dict)
+            or fetched_league.get("id") is None
+        )
+        if live_fixture and context_was_incomplete:
+            recovered_teams = raw_fixture.get("teams") if isinstance(raw_fixture, dict) else {}
+            recovered_league = raw_fixture.get("league") if isinstance(raw_fixture, dict) else {}
+            logger.info(
+                "[FIXTURE_CONTEXT_RECOVERY] fixture_id=%s fetched_fixture_id=%s "
+                "recovered_home_team_id=%s recovered_away_team_id=%s recovered_league_id=%s",
+                fixture_id,
+                get_fixture_id(fetched_fixture),
+                ((recovered_teams or {}).get("home") or {}).get("id"),
+                ((recovered_teams or {}).get("away") or {}).get("id"),
+                (recovered_league or {}).get("id"),
+            )
         raw_stats = self.fetch_fixture_statistics(fixture_id) or []
         raw_events = self.fetch_fixture_events(fixture_id) or []
         raw_players = self.fetch_players(fixture_id) or []
@@ -3426,9 +5829,17 @@ class APISportsMetricsClient:
             out["statistics_raw"] = raw_stats
 
         out["fixture"].update(self._normalize_fixture_basic(raw_fixture))
+        if not get_fixture_id(out["fixture"]):
+            # Even without a usable fixture payload, never let downstream
+            # logging, deduplication or reputation calculations see id=0.
+            out["fixture"]["fixture_id"] = self._wrap(int(fixture_id), "request_context")
         out["fixture"].update(self._normalize_statistics(raw_stats, raw_fixture))
         out["prematch"].update(self._normalize_prematch(raw_odds, raw_fixture))
-        out["events"] = self._normalize_events(raw_events)
+        fixture_context = {
+            "status_short": _normalize_status_short(out["fixture"]),
+            "status": _normalize_status_short(out["fixture"]),
+        }
+        out["events"] = self._normalize_events(raw_events, fixture_context)
         out["shotmap"] = self._normalize_shotmap(raw_shots)
         out["players"] = self._normalize_players(raw_players)
         out["fixture"].update(self._normalize_lineups(raw_lineups))
@@ -3463,12 +5874,27 @@ def load_json(path: str, default: Any) -> Any:
         return default
 
 
+def _write_json_atomic(path: str, data: Any) -> None:
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    descriptor, tmp = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
 def save_json(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    _write_json_atomic(path, data)
 
 
 def save_json_atomic(path: str, data: Any) -> None:
@@ -3516,6 +5942,136 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+_second_half_aggregate_lock = threading.Lock()
+
+
+def _aggregate_second_half_history(*, source: str) -> bool:
+    if not AUTO_AGGREGATE_2H_STATS:
+        return False
+    try:
+        with _second_half_aggregate_lock:
+            aggregate_result = aggregate_history_to_files(
+                history_path=SECOND_HALF_HISTORY_PATH,
+                team_stats_path=TEAM_2H_STATS_PATH,
+                league_stats_path=LEAGUE_2H_STATS_PATH,
+            )
+        logger.info(
+            "[2H_AGGREGATE] source=%s history_records=%s team_count=%s league_count=%s",
+            source,
+            aggregate_result.get("history_records"),
+            aggregate_result.get("team_count"),
+            aggregate_result.get("league_count"),
+        )
+        return True
+    except Exception:
+        logger.exception("[2H_AGGREGATE_ERR] source=%s", source)
+        return False
+
+
+def store_second_half_history_payload(
+    fixture_payload: Any,
+    events_payload: Optional[Any],
+    *,
+    source: str,
+    aggregate: bool = True,
+    observed_finished_at_utc: Optional[str] = None,
+    raise_incomplete: bool = False,
+) -> bool:
+    if not ENABLE_2H_COLLECTION:
+        return False
+
+    try:
+        stored, record = collect_and_store_second_half_history(
+            fixture_payload,
+            events_payload,
+            path=SECOND_HALF_HISTORY_PATH,
+            observed_finished_at_utc=observed_finished_at_utc,
+        )
+        if stored:
+            logger.info(
+                "[2H_HISTORY_COLLECT] fixture_id=%s source=%s events_quality=%s stored=true",
+                record.get("fixture_id"),
+                source,
+                record.get("events_quality"),
+            )
+            if aggregate:
+                _aggregate_second_half_history(source=source)
+        if DEBUG_2H_LOGS:
+            logger.info(
+                "[2H_DATA] fixture_id=%s source=%s events_available=%s ht=%s-%s ft=%s-%s goals_2h_total=%s after60=%s after75=%s",
+                record.get("fixture_id"),
+                source,
+                record.get("events_available"),
+                record.get("ht_home"),
+                record.get("ht_away"),
+                record.get("ft_home"),
+                record.get("ft_away"),
+                record.get("goals_2h_total"),
+                record.get("goals_after_60_total"),
+                record.get("goals_after_75_total"),
+            )
+        return stored
+    except IncompleteSecondHalfDataError as exc:
+        if raise_incomplete:
+            raise
+        fixture_id = get_fixture_id(fixture_payload)
+        logger.warning(
+            "[2H_DATA_DEFER] fixture_id=%s source=%s reason=%s",
+            fixture_id,
+            source,
+            exc,
+        )
+        return False
+    except Exception:
+        fixture_id = get_fixture_id(fixture_payload)
+        logger.exception(
+            "[2H_DATA_ERR] fixture_id=%s source=%s",
+            fixture_id,
+            source,
+        )
+        return False
+
+
+def collect_second_half_history_for_fixture(client: "APISportsMetricsClient", fixture_id: int) -> bool:
+    if not ENABLE_2H_COLLECTION:
+        return False
+
+    requested_fixture_id = _safe_int(fixture_id, 0)
+    if requested_fixture_id <= 0:
+        logger.warning(
+            "[2H_DATA_DEFER] fixture_id=%s source=signal_monitor "
+            "reason=invalid_requested_fixture_id",
+            fixture_id,
+        )
+        return False
+
+    try:
+        raw_fixture = client.fetch_fixture(requested_fixture_id) or {}
+        payload_fixture_id = _safe_int(get_fixture_id(raw_fixture), 0)
+        if payload_fixture_id != requested_fixture_id:
+            logger.warning(
+                "[2H_DATA_DEFER] fixture_id=%s source=signal_monitor "
+                "reason=fixture_payload_missing_or_mismatched "
+                "payload_fixture_id=%s",
+                requested_fixture_id,
+                payload_fixture_id or None,
+            )
+            return False
+        raw_events = client.fetch_fixture_events_response(requested_fixture_id)
+    except Exception:
+        logger.exception(
+            "[2H_DATA_FETCH_ERR] fixture_id=%s source=signal_monitor",
+            requested_fixture_id,
+        )
+        return False
+    return store_second_half_history_payload(
+        raw_fixture,
+        raw_events,
+        source="signal_monitor",
+        observed_finished_at_utc=_utc_now_iso(),
+    )
 
 
 def _utc_now_iso() -> str:
@@ -3655,6 +6211,8 @@ def _build_regular_signal_training_payload(
     res_45: Dict[str, Any],
     threshold_next15: float,
     threshold_remain: float,
+    decision_snapshot: Optional[Dict[str, Any]] = None,
+    telegram_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     fixture_id_int = int(fixture_id)
     signal_minute_int = _safe_int(signal_minute, 0)
@@ -3750,41 +6308,98 @@ def _build_regular_signal_training_payload(
         "xg_away": xg_away,
         "xg_total": xg_total,
         "xg_delta": xg_delta,
+        "xg_total_effective": round(_safe_float(res_45.get("xg_total_effective"), xg_total), 4),
+        "xg_confidence": round(_safe_float(res_45.get("xg_confidence"), 1.0), 4),
+        "xg_delta_confidence": round(_safe_float(res_45.get("xg_delta_confidence"), 1.0), 4),
+        "xg_home_confidence": round(_safe_float(res_45.get("xg_home_confidence"), 1.0), 4),
+        "xg_away_confidence": round(_safe_float(res_45.get("xg_away_confidence"), 1.0), 4),
+        "xg_weight_effective": round(_safe_float(res_45.get("xg_weight_effective"), 0.25), 4),
         "goal_xg_gap": goal_xg_gap,
         "pressure_index": pressure_index,
+        "pressure_index_version": str(res_45.get("pressure_index_version") or "v3_smooth"),
+        "pressure_components": dict(res_45.get("pressure_components") or {}),
         "shots_on_target_home": shots_on_target_home,
         "shots_on_target_away": shots_on_target_away,
         "shots_on_target_total": shots_on_target_total,
         "shots_in_box_home": shots_in_box_home,
         "shots_in_box_away": shots_in_box_away,
         "shots_in_box_total": shots_in_box_total,
+        "shots_in_box_norm": round(_safe_float(res_45.get("shots_in_box_norm"), 0.0), 4),
         "total_shots_home": total_shots_home,
         "total_shots_away": total_shots_away,
         "total_shots": total_shots,
         "saves_home": saves_home,
         "saves_away": saves_away,
         "save_stress": save_stress,
+        "save_stress_norm": round(_safe_float(res_45.get("save_stress_norm"), save_stress), 4),
+        "save_weight_effective": round(_safe_float(res_45.get("save_weight_effective"), 0.08), 4),
         "corners_home": corners_home,
         "corners_away": corners_away,
         "possession_home": possession_home,
         "possession_away": possession_away,
         "tempo": tempo,
+        "tempo_norm": round(_safe_float(res_45.get("tempo_norm"), 0.0), 4),
+        "tempo_source": str(res_45.get("tempo_source") or "missing"),
+        "tempo_confidence": round(_safe_float(res_45.get("tempo_confidence"), 0.0), 4),
         "live_intensity": round(_safe_float(res_45.get("live_intensity"), 0.0), 4),
         "adjusted_intensity": round(_safe_float(res_45.get("adjusted_intensity"), 0.0), 4),
         "game_state_factor": round(_safe_float(res_45.get("game_state_factor"), 1.0), 4),
         "goal_xg_gap_factor": round(_safe_float(res_45.get("goal_xg_gap_factor"), 1.0), 4),
         "xg_delta_factor": round(_safe_float(res_45.get("xg_delta_factor"), 1.0), 4),
+        "season_context_factor_45p": round(_safe_float(res_45.get("season_context_factor_45p"), 1.0), 4),
+        "legacy_combined_m_2h": round(_safe_float(res_45.get("legacy_combined_m_2h"), _safe_float(res_45.get("combined_m_2h"), 1.0)), 4),
         "combined_m_2h": round(_safe_float(res_45.get("combined_m_2h"), 1.0), 4),
         "urgency_factor": round(_safe_float(res_45.get("urgency_factor"), 1.0), 4),
         "lambda_2h": round(_safe_float(res_45.get("lambda_2h"), 0.0), 4),
+        "horizon_minutes": round(_safe_float(res_45.get("horizon_minutes"), _safe_float(res_45.get("remaining_minutes_adjusted"), 0.0)), 2),
         "remaining_minutes_adjusted": round(_safe_float(res_45.get("remaining_minutes_adjusted"), 0.0), 2),
         "prob_next_15": round(_safe_float(res_45.get("prob_next_15"), 0.0), 2),
+        "prob_next_25": round(_safe_float(res_45.get("prob_next_25"), _safe_float(res_45.get("prob_second_half_remain"), 0.0)), 2),
+        "prob_next_25_pct": round(_safe_float(res_45.get("prob_next_25_pct"), _safe_float(res_45.get("prob_second_half_remain_pct"), _safe_float(res_45.get("prob_second_half_remain"), 0.0))), 2),
         "prob_second_half_remain": round(_safe_float(res_45.get("prob_second_half_remain"), 0.0), 2),
+        "prob_second_half_remain_pct": round(_safe_float(res_45.get("prob_second_half_remain_pct"), _safe_float(res_45.get("prob_second_half_remain"), 0.0)), 2),
         "prob_to90": round(_safe_float(res_45.get("prob_to90"), 0.0), 2),
         "prob_to75": round(_safe_float(res_45.get("prob_to75"), 0.0), 2),
+        "prob_until_end_decision": round(
+            _safe_float(
+                res_45.get("prob_until_end_decision"),
+                _safe_float(res_45.get("prob_to90"), _safe_float(res_45.get("prob_second_half_remain"), 0.0)),
+            ),
+            2,
+        ),
+        "decision_remain_metric": str(res_45.get("decision_remain_metric") or "prob_to90"),
+        "legacy_prob_second_half_remain": round(
+            _safe_float(res_45.get("legacy_prob_second_half_remain"), _safe_float(res_45.get("prob_second_half_remain"), 0.0)),
+            2,
+        ),
+        "raw_context_multiplier": round(_safe_float(res_45.get("raw_context_multiplier"), _safe_float(res_45.get("context_multiplier"), 1.0)), 4),
+        "applied_context_multiplier": round(_safe_float(res_45.get("applied_context_multiplier"), 1.0), 4),
+        "pressure_weight_effective": round(_safe_float(res_45.get("pressure_weight_effective"), 0.2), 4),
+        "legacy_live_gate_passed_count": _safe_int(res_45.get("legacy_live_gate_passed_count"), 0),
+        "garbage_weak_count": _safe_int(res_45.get("garbage_weak_count"), 0),
+        "live_gate_garbage": bool(res_45.get("live_gate_garbage", False)),
         "threshold_next15": round(_safe_float(threshold_next15, 0.0), 2),
         "threshold_remain": round(_safe_float(threshold_remain, 0.0), 2),
+        "selected_prob_to90_threshold": round(_safe_float(res_45.get("selected_prob_to90_threshold"), threshold_remain), 2),
+        "threshold_source": str(res_45.get("threshold_source") or "fixed_config"),
+        "minute_bucket": res_45.get("minute_bucket"),
+        "dynamic_threshold_enabled": bool(res_45.get("dynamic_threshold_enabled", False)),
+        "old_fixed_threshold": round(_safe_float(res_45.get("old_fixed_threshold"), threshold_remain), 2),
+        "decision_changed_vs_old": bool(res_45.get("decision_changed_vs_old", False)),
+        "decision": dict(decision_snapshot.get("decision", {})) if isinstance(decision_snapshot, dict) else None,
+        "telegram": dict(telegram_snapshot) if isinstance(telegram_snapshot, dict) else None,
         "signal_model": "45_plus",
+        "signal_route": str(res_45.get("signal_route") or "primary"),
+        "premium_badge": bool(res_45.get("premium_badge", False)),
+        "premium_badge_rule_version": (
+            str(res_45.get("premium_badge_rule_version"))
+            if res_45.get("premium_badge_rule_version")
+            else None
+        ),
+        "channel_signal_filter": dict(
+            res_45.get("channel_signal_filter") or {}
+        ),
+        "rescue_evaluation": dict(res_45.get("rescue_evaluation") or {}),
         "model_version": "v2",
         "readiness_check_passed": True,
         "anti_garbage_passed": bool(res_45.get("anti_garbage_passed", True)),
@@ -3804,10 +6419,19 @@ def _build_regular_signal_training_payload(
         "away_team": away_team,
         "league_name": league_name,
         "prob_next_15_at_signal": snapshot["prob_next_15"],
+        "prob_next_25_at_signal": snapshot["prob_next_25"],
         "prob_second_half_remain_at_signal": snapshot["prob_second_half_remain"],
+        "prob_to90_at_signal": snapshot["prob_to90"],
+        "horizon_minutes_at_signal": snapshot["horizon_minutes"],
         "lambda_2h_at_signal": snapshot["lambda_2h"],
+        "season_context_factor_45p_at_signal": snapshot["season_context_factor_45p"],
         "model_version": snapshot["model_version"],
         "signal_model": snapshot["signal_model"],
+        "signal_route": snapshot["signal_route"],
+        "premium_badge": snapshot["premium_badge"],
+        "premium_badge_rule_version": snapshot[
+            "premium_badge_rule_version"
+        ],
         "telegram_message_id": telegram_message_value,
         "snapshot_saved": False,
         "outcome_saved": False,
@@ -4240,9 +6864,19 @@ def _get_team_goal_totals_for_fixture(raw_fixture: Dict[str, Any], team_id: int)
         teams_block = raw_fixture.get("teams") or {}
         home_id = (teams_block.get("home") or {}).get("id")
         away_id = (teams_block.get("away") or {}).get("id")
-        goals_block = raw_fixture.get("goals") or (raw_fixture.get("fixture") or {}).get("goals") or {}
-        gh = goals_block.get("home")
-        ga = goals_block.get("away")
+        status_value = _extract_status_short_from_raw_fixture(raw_fixture)
+        score_blocks = normalize_score_blocks(raw_fixture)
+        normal_block = score_blocks.get("normal_time") or {}
+        gh = normal_block.get("home")
+        ga = normal_block.get("away")
+        if (gh is None or ga is None) and status_value == "FT":
+            goals_block = raw_fixture.get("goals") or (raw_fixture.get("fixture") or {}).get("goals") or {}
+            gh, ga = goals_block.get("home"), goals_block.get("away")
+        if (gh is None or ga is None) and status_value in {"AET", "PEN"}:
+            logger.warning(
+                "[SEASON_NORMAL_TIME_SCORE_MISSING] fixture_id=%s status=%s score_scope=NORMAL_TIME",
+                _extract_fixture_id_from_raw_fixture(raw_fixture), status_value,
+            )
         if gh is None or ga is None:
             return None
         goals_home = int(gh)
@@ -4293,13 +6927,19 @@ def _update_single_team_stats(
         totals_for = 0
         totals_against = 0
         used = 0
+        skipped_aet_unknown_count = 0
+        normal_time_score_source_counts: Dict[str, int] = {}
         for raw_fixture in fixtures:
             status_val = _extract_status_short_from_raw_fixture(raw_fixture)
             if status_val not in FINISHED_STATUSES:
                 continue
             pair = _get_team_goal_totals_for_fixture(raw_fixture, team_id_int)
             if pair is None:
+                if status_val in {"AET", "PEN"}:
+                    skipped_aet_unknown_count += 1
                 continue
+            source = str(normalize_score_blocks(raw_fixture).get("normal_time_source") or "unknown")
+            normal_time_score_source_counts[source] = normal_time_score_source_counts.get(source, 0) + 1
             gf, ga = pair
             totals_for += int(gf)
             totals_against += int(ga)
@@ -4342,6 +6982,9 @@ def _update_single_team_stats(
             rec["avg_conceded"] = float(round(avg_conceded, 6))
             rec["attack_factor"] = float(round(attack_factor, 6))
             rec["defense_factor"] = float(round(defense_factor, 6))
+            rec["score_scope"] = "NORMAL_TIME"
+            rec["skipped_aet_unknown_count"] = int(skipped_aet_unknown_count)
+            rec["normal_time_score_source_counts"] = normal_time_score_source_counts
             rec["updated_at_utc"] = _utc_now_iso()
             rec["cooldown_until_utc"] = None
             rec["last_error"] = None
@@ -4461,6 +7104,7 @@ def enqueue_league_update(
     league_key = str(league_id_int)
     is_first_seen = False
     type_filled = False
+    metadata_changed = False
     
     # Normalize type, using league name as fallback
     raw_api_type = league_type
@@ -4483,8 +7127,10 @@ def enqueue_league_update(
         else:
             if name and not rec.get("name"):
                 rec["name"] = str(name)
+                metadata_changed = True
             if country and not rec.get("country"):
                 rec["country"] = str(country)
+                metadata_changed = True
             
             # If record has no type, try to fill it
             if not _normalize_league_type(rec.get("type")):
@@ -4494,6 +7140,7 @@ def enqueue_league_update(
                 if attempt_type:
                     rec["type"] = attempt_type
                     type_filled = True
+                    metadata_changed = True
                     source = "api" if raw_api_type else "fallback_name"
                     logger.info('[LEAGUE_TYPE] league_id=%s name="%s" api_type=%s old_type=%s new_type=%s source=%s',
                                league_id_int,
@@ -4512,11 +7159,14 @@ def enqueue_league_update(
             
             if season is not None:
                 try:
-                    rec["season"] = int(season)
+                    season_int = int(season)
+                    if rec.get("season") != season_int:
+                        rec["season"] = season_int
+                        metadata_changed = True
                 except Exception:
                     pass
 
-    if is_first_seen or type_filled:
+    if is_first_seen or type_filled or metadata_changed:
         if is_first_seen:
             logger.info(
                 "[LEAGUE_QUEUE] first seen league_id=%s name='%s' country='%s' type=%s season=%s",
@@ -4533,6 +7183,187 @@ def enqueue_league_update(
             league_update_set.add(league_id_int)
             league_update_queue.append(league_id_int)
             logger.info("[LEAGUE_QUEUE] queued league_id=%s reason=%s", league_id_int, reason or "unspecified")
+
+
+def ensure_league_registered(
+    league_id: Optional[int],
+    name: str = "",
+    country: Optional[str] = None,
+    season: Optional[int] = None,
+    league_type: Optional[str] = None,
+    source: str = "fixture",
+) -> str:
+    """Register a discovered league and queue only missing/stale metadata."""
+    if league_id is None:
+        return "invalid"
+    try:
+        league_id_int = int(league_id)
+    except (TypeError, ValueError):
+        return "invalid"
+    if league_id_int <= 0:
+        return "invalid"
+
+    rec = get_persisted_league_record(league_id_int)
+    if not rec:
+        enqueue_league_update(
+            league_id=league_id_int,
+            name=name,
+            country=country,
+            season=season,
+            league_type=league_type,
+            reason=f"{source}_missing",
+        )
+        return "new"
+
+    if _is_cooldown_active(rec.get("cooldown_until_utc")):
+        return "cooldown"
+
+    normalized_type = _normalize_league_type(league_type, fallback_name=name)
+    metadata_incomplete = bool(
+        (name and not rec.get("name"))
+        or (country and not rec.get("country"))
+        or (normalized_type and not _normalize_league_type(rec.get("type")))
+        or (
+            season is not None
+            and _safe_int(rec.get("season"), -1) != _safe_int(season, -1)
+        )
+    )
+    stale = not _is_within_ttl_iso(
+        rec.get("last_updated_utc"), LEAGUE_FACTOR_TTL_DAYS
+    )
+    if metadata_incomplete or stale:
+        enqueue_league_update(
+            league_id=league_id_int,
+            name=name or str(rec.get("name") or ""),
+            country=country if country is not None else rec.get("country"),
+            season=season if season is not None else rec.get("season"),
+            league_type=normalized_type or rec.get("type"),
+            reason=(
+                f"{source}_metadata"
+                if metadata_incomplete
+                else f"{source}_expired"
+            ),
+        )
+        return "queued"
+    return "known"
+
+
+def _raw_fixture_league_context(raw_fixture: Any) -> Dict[str, Any]:
+    raw_fixture = raw_fixture if isinstance(raw_fixture, dict) else {}
+    league = raw_fixture.get("league")
+    league = league if isinstance(league, dict) else {}
+    return {
+        "league_id": _unwrap_metric_int(league.get("id")),
+        "name": str(league.get("name") or "").strip(),
+        "country": str(league.get("country") or "").strip() or None,
+        "season": _unwrap_metric_int(league.get("season")),
+        "type": _normalize_league_type(
+            league.get("type"), fallback_name=str(league.get("name") or "")
+        ),
+    }
+
+
+def discover_live_leagues(fixtures: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Discover every league returned by fixtures?live=all before match filters."""
+    summary = {
+        "fixtures": len(fixtures or []),
+        "unique_leagues": 0,
+        "new": 0,
+        "queued": 0,
+        "known": 0,
+        "cooldown": 0,
+        "invalid": 0,
+    }
+    seen: Set[int] = set()
+    for raw_fixture in fixtures or []:
+        context = _raw_fixture_league_context(raw_fixture)
+        league_id = context.get("league_id")
+        if league_id is None or int(league_id) <= 0:
+            summary["invalid"] += 1
+            continue
+        league_id_int = int(league_id)
+        if league_id_int in seen:
+            continue
+        seen.add(league_id_int)
+        status = ensure_league_registered(
+            league_id=league_id_int,
+            name=str(context.get("name") or ""),
+            country=context.get("country"),
+            season=context.get("season"),
+            league_type=context.get("type"),
+            source="live",
+        )
+        summary[status] = summary.get(status, 0) + 1
+    summary["unique_leagues"] = len(seen)
+    if summary["new"] or summary["queued"]:
+        logger.info(
+            "[LEAGUE_DISCOVERY] fixtures=%s unique_leagues=%s new=%s queued=%s known=%s cooldown=%s invalid=%s queue_size=%s",
+            summary["fixtures"],
+            summary["unique_leagues"],
+            summary["new"],
+            summary["queued"],
+            summary["known"],
+            summary["cooldown"],
+            summary["invalid"],
+            len(league_update_queue),
+        )
+    return summary
+
+
+def bootstrap_leagues_from_2h_stats(path: Optional[str] = None) -> Dict[str, int]:
+    """Register leagues already observed in the second-half history aggregate."""
+    stats_path = str(path or LEAGUE_2H_STATS_PATH)
+    summary = {
+        "records": 0,
+        "new": 0,
+        "queued": 0,
+        "known": 0,
+        "cooldown": 0,
+        "invalid": 0,
+    }
+    try:
+        with open(stats_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        logger.info("[LEAGUE_BOOTSTRAP] file not found: %s", stats_path)
+        return summary
+    except Exception:
+        logger.exception("[LEAGUE_BOOTSTRAP] failed to read: %s", stats_path)
+        return summary
+
+    league_records = payload.get("leagues") if isinstance(payload, dict) else None
+    if not isinstance(league_records, dict):
+        logger.warning("[LEAGUE_BOOTSTRAP] invalid leagues payload: %s", stats_path)
+        return summary
+
+    for league_key, raw_record in league_records.items():
+        rec = raw_record if isinstance(raw_record, dict) else {}
+        league_id = _unwrap_metric_int(rec.get("league_id"))
+        if league_id is None:
+            league_id = _unwrap_metric_int(league_key)
+        status = ensure_league_registered(
+            league_id=league_id,
+            name=str(rec.get("league_name") or rec.get("name") or "").strip(),
+            country=str(rec.get("country") or "").strip() or None,
+            season=_unwrap_metric_int(rec.get("season")),
+            league_type=rec.get("league_type") or rec.get("type"),
+            source="2h_bootstrap",
+        )
+        summary["records"] += 1
+        summary[status] = summary.get(status, 0) + 1
+
+    logger.info(
+        "[LEAGUE_BOOTSTRAP] records=%s new=%s queued=%s known=%s cooldown=%s invalid=%s queue_size=%s file=%s",
+        summary["records"],
+        summary["new"],
+        summary["queued"],
+        summary["known"],
+        summary["cooldown"],
+        summary["invalid"],
+        len(league_update_queue),
+        stats_path,
+    )
+    return summary
 
 
 def get_persisted_league_record(league_id: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -4652,9 +7483,18 @@ def _get_persisted_league_factor(fixture_metrics: Dict[str, Any]) -> Tuple[float
 
 def _extract_goals_from_raw_fixture(raw_fixture: Dict[str, Any]) -> Optional[int]:
     try:
-        goals = raw_fixture.get("goals") or (raw_fixture.get("fixture") or {}).get("goals") or {}
-        home = goals.get("home")
-        away = goals.get("away")
+        status_value = _extract_status_short_from_raw_fixture(raw_fixture)
+        score_blocks = normalize_score_blocks(raw_fixture)
+        normal_block = score_blocks.get("normal_time") or {}
+        home, away = normal_block.get("home"), normal_block.get("away")
+        if (home is None or away is None) and status_value == "FT":
+            goals = raw_fixture.get("goals") or (raw_fixture.get("fixture") or {}).get("goals") or {}
+            home, away = goals.get("home"), goals.get("away")
+        if (home is None or away is None) and status_value in {"AET", "PEN"}:
+            logger.warning(
+                "[SEASON_NORMAL_TIME_SCORE_MISSING] fixture_id=%s status=%s score_scope=NORMAL_TIME",
+                _extract_fixture_id_from_raw_fixture(raw_fixture), status_value,
+            )
         if home is None or away is None:
             return None
         return int(home) + int(away)
@@ -4858,6 +7698,13 @@ def update_cup_league_stats(client: APISportsMetricsClient, league_id: int, leag
             rec_ok["total_goals"] = int(total_goals)
             rec_ok["avg_goals"] = float(round(avg_goals, 6))
             rec_ok["factor"] = float(round(factor, 6))
+            rec_ok["score_scope"] = "NORMAL_TIME"
+            rec_ok["skipped_aet_unknown_count"] = 0
+            source_counts: Dict[str, int] = {}
+            for fixture_row in fixtures[:sample_size]:
+                source = str(normalize_score_blocks(fixture_row).get("normal_time_source") or "unknown")
+                source_counts[source] = source_counts.get(source, 0) + 1
+            rec_ok["normal_time_score_source_counts"] = source_counts
             rec_ok["last_updated_utc"] = _utc_now_iso()
             rec_ok["last_error"] = None
             rec_ok["cooldown_until_utc"] = None
@@ -5689,9 +8536,24 @@ def _text_hash(text: str) -> str:
 
 def _normalize_status_short(fixture: Dict[str, Any]) -> str:
     status = fixture.get("status")
-    if isinstance(status, dict):
-        return str(status.get("short") or status.get("value") or "").upper()
-    return str(status or "").upper()
+    for _ in range(3):
+        if not isinstance(status, dict):
+            return str(status or "").strip().upper()
+
+        short = status.get("short")
+        if short is None:
+            short = status.get("SHORT")
+        if short is not None and not isinstance(short, dict):
+            return str(short).strip().upper()
+
+        nested = status.get("value")
+        if nested is None:
+            nested = status.get("VALUE")
+        if nested is status:
+            break
+        status = nested
+
+    return ""
 
 
 def _extract_fixture_tracking_snapshot(fixture: Dict[str, Any]) -> Dict[str, Any]:
@@ -5775,6 +8637,7 @@ def prune_finished_matches_from_tracking() -> None:
         return
 
     with state_lock:
+        changed = False
         monitored_before = list(state.get("monitored_matches", []))
         filtered = []
         for match_id in monitored_before:
@@ -5787,10 +8650,36 @@ def prune_finished_matches_from_tracking() -> None:
 
         if len(filtered) != len(monitored_before):
             state["monitored_matches"] = filtered
-            excluded = state.setdefault("excluded_matches", [])
-            for match_id in finished_ids:
-                if match_id not in excluded:
-                    excluded.append(match_id)
+            changed = True
+
+        active_before = list(state.get("active_fixtures", []))
+        state["active_fixtures"] = [
+            match_id for match_id in active_before
+            if _safe_int(match_id, -1) not in finished_ids
+        ]
+        if len(state["active_fixtures"]) != len(active_before):
+            changed = True
+
+        tracked = state.get("tracked_matches", {})
+        sent = state.get("sent", {})
+        for match_id in finished_ids:
+            fixture_key = str(match_id)
+            if isinstance(tracked, dict) and isinstance(tracked.get(fixture_key), dict):
+                tracked[fixture_key]["finished"] = True
+                tracked[fixture_key]["status"] = "FT"
+                changed = True
+            if isinstance(sent, dict) and isinstance(sent.get(fixture_key), dict):
+                sent[fixture_key]["finished"] = True
+                sent[fixture_key]["status"] = "FT"
+                changed = True
+
+        excluded = state.setdefault("excluded_matches", [])
+        for match_id in finished_ids:
+            if match_id not in excluded:
+                excluded.append(match_id)
+                changed = True
+
+        if changed:
             mark_state_dirty()
 
     for match_id in finished_ids:
@@ -5806,11 +8695,13 @@ state: Dict[str, Any] = {
     "active_fixtures": [],            # fixture_ids that must be updated by monitor loop
     "signal_header_texts": {},         # match_id -> immutable snapshot header text
     "signal_snapshot_meta": {},        # match_id -> {signal_score_home, signal_score_away, signal_minute, message_id, chat_id, prob_to75, prob_to90}
+    "rescue_candidates": {},            # fixture_id -> qualifying observations for Rescue confirmation
     "monitored_matches": [],
     "match_initial_score": {},     # score_at_signal (top-line, immutable)
     "match_initial_minute": {},    # minute at signal time (for event filtering)
     "match_prob_status": {},
     "match_goal_status": {},            # per-match dict with processed events and flags
+    "score_timelines": {},              # fixture_id -> bounded live score observations
     "match_processed_event_ids": {},    # processed event keys per match
     "match_sent_at": {},                # epoch timestamp when signal was sent
     "excluded_matches": [],
@@ -5852,11 +8743,57 @@ def load_state():
                         state.setdefault("active_fixtures", state.get("active_fixtures", []))
                         state.setdefault("signal_header_texts", state.get("signal_header_texts", {}))
                         state.setdefault("signal_snapshot_meta", state.get("signal_snapshot_meta", {}))
+                        state.setdefault("rescue_candidates", state.get("rescue_candidates", {}))
+                        state.setdefault("score_timelines", state.get("score_timelines", {}))
                         state.setdefault("training_signal_records", state.get("training_signal_records", {}))
                         state.setdefault("training_fixture_index", state.get("training_fixture_index", {}))
                         logger.info(f"[STATE] Loaded state from {STATE_FILE}")
         except Exception:
             logger.exception("Failed to load state")
+
+
+def record_score_timeline_observation(
+    fixture_id: int,
+    minute: int,
+    score_home: int,
+    score_away: int,
+    status_short: str = "",
+    observed_at_utc: Optional[str] = None,
+) -> None:
+    """Persist a bounded score history used for horizon outcome labels."""
+    fixture_key = str(int(fixture_id))
+    observation = {
+        "minute": max(0, _safe_int(minute, 0)),
+        "home": max(0, _safe_int(score_home, 0)),
+        "away": max(0, _safe_int(score_away, 0)),
+        "status": str(status_short or "").upper(),
+        "observed_at_utc": str(observed_at_utc or _utc_now_iso()),
+    }
+    with state_lock:
+        timelines = state.setdefault("score_timelines", {})
+        if not isinstance(timelines, dict):
+            timelines = {}
+            state["score_timelines"] = timelines
+        timeline = timelines.get(fixture_key)
+        if not isinstance(timeline, list):
+            timeline = []
+        comparable = ("minute", "home", "away", "status")
+        if timeline and all(timeline[-1].get(key) == observation.get(key) for key in comparable):
+            return
+        timeline.append(observation)
+        timelines[fixture_key] = timeline[-240:]
+        while len(timelines) > 1000:
+            oldest_key = next(iter(timelines))
+            if oldest_key == fixture_key and len(timelines) > 1:
+                oldest_key = next(key for key in timelines if key != fixture_key)
+            timelines.pop(oldest_key, None)
+        mark_state_dirty()
+
+
+def get_score_timeline(fixture_id: int) -> List[Dict[str, Any]]:
+    with state_lock:
+        timeline = state.setdefault("score_timelines", {}).get(str(int(fixture_id)), [])
+        return [dict(item) for item in timeline if isinstance(item, dict)]
 
 
 def add_tracked_match(
@@ -6049,6 +8986,8 @@ def get_tracked_update_candidates() -> List[int]:
             for fixture_id_str, rec in tracked.items():
                 if not isinstance(rec, dict):
                     continue
+                if bool(rec.get("finished", False)):
+                    continue
                 status = str(rec.get("status") or "LIVE").upper()
                 if status in ("FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"):
                     continue
@@ -6103,10 +9042,7 @@ def bootstrap_tracking_from_state() -> None:
 def save_state_to_disk():
     with state_lock:
         try:
-            tmp = STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(state, fh, ensure_ascii=False, indent=2)
-            os.replace(tmp, STATE_FILE)
+            _write_json_atomic(STATE_FILE, state)
             logger.info("[STATE] Saved")
         except Exception:
             logger.exception("[STATE] Save failed")
@@ -6143,19 +9079,24 @@ def start_state_saver_daemon():
     _state_saver_thread = t
     t.start()
 
-os.makedirs(PERSIST_DIR, exist_ok=True)
-_ensure_jsonl_file(MATCH_SNAPSHOTS_JSONL_PATH)
-_ensure_jsonl_file(MATCH_OUTCOMES_JSONL_PATH)
-load_persistent_state()
-load_matches_state()
-load_leagues_state()
-load_teams_state()
-migrate_matches_from_core()
-start_state_saver_daemon()
-load_state()
-bootstrap_tracking_from_state()
-_migrate_persistent_state_from_state()
-prune_finished_matches_from_tracking()
+# Persistent state has one owner: the process executing NanoTest.py itself.
+# Importing the module must stay side-effect free even if a caller forgets to
+# set GOALBOT_LIBRARY_MODE; otherwise an analysis process can overwrite the
+# live bot's state with its own freshly initialized copy.
+if __name__ == "__main__" and not _parse_env_bool("GOALBOT_LIBRARY_MODE", False):
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+    _ensure_jsonl_file(MATCH_SNAPSHOTS_JSONL_PATH)
+    _ensure_jsonl_file(MATCH_OUTCOMES_JSONL_PATH)
+    load_persistent_state()
+    load_matches_state()
+    load_leagues_state()
+    load_teams_state()
+    migrate_matches_from_core()
+    start_state_saver_daemon()
+    load_state()
+    bootstrap_tracking_from_state()
+    _migrate_persistent_state_from_state()
+    prune_finished_matches_from_tracking()
 
 # -------------------------
 # Helper utilities for ignored matches logic (STRICT RULES)
@@ -6206,7 +9147,22 @@ def save_signal_snapshot_state(
     chat_id: Optional[int],
     prob_to75: Optional[float] = None,
     prob_to90: Optional[float] = None,
+    prob_next_15: Optional[float] = None,
+    prob_next_25: Optional[float] = None,
+    prob_until_end_decision: Optional[float] = None,
+    decision_remain_metric: Optional[str] = None,
+    legacy_prob_second_half_remain: Optional[float] = None,
     signal_model: Optional[str] = None,
+    signal_route: str = "primary",
+    premium_badge: bool = False,
+    selected_prob_to90_threshold: Optional[float] = None,
+    threshold_source: Optional[str] = None,
+    minute_bucket: Optional[str] = None,
+    dynamic_threshold_enabled: bool = False,
+    old_fixed_threshold: Optional[float] = None,
+    decision_changed_vs_old: bool = False,
+    decision: Optional[Dict[str, Any]] = None,
+    telegram: Optional[Dict[str, Any]] = None,
 ) -> None:
     with state_lock:
         state.setdefault("signal_header_texts", {})[str(match_id)] = str(header_text or "")
@@ -6216,11 +9172,87 @@ def save_signal_snapshot_state(
             "signal_minute": int(signal_minute or 0),
             "message_id": int(message_id) if message_id else None,
             "chat_id": int(chat_id) if chat_id else None,
+            "prob_next_15": float(prob_next_15) if prob_next_15 is not None else None,
+            "prob_next_25": float(prob_next_25) if prob_next_25 is not None else None,
             "prob_to75": float(prob_to75) if prob_to75 is not None else None,
             "prob_to90": float(prob_to90) if prob_to90 is not None else None,
+            "prob_until_end_decision": (
+                float(prob_until_end_decision)
+                if prob_until_end_decision is not None
+                else None
+            ),
+            "decision_remain_metric": (
+                str(decision_remain_metric)
+                if decision_remain_metric is not None
+                else None
+            ),
+            "legacy_prob_second_half_remain": (
+                float(legacy_prob_second_half_remain)
+                if legacy_prob_second_half_remain is not None
+                else None
+            ),
             "signal_model": str(signal_model) if signal_model is not None else None,
+            "signal_route": "rescue" if str(signal_route).lower() == "rescue" else "primary",
+            "premium_badge": bool(premium_badge),
+            "premium_badge_rule_version": (
+                PREMIUM_BADGE_RULE_VERSION if premium_badge else None
+            ),
+            "selected_prob_to90_threshold": float(selected_prob_to90_threshold) if selected_prob_to90_threshold is not None else None,
+            "threshold_source": str(threshold_source) if threshold_source is not None else None,
+            "minute_bucket": str(minute_bucket) if minute_bucket is not None else None,
+            "dynamic_threshold_enabled": bool(dynamic_threshold_enabled),
+            "old_fixed_threshold": float(old_fixed_threshold) if old_fixed_threshold is not None else None,
+            "decision_changed_vs_old": bool(decision_changed_vs_old),
+            "decision": dict(decision) if isinstance(decision, dict) else None,
+            "telegram": dict(telegram) if isinstance(telegram, dict) else None,
         }
         mark_state_dirty()
+
+
+def register_rescue_candidate_observation(
+    fixture_id: int,
+    minute: int,
+    rescue_evaluation: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist confirmation using distinct match minutes, not loop iterations."""
+    fixture_key = str(int(fixture_id))
+    quality_passed = bool((rescue_evaluation or {}).get("quality_passed", False))
+    controller_score = _safe_float((rescue_evaluation or {}).get("controller_score"), 0.0)
+    instant = quality_passed and controller_score >= RESCUE_INSTANT_CONTROLLER_SCORE
+
+    with state_lock:
+        candidates = state.setdefault("rescue_candidates", {})
+        previous = candidates.get(fixture_key, {}) if isinstance(candidates.get(fixture_key), dict) else {}
+        previous_minute = _safe_int(previous.get("last_qualifying_minute"), -1)
+        observations = _safe_int(previous.get("qualifying_observations"), 0)
+
+        if not quality_passed:
+            candidates.pop(fixture_key, None)
+            mark_state_dirty()
+            return {
+                "confirmed": False,
+                "instant": False,
+                "qualifying_observations": 0,
+                "required_observations": int(RESCUE_CONFIRMATION_OBSERVATIONS),
+            }
+
+        if int(minute) != previous_minute:
+            observations += 1
+        confirmed = instant or observations >= RESCUE_CONFIRMATION_OBSERVATIONS
+        candidates[fixture_key] = {
+            "last_qualifying_minute": int(minute),
+            "qualifying_observations": int(observations),
+            "last_controller_score": round(controller_score, 2),
+            "confirmed": bool(confirmed),
+        }
+        mark_state_dirty()
+
+    return {
+        "confirmed": bool(confirmed),
+        "instant": bool(instant),
+        "qualifying_observations": int(observations),
+        "required_observations": int(RESCUE_CONFIRMATION_OBSERVATIONS),
+    }
 
 
 def get_signal_snapshot_state(match_id: int) -> Tuple[Optional[str], Dict[str, Any]]:
@@ -6231,24 +9263,93 @@ def get_signal_snapshot_state(match_id: int) -> Tuple[Optional[str], Dict[str, A
         meta = {}
     return (str(header) if header else None), dict(meta)
 
+
+def _cleanup_no_stats_entries(
+    *,
+    cleanup_fixtures: bool,
+    cleanup_blocked: bool,
+    log_summary: bool,
+) -> Dict[str, Any]:
+    summary = {
+        "enabled": ENABLE_CLEANUP,
+        "expired_no_stats_fixtures_removed": 0,
+        "expired_no_stats_blocked_removed": 0,
+        "remaining_no_stats_fixtures": 0,
+        "remaining_no_stats_blocked": 0,
+        "sent_state_touched": False,
+        "tracked_state_touched": False,
+        "outcome_state_touched": False,
+    }
+
+    if not ENABLE_CLEANUP:
+        return summary
+
+    now = time.time()
+    with state_lock:
+        no_stats = state.setdefault("no_stats_fixtures", {})
+        blocked = state.setdefault("no_stats_blocked", {})
+
+        expired_fixture_ids: List[str] = []
+        expired_block_keys: List[str] = []
+
+        if cleanup_fixtures:
+            expired_fixture_ids = [
+                fixture_id
+                for fixture_id, info in no_stats.items()
+                if float((info or {}).get("expires_ts", 0) or 0) < now
+            ]
+            for fixture_id in expired_fixture_ids:
+                no_stats.pop(fixture_id, None)
+
+        if cleanup_blocked:
+            expired_block_keys = [
+                block_key
+                for block_key, info in blocked.items()
+                if float((info or {}).get("expires_ts", 0) or 0) < now
+            ]
+            for block_key in expired_block_keys:
+                blocked.pop(block_key, None)
+
+        if expired_fixture_ids or expired_block_keys:
+            mark_state_dirty()
+
+        summary["expired_no_stats_fixtures_removed"] = len(expired_fixture_ids)
+        summary["expired_no_stats_blocked_removed"] = len(expired_block_keys)
+        summary["remaining_no_stats_fixtures"] = len(no_stats)
+        summary["remaining_no_stats_blocked"] = len(blocked)
+
+    if log_summary:
+        logger.info(
+            "[CLEANUP_NO_STATS] enabled=%s expired_no_stats_fixtures_removed=%s expired_no_stats_blocked_removed=%s remaining_no_stats_fixtures=%s remaining_no_stats_blocked=%s sent_state_touched=%s tracked_state_touched=%s outcome_state_touched=%s",
+            summary["enabled"],
+            summary["expired_no_stats_fixtures_removed"],
+            summary["expired_no_stats_blocked_removed"],
+            summary["remaining_no_stats_fixtures"],
+            summary["remaining_no_stats_blocked"],
+            summary["sent_state_touched"],
+            summary["tracked_state_touched"],
+            summary["outcome_state_touched"],
+        )
+    return summary
+
+
+def cleanup_expired_no_stats_state() -> Dict[str, Any]:
+    return _cleanup_no_stats_entries(
+        cleanup_fixtures=True,
+        cleanup_blocked=True,
+        log_summary=True,
+    )
+
 def cleanup_expired_no_stats_fixtures() -> None:
     """
     Очистить записи no_stats_fixtures с истекшим expires_ts.
     Вызывается периодически из main_loop для освобождения памяти.
     """
-    if not ENABLE_CLEANUP:
-        logger.info("[CLEANUP] disabled (temporary)")
-        return
-    now = time.time()
-    with state_lock:
-        no_stats = state.setdefault("no_stats_fixtures", {})
-        expired_ids = [fid for fid, info in no_stats.items() if info.get("expires_ts", 0) < now]
-        
-        if expired_ids:
-            for fid in expired_ids:
-                del no_stats[fid]
-            mark_state_dirty()
-            logger.debug(f"[NO_STATS] Cleaned up {len(expired_ids)} expired fixture(s)")
+    _cleanup_no_stats_entries(
+        cleanup_fixtures=True,
+        cleanup_blocked=False,
+        log_summary=False,
+    )
 
 def is_no_stats_fixture(fixture_id: int) -> bool:
     """
@@ -6266,7 +9367,6 @@ def is_no_stats_fixture(fixture_id: int) -> bool:
         expires_ts = info.get("expires_ts", 0)
         if expires_ts < now:
             if not ENABLE_CLEANUP:
-                logger.info("[CLEANUP] disabled (temporary)")
                 return False
             # Expired - удалить и вернуть False
             del no_stats[str(fixture_id)]
@@ -6299,18 +9399,11 @@ def block_no_stats_fixture(fixture_id: int, minute: int, coverage: float) -> Non
 
 def cleanup_expired_no_stats_blocked() -> None:
     """Cleanup long no-stats blocks with expired timestamps."""
-    if not ENABLE_CLEANUP:
-        logger.info("[CLEANUP] disabled (temporary)")
-        return
-    now = time.time()
-    with state_lock:
-        blocked = state.setdefault("no_stats_blocked", {})
-        expired = [k for k, info in blocked.items() if info.get("expires_ts", 0) < now]
-        if expired:
-            for k in expired:
-                del blocked[k]
-            mark_state_dirty()
-            logger.debug(f"[NO_STATS_BLOCK] Cleaned up {len(expired)} expired block(s)")
+    _cleanup_no_stats_entries(
+        cleanup_fixtures=False,
+        cleanup_blocked=True,
+        log_summary=False,
+    )
 
 
 def is_no_stats_blocked(block_key: str) -> bool:
@@ -6324,7 +9417,6 @@ def is_no_stats_blocked(block_key: str) -> bool:
         expires_ts = info.get("expires_ts", 0)
         if expires_ts < now:
             if not ENABLE_CLEANUP:
-                logger.info("[CLEANUP] disabled (temporary)")
                 return False
             del blocked[str(block_key)]
             mark_state_dirty()
@@ -6456,8 +9548,95 @@ class TgEditQueue:
         self._global_edit_ts: deque[float] = deque()
         self.last_edit_ts: Dict[Tuple[int, int], float] = {}
         self.last_sent_hash: Dict[Tuple[int, int], str] = {}
+        self.last_activity_ts: Dict[Tuple[int, int], float] = {}
         self.chat_block_until: Dict[int, float] = {}
         self._last_429_log_at: Dict[int, float] = {}
+
+    def _remember_hash_locked(
+        self,
+        key: Tuple[int, int],
+        text_hash: str,
+        *,
+        now_ts: Optional[float] = None,
+    ) -> None:
+        self.last_sent_hash[key] = text_hash
+        self.last_activity_ts[key] = float(
+            time.time() if now_ts is None else now_ts
+        )
+
+    def remember_sent_hash(
+        self,
+        chat_id: int,
+        message_id: int,
+        text_hash: str,
+    ) -> None:
+        key = (int(chat_id), int(message_id))
+        with self._lock:
+            self._remember_hash_locked(key, text_hash)
+
+    def prune(
+        self,
+        *,
+        now_ts: Optional[float] = None,
+        max_age_seconds: int = TG_EDIT_CACHE_TTL_SECONDS,
+        max_entries: int = TG_EDIT_CACHE_MAX_ENTRIES,
+    ) -> int:
+        """Bound message/chat bookkeeping without affecting Telegram state."""
+        current = float(time.time() if now_ts is None else now_ts)
+        cutoff = current - max(1, int(max_age_seconds))
+        limit = max(1, int(max_entries))
+        removed = 0
+        with self._lock:
+            while self._global_edit_ts and current - self._global_edit_ts[0] >= 60:
+                self._global_edit_ts.popleft()
+
+            all_message_keys = (
+                set(self.last_edit_ts)
+                | set(self.last_sent_hash)
+                | set(self.last_activity_ts)
+            )
+            stale_keys = {
+                key
+                for key in all_message_keys
+                if float(
+                    self.last_activity_ts.get(
+                        key, self.last_edit_ts.get(key, 0.0)
+                    )
+                    or 0.0
+                )
+                < cutoff
+            }
+            ranked_keys = sorted(
+                all_message_keys - stale_keys,
+                key=lambda key: float(
+                    self.last_activity_ts.get(
+                        key, self.last_edit_ts.get(key, 0.0)
+                    )
+                    or 0.0
+                ),
+                reverse=True,
+            )
+            stale_keys.update(ranked_keys[limit:])
+            for key in stale_keys:
+                existed = (
+                    key in self.last_edit_ts
+                    or key in self.last_sent_hash
+                    or key in self.last_activity_ts
+                )
+                self.last_edit_ts.pop(key, None)
+                self.last_sent_hash.pop(key, None)
+                self.last_activity_ts.pop(key, None)
+                removed += int(existed)
+
+            for chat_id, blocked_until in list(self.chat_block_until.items()):
+                if float(blocked_until or 0.0) <= current:
+                    self.chat_block_until.pop(chat_id, None)
+                    removed += 1
+            for chat_id, logged_at in list(self._last_429_log_at.items()):
+                if float(logged_at or 0.0) < cutoff:
+                    self._last_429_log_at.pop(chat_id, None)
+                    removed += 1
+        return removed
 
     @staticmethod
     def _parse_body(response: requests.Response) -> Dict[str, Any]:
@@ -6549,7 +9728,7 @@ class TgEditQueue:
                 with self._lock:
                     now_ok = time.time()
                     self.last_edit_ts[key] = now_ok
-                    self.last_sent_hash[key] = text_hash
+                    self._remember_hash_locked(key, text_hash, now_ts=now_ok)
                     self.chat_block_until.pop(int(chat_id), None)
                 return True, "ok", 0
 
@@ -6558,7 +9737,7 @@ class TgEditQueue:
 
             if "message is not modified" in desc_l:
                 with self._lock:
-                    self.last_sent_hash[key] = text_hash
+                    self._remember_hash_locked(key, text_hash)
                 return False, "not_modified", 0
 
             if "message to edit not found" in desc_l or "message not found" in desc_l:
@@ -6592,7 +9771,7 @@ class TgEditQueue:
                     with self._lock:
                         now_ok = time.time()
                         self.last_edit_ts[key] = now_ok
-                        self.last_sent_hash[key] = text_hash
+                        self._remember_hash_locked(key, text_hash, now_ts=now_ok)
                         self.chat_block_until.pop(int(chat_id), None)
                     return True, "ok", 0
 
@@ -6654,7 +9833,7 @@ class TgEditQueue:
                 with self._lock:
                     now_ok = time.time()
                     self.last_edit_ts[key] = now_ok
-                    self.last_sent_hash[key] = caption_hash
+                    self._remember_hash_locked(key, caption_hash, now_ts=now_ok)
                     self.chat_block_until.pop(int(chat_id), None)
                 return True, "ok", 0
 
@@ -6663,7 +9842,7 @@ class TgEditQueue:
 
             if "message is not modified" in desc_l:
                 with self._lock:
-                    self.last_sent_hash[key] = caption_hash
+                    self._remember_hash_locked(key, caption_hash)
                 return False, "not_modified", 0
 
             if "message to edit not found" in desc_l or "message not found" in desc_l:
@@ -6697,7 +9876,7 @@ class TgEditQueue:
                     with self._lock:
                         now_ok = time.time()
                         self.last_edit_ts[key] = now_ok
-                        self.last_sent_hash[key] = caption_hash
+                        self._remember_hash_locked(key, caption_hash, now_ts=now_ok)
                         self.chat_block_until.pop(int(chat_id), None)
                     return True, "ok", 0
 
@@ -6763,6 +9942,7 @@ def send_to_telegram(
     match_id: Optional[int] = None,
     score_at_signal: Optional[Tuple[int, int]] = None,
     signal_minute: Optional[int] = None,
+    reply_markup: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
     if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is None:
         logger.warning("[TG] Telegram send skipped: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not configured.")
@@ -6770,6 +9950,8 @@ def send_to_telegram(
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    if isinstance(reply_markup, dict):
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     
     # Log details before sending
     logger.info(f"[TG] Sending message: chat_id={TELEGRAM_CHAT_ID}, match_id={match_id}, text_preview={text[:100]}...")
@@ -6784,7 +9966,11 @@ def send_to_telegram(
             mid = body.get("result", {}).get("message_id")
             if mid:
                 try:
-                    tg_edit_queue.last_sent_hash[(int(TELEGRAM_CHAT_ID), int(mid))] = _text_hash(text)
+                    tg_edit_queue.remember_sent_hash(
+                        int(TELEGRAM_CHAT_ID),
+                        int(mid),
+                        _text_hash(text),
+                    )
                 except Exception:
                     pass
             if match_id is not None and mid:
@@ -7036,7 +10222,16 @@ def _apply_intensity_scaling(base_prob01: float, combined_m: float, cap: float =
 
 
 def _get_v2_league_context(fixture_metrics: Dict[str, Any]) -> Dict[str, Any]:
-    league_id = _unwrap_metric_int(fixture_metrics.get("league_id"))
+    league_context = _extract_league_context(fixture_metrics)
+    league_id = league_context.get("league_id")
+    ensure_league_registered(
+        league_id=league_id,
+        name=str(league_context.get("name") or ""),
+        country=league_context.get("country"),
+        season=league_context.get("season"),
+        league_type=league_context.get("type"),
+        source="v2",
+    )
     league_rec = get_persisted_league_record(league_id) or {}
 
     league_avg_goals_raw = league_rec.get("avg_goals")
@@ -7108,6 +10303,422 @@ def _get_v2_team_profile(team_id: Optional[int], league_avg_team: float) -> Dict
         "attack_factor": float(attack_factor),
         "defense_factor": float(defense_factor),
     }
+
+
+def _safe_nested_get(source: Any, path: List[str], default: Any = None) -> Any:
+    try:
+        cur = source
+        for key in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(key)
+        return cur if cur not in (None, "") else default
+    except Exception:
+        return default
+
+
+def _safe_context_name(value: Any) -> str:
+    try:
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("value")
+        text = str(value or "").strip()
+        return text or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _safe_context_int(value: Any) -> Optional[int]:
+    try:
+        return _unwrap_metric_int(value)
+    except Exception:
+        return None
+
+
+def _detect_cup_context(league_type: Any, league_name: str) -> Tuple[Optional[bool], str, str]:
+    raw_type = _safe_context_name(league_type)
+    lowered_type = "" if raw_type == "unknown" else raw_type.lower()
+    if lowered_type == "cup":
+        return True, "api_type", "Cup"
+    if lowered_type == "league":
+        return False, "api_type", "League"
+
+    name = str(league_name or "").lower()
+    cup_markers = (
+        "cup",
+        "copa",
+        "pokal",
+        "trophy",
+        "shield",
+        "playoff",
+        "qualification",
+        "world cup",
+        "euro",
+        "nations league",
+    )
+    if any(marker in name for marker in cup_markers):
+        return True, "name_heuristic", "Cup"
+    return None, "unknown", "Unknown"
+
+
+def build_match_identity_context(fixture_metrics: dict) -> dict:
+    """Safely extract match/team/league identity for diagnostics only."""
+    try:
+        fixture_metrics = fixture_metrics if isinstance(fixture_metrics, dict) else {}
+        prematch = fixture_metrics.get("prematch") if isinstance(fixture_metrics.get("prematch"), dict) else {}
+        raw_fixture = (
+            fixture_metrics.get("raw_fixture")
+            if isinstance(fixture_metrics.get("raw_fixture"), dict)
+            else fixture_metrics
+        )
+
+        league_raw = (
+            fixture_metrics.get("league")
+            if isinstance(fixture_metrics.get("league"), dict)
+            else _safe_nested_get(prematch, ["league"], {})
+        )
+        if not isinstance(league_raw, dict):
+            league_raw = _safe_nested_get(raw_fixture, ["league"], {})
+        teams_raw = (
+            fixture_metrics.get("teams")
+            if isinstance(fixture_metrics.get("teams"), dict)
+            else _safe_nested_get(prematch, ["teams"], {})
+        )
+        if not isinstance(teams_raw, dict):
+            teams_raw = _safe_nested_get(raw_fixture, ["teams"], {})
+
+        fixture_id = get_fixture_id(fixture_metrics) or get_fixture_id(raw_fixture) or get_fixture_id(prematch)
+        home_raw = teams_raw.get("home") if isinstance(teams_raw, dict) else {}
+        away_raw = teams_raw.get("away") if isinstance(teams_raw, dict) else {}
+        home_raw = home_raw if isinstance(home_raw, dict) else {}
+        away_raw = away_raw if isinstance(away_raw, dict) else {}
+
+        home_team_id = (
+            _safe_context_int(fixture_metrics.get("team_home_id"))
+            or _safe_context_int(fixture_metrics.get("home_team_id"))
+            or _safe_context_int(home_raw.get("id"))
+        )
+        away_team_id = (
+            _safe_context_int(fixture_metrics.get("team_away_id"))
+            or _safe_context_int(fixture_metrics.get("away_team_id"))
+            or _safe_context_int(away_raw.get("id"))
+        )
+        league_id = (
+            _safe_context_int(fixture_metrics.get("league_id"))
+            or _safe_context_int(_safe_nested_get(league_raw, ["id"]))
+        )
+
+        home_team_name = _safe_context_name(
+            fixture_metrics.get("team_home_name")
+            or fixture_metrics.get("home_team_name")
+            or fixture_metrics.get("home_team")
+            or home_raw.get("name")
+        )
+        away_team_name = _safe_context_name(
+            fixture_metrics.get("team_away_name")
+            or fixture_metrics.get("away_team_name")
+            or fixture_metrics.get("away_team")
+            or away_raw.get("name")
+        )
+        league_name = _safe_context_name(
+            fixture_metrics.get("league_name")
+            or _safe_nested_get(league_raw, ["name"])
+        )
+        league_country = _safe_context_name(
+            fixture_metrics.get("league_country")
+            or fixture_metrics.get("country")
+            or _safe_nested_get(league_raw, ["country"])
+        )
+        league_type_raw = (
+            fixture_metrics.get("league_type")
+            or _safe_nested_get(league_raw, ["type"])
+        )
+        # Keep a stable precedence: explicit fixture/API type, persisted
+        # league registry, then the weaker name heuristic.
+        is_cup, is_cup_source, league_type = _detect_cup_context(
+            league_type_raw, ""
+        )
+        if league_type == "Unknown" and league_id is not None:
+            persisted_league = get_persisted_league_record(league_id) or {}
+            persisted_type = _safe_context_name(
+                persisted_league.get("type") or persisted_league.get("league_type")
+            )
+            normalized_persisted_type = (
+                persisted_type
+                if persisted_type in {"Cup", "League"}
+                else persisted_type.title()
+            )
+            if normalized_persisted_type in {"Cup", "League"}:
+                league_type = normalized_persisted_type
+                is_cup = normalized_persisted_type == "Cup"
+                is_cup_source = "persisted_league"
+        if league_type == "Unknown":
+            is_cup, is_cup_source, league_type = _detect_cup_context(
+                None, league_name
+            )
+        season = (
+            _safe_context_int(fixture_metrics.get("league_season"))
+            or _safe_context_int(fixture_metrics.get("season"))
+            or _safe_context_int(_safe_nested_get(league_raw, ["season"]))
+        )
+        round_name = _safe_context_name(
+            fixture_metrics.get("league_round")
+            or fixture_metrics.get("round")
+            or _safe_nested_get(league_raw, ["round"])
+        )
+
+        return {
+            "fixture_id": fixture_id,
+            "home_team_id": home_team_id,
+            "home_team_name": home_team_name,
+            "away_team_id": away_team_id,
+            "away_team_name": away_team_name,
+            "league_id": league_id,
+            "league_name": league_name,
+            "league_country": league_country,
+            "league_type": league_type,
+            "is_cup": is_cup,
+            "is_cup_source": is_cup_source,
+            "season": season,
+            "round": round_name,
+        }
+    except Exception:
+        logger.exception("[FACTOR_CONTEXT_IDENTITY_ERR]")
+        return {
+            "fixture_id": None,
+            "home_team_id": None,
+            "home_team_name": "unknown",
+            "away_team_id": None,
+            "away_team_name": "unknown",
+            "league_id": None,
+            "league_name": "unknown",
+            "league_country": "unknown",
+            "league_type": "Unknown",
+            "is_cup": None,
+            "is_cup_source": "unknown",
+            "season": None,
+            "round": "unknown",
+        }
+
+
+def _lookup_stats_record(container: Any, record_id: Optional[int]) -> Tuple[Dict[str, Any], bool, str, bool]:
+    if record_id is None or not isinstance(container, dict):
+        return {}, False, "missing", False
+    try:
+        str_key = str(int(record_id))
+        int_key = int(record_id)
+    except Exception:
+        return {}, False, "missing", False
+
+    record = container.get(str_key)
+    if isinstance(record, dict):
+        return dict(record), True, "json", False
+    record = container.get(int_key)
+    if isinstance(record, dict):
+        return dict(record), True, "json", True
+    return {}, False, "missing", False
+
+
+def build_2h_factor_context(
+    match_identity: dict,
+    second_half_context: dict,
+    team_2h_stats: dict,
+    league_2h_stats: dict,
+) -> dict:
+    """Build diagnostic context for 2H JSON availability without changing model logic."""
+    try:
+        match_identity = match_identity if isinstance(match_identity, dict) else {}
+        second_half_context = second_half_context if isinstance(second_half_context, dict) else {}
+        team_records = team_2h_stats.get("teams", {}) if isinstance(team_2h_stats, dict) else {}
+        league_records = league_2h_stats.get("leagues", {}) if isinstance(league_2h_stats, dict) else {}
+
+        home_id = _safe_context_int(match_identity.get("home_team_id"))
+        away_id = _safe_context_int(match_identity.get("away_team_id"))
+        league_id = _safe_context_int(match_identity.get("league_id"))
+
+        home_record, home_exists, home_source, home_key_mismatch = _lookup_stats_record(team_records, home_id)
+        away_record, away_exists, away_source, away_key_mismatch = _lookup_stats_record(team_records, away_id)
+        league_record, league_exists, league_source, league_key_mismatch = _lookup_stats_record(league_records, league_id)
+
+        possible_key_type_mismatch = bool(home_key_mismatch or away_key_mismatch or league_key_mismatch)
+        fallback_reason = str(second_half_context.get("fallback_reason") or "")
+        if not fallback_reason and not (home_exists or away_exists or league_exists):
+            fallback_reason = "missing_2h_stats"
+
+        return {
+            "home_team_id": home_id,
+            "home_team_name": match_identity.get("home_team_name", "unknown"),
+            "home_exists_in_2h_json": home_exists,
+            "home_2h_sample": int(home_record.get("sample_matches") or second_half_context.get("team_sample_home", 0) or 0),
+            "home_2h_scored": float(second_half_context.get("home_2h_scored", home_record.get("weighted_2h_scored_avg_final", 0.5)) or 0.5),
+            "home_2h_conceded": float(second_half_context.get("home_2h_conceded", home_record.get("weighted_2h_conceded_avg_final", 0.5)) or 0.5),
+            "home_2h_stats_source": home_source,
+            "away_team_id": away_id,
+            "away_team_name": match_identity.get("away_team_name", "unknown"),
+            "away_exists_in_2h_json": away_exists,
+            "away_2h_sample": int(away_record.get("sample_matches") or second_half_context.get("team_sample_away", 0) or 0),
+            "away_2h_scored": float(second_half_context.get("away_2h_scored", away_record.get("weighted_2h_scored_avg_final", 0.5)) or 0.5),
+            "away_2h_conceded": float(second_half_context.get("away_2h_conceded", away_record.get("weighted_2h_conceded_avg_final", 0.5)) or 0.5),
+            "away_2h_stats_source": away_source,
+            "league_id": league_id,
+            "league_name": match_identity.get("league_name", "unknown"),
+            "league_exists_in_2h_json": league_exists,
+            "league_2h_sample": int(league_record.get("sample_matches") or second_half_context.get("league_sample", 0) or 0),
+            "league_2h_factor": float(second_half_context.get("league_2h_factor", 1.0) or 1.0),
+            "league_2h_stats_source": league_source,
+            "team_2h_factor": float(second_half_context.get("team_2h_factor", 1.0) or 1.0),
+            "score_state_factor": float(second_half_context.get("score_state_factor", 1.0) or 1.0),
+            "context_multiplier": float(second_half_context.get("context_multiplier", 1.0) or 1.0),
+            "applied_context_multiplier": float(second_half_context.get("applied_context_multiplier", 1.0) or 1.0),
+            "sample_confidence": float(second_half_context.get("sample_confidence", 0.0) or 0.0),
+            "raw_context_multiplier": float(second_half_context.get("raw_context_multiplier", 1.0) or 1.0),
+            "fallback_reason": fallback_reason,
+            "probability_changed": bool(second_half_context.get("probability_changed", False)),
+            "possible_key_type_mismatch": possible_key_type_mismatch,
+        }
+    except Exception:
+        logger.exception("[2H_FACTOR_CONTEXT_BUILD_ERR]")
+        return {
+            "home_exists_in_2h_json": False,
+            "away_exists_in_2h_json": False,
+            "league_exists_in_2h_json": False,
+            "fallback_reason": "context_build_error",
+            "possible_key_type_mismatch": False,
+        }
+
+
+def _log_season_factor_context(match_identity: dict, team_boosts: dict, season_context_factor_45p: float) -> None:
+    if not ENABLE_FACTOR_CONTEXT_LOGS:
+        return
+    try:
+        logger.info(
+            '[SEASON_FACTOR_CONTEXT] fixture_id=%s league="%s" league_id=%s league_country="%s" league_type="%s" is_cup=%s is_cup_source=%s league_avg_goals=%.3f league_factor=%.3f league_avg_team=%.3f home="%s" home_id=%s home_matches=%s home_avg_scored_raw=%s home_avg_conceded_raw=%s home_gf_used=%.3f home_ga_used=%.3f home_attack_factor=%.3f home_defense_factor=%.3f away="%s" away_id=%s away_matches=%s away_avg_scored_raw=%s away_avg_conceded_raw=%s away_gf_used=%.3f away_ga_used=%.3f away_attack_factor=%.3f away_defense_factor=%.3f team_mix_factor=%.3f combined_M=%.3f season_context_factor_45p=%.3f',
+            match_identity.get("fixture_id"),
+            match_identity.get("league_name", "unknown"),
+            match_identity.get("league_id"),
+            match_identity.get("league_country", "unknown"),
+            match_identity.get("league_type", "Unknown"),
+            match_identity.get("is_cup"),
+            match_identity.get("is_cup_source", "unknown"),
+            float(team_boosts.get("league_avg_goals", 0.0) or 0.0),
+            float(team_boosts.get("league_factor", 1.0) or 1.0),
+            float(team_boosts.get("league_avg_team", 0.0) or 0.0),
+            match_identity.get("home_team_name", team_boosts.get("home_team", "unknown")),
+            match_identity.get("home_team_id"),
+            int(team_boosts.get("home_matches", 0) or 0),
+            team_boosts.get("home_avg_scored_raw"),
+            team_boosts.get("home_avg_conceded_raw"),
+            float(team_boosts.get("home_gf_used", 0.0) or 0.0),
+            float(team_boosts.get("home_ga_used", 0.0) or 0.0),
+            float(team_boosts.get("home_attack_factor", 1.0) or 1.0),
+            float(team_boosts.get("home_defense_factor", 1.0) or 1.0),
+            match_identity.get("away_team_name", team_boosts.get("away_team", "unknown")),
+            match_identity.get("away_team_id"),
+            int(team_boosts.get("away_matches", 0) or 0),
+            team_boosts.get("away_avg_scored_raw"),
+            team_boosts.get("away_avg_conceded_raw"),
+            float(team_boosts.get("away_gf_used", 0.0) or 0.0),
+            float(team_boosts.get("away_ga_used", 0.0) or 0.0),
+            float(team_boosts.get("away_attack_factor", 1.0) or 1.0),
+            float(team_boosts.get("away_defense_factor", 1.0) or 1.0),
+            float(team_boosts.get("team_mix_factor", 1.0) or 1.0),
+            float(team_boosts.get("combined_m", 1.0) or 1.0),
+            float(season_context_factor_45p or 1.0),
+        )
+    except Exception:
+        logger.exception("[SEASON_FACTOR_CONTEXT_ERR]")
+
+
+def _log_2h_factor_context(match_identity: dict, factor_context: dict, minute: int) -> None:
+    if not ENABLE_FACTOR_CONTEXT_LOGS:
+        return
+    try:
+        logger.info(
+            '[2H_FACTOR_CONTEXT] fixture_id=%s minute=%s league="%s" league_id=%s league_type="%s" is_cup=%s league_exists_in_2h_json=%s league_sample=%s league_2h_factor=%.3f league_2h_stats_source=%s home="%s" home_id=%s home_exists_in_2h_json=%s home_sample=%s home_2h_scored=%.3f home_2h_conceded=%.3f home_2h_stats_source=%s away="%s" away_id=%s away_exists_in_2h_json=%s away_sample=%s away_2h_scored=%.3f away_2h_conceded=%.3f away_2h_stats_source=%s team_2h_factor=%.3f score_state_factor=%.3f context_multiplier=%.3f applied_context_multiplier=%.3f sample_confidence=%.3f raw_context_multiplier=%.3f fallback_reason=%s probability_changed=%s possible_key_type_mismatch=%s',
+            match_identity.get("fixture_id"),
+            minute,
+            match_identity.get("league_name", "unknown"),
+            match_identity.get("league_id"),
+            match_identity.get("league_type", "Unknown"),
+            match_identity.get("is_cup"),
+            bool(factor_context.get("league_exists_in_2h_json", False)),
+            int(factor_context.get("league_2h_sample", 0) or 0),
+            float(factor_context.get("league_2h_factor", 1.0) or 1.0),
+            factor_context.get("league_2h_stats_source", "missing"),
+            match_identity.get("home_team_name", "unknown"),
+            match_identity.get("home_team_id"),
+            bool(factor_context.get("home_exists_in_2h_json", False)),
+            int(factor_context.get("home_2h_sample", 0) or 0),
+            float(factor_context.get("home_2h_scored", 0.5) or 0.5),
+            float(factor_context.get("home_2h_conceded", 0.5) or 0.5),
+            factor_context.get("home_2h_stats_source", "missing"),
+            match_identity.get("away_team_name", "unknown"),
+            match_identity.get("away_team_id"),
+            bool(factor_context.get("away_exists_in_2h_json", False)),
+            int(factor_context.get("away_2h_sample", 0) or 0),
+            float(factor_context.get("away_2h_scored", 0.5) or 0.5),
+            float(factor_context.get("away_2h_conceded", 0.5) or 0.5),
+            factor_context.get("away_2h_stats_source", "missing"),
+            float(factor_context.get("team_2h_factor", 1.0) or 1.0),
+            float(factor_context.get("score_state_factor", 1.0) or 1.0),
+            float(factor_context.get("context_multiplier", 1.0) or 1.0),
+            float(factor_context.get("applied_context_multiplier", 1.0) or 1.0),
+            float(factor_context.get("sample_confidence", 0.0) or 0.0),
+            float(factor_context.get("raw_context_multiplier", 1.0) or 1.0),
+            factor_context.get("fallback_reason", ""),
+            bool(factor_context.get("probability_changed", False)),
+            bool(factor_context.get("possible_key_type_mismatch", False)),
+        )
+    except Exception:
+        logger.exception("[2H_FACTOR_CONTEXT_ERR]")
+
+
+def _log_factor_stack(
+    match_identity: dict,
+    minute: int,
+    score_state: str,
+    live_intensity: float,
+    game_state_factor: float,
+    goal_xg_gap_factor: float,
+    xg_delta_factor: float,
+    urgency_factor: float,
+    season_context_factor_45p: float,
+    second_half_context: dict,
+    applied_context_multiplier: float,
+    baseline_prob_next_15: float,
+    final_prob_next_15: float,
+    baseline_prob_to90: float,
+    final_prob_to90: float,
+) -> None:
+    if not ENABLE_FACTOR_CONTEXT_LOGS:
+        return
+    try:
+        logger.info(
+            '[FACTOR_STACK] fixture_id=%s minute=%s home="%s" away="%s" league="%s" score_state=%s live_intensity=%.3f game_state_factor=%.3f goal_xg_gap_factor=%.3f xg_delta_factor=%.3f urgency_factor=%.3f season_context_factor_45p=%.3f team_2h_factor=%.3f league_2h_factor=%.3f score_state_factor=%.3f context_multiplier=%.3f applied_context_multiplier=%.3f baseline_prob_next_15=%.2f final_prob_next_15=%.2f baseline_prob_to90=%.2f final_prob_to90=%.2f decision_remain_metric=prob_to90 prob_until_end_decision=%.2f',
+            match_identity.get("fixture_id"),
+            minute,
+            match_identity.get("home_team_name", "unknown"),
+            match_identity.get("away_team_name", "unknown"),
+            match_identity.get("league_name", "unknown"),
+            score_state,
+            float(live_intensity or 0.0),
+            float(game_state_factor or 1.0),
+            float(goal_xg_gap_factor or 1.0),
+            float(xg_delta_factor or 1.0),
+            float(urgency_factor or 1.0),
+            float(season_context_factor_45p or 1.0),
+            float(second_half_context.get("team_2h_factor", 1.0) or 1.0),
+            float(second_half_context.get("league_2h_factor", 1.0) or 1.0),
+            float(second_half_context.get("score_state_factor", 1.0) or 1.0),
+            float(second_half_context.get("context_multiplier", 1.0) or 1.0),
+            float(applied_context_multiplier or 1.0),
+            float(baseline_prob_next_15 or 0.0),
+            float(final_prob_next_15 or 0.0),
+            float(baseline_prob_to90 or 0.0),
+            float(final_prob_to90 or 0.0),
+            float(final_prob_to90 or 0.0),
+        )
+    except Exception:
+        logger.exception("[FACTOR_STACK_ERR]")
 
 
 def calc_match_team_boost_v2(fixture_metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -7860,6 +11471,16 @@ def build_review_message(fx: Dict[str, Any], stats: Dict[str, Any], computed: Di
     save_stress_color = get_color('save_stress', save_stress, minute)
     possession_color = get_color('possession_pressure', possession_pressure, minute)
 
+    probability_lines = []
+    if minute < 75:
+        probability_lines.append(
+            f"Гол в ближайшие 15 минут: {_format_probability_percent(probs.get('prob_next_15', probs.get('prob_75')))}%"
+        )
+    probability_lines.append(
+        f"Гол до конца основного времени: {_format_probability_percent(probs.get('prob_90'))}%"
+    )
+    probability_text = "\n".join(probability_lines)
+
     admin_message = f"""
 👁️ Босс, нужен совет
 
@@ -7869,8 +11490,7 @@ def build_review_message(fx: Dict[str, Any], stats: Dict[str, Any], computed: Di
 
 Счет: {signal_score} {minute} минута 
 
-Вероятность гола до 75 минуты: {float(probs.get('prob_75') or 0.0):.1f}%
-Вероятность гола до 90 минуты: {float(probs.get('prob_90') or 0.0):.1f}%
+{probability_text}
 
 xG до {minute} минуты: {float(stats.get('xg_home') or 0.0):.2f} - {float(stats.get('xg_away') or 0.0):.2f}
 
@@ -8073,7 +11693,7 @@ def build_review_card(data: Dict[str, Any], prob: float, minute: int, fixture_id
     derived_possession_pressure = abs(float(possession_home) - float(possession_away)) / 100.0
 
     res = compute_lambda_and_probability(fixture_metrics, minute)
-    prob_75 = res.get("prob_goal_either_to75") if res else None
+    prob_next_15 = res.get("prob_next_15") if res else None
     prob_90 = res.get("prob_goal_either_to90") if res else None
 
     minute_display = format_match_minute(fixture_metrics, minute)
@@ -8114,7 +11734,7 @@ def build_review_card(data: Dict[str, Any], prob: float, minute: int, fixture_id
     }
 
     probs = {
-        "prob_75": prob_75,
+        "prob_next_15": prob_next_15,
         "prob_90": prob_90
     }
 
@@ -8423,25 +12043,25 @@ def send_review_to_admin(fixture_id: int, data: Dict[str, Any], prob: float, min
                         reason,
                     )
                 else:
-                    base_prob_75 = float(prob)
+                    base_prob_next_15 = float(prob)
                     base_prob_90 = float(prob)
                     try:
                         fixture_metrics_auto = data.get("fixture", {}) or {}
                         minute_auto = int(minute or 0)
                         res_auto = compute_lambda_and_probability(fixture_metrics_auto, minute_auto)
                         if isinstance(res_auto, dict):
-                            base_prob_75 = float(res_auto.get("prob_goal_either_to75", base_prob_75) or base_prob_75)
+                            base_prob_next_15 = float(res_auto.get("prob_next_15", base_prob_next_15) or base_prob_next_15)
                             base_prob_90 = float(res_auto.get("prob_goal_either_to90", base_prob_90) or base_prob_90)
                     except Exception:
                         logger.exception("[PROB_BOOST] failed to fetch base probabilities for auto-post fixture=%s", fixture_id)
 
                     league_avg_for_boost = float(league_avg) if league_avg is not None else float(DEFAULT_LEAGUE_AVG_GOALS)
-                    boosted_prob_75 = _apply_auto_signal_prob_boost(base_prob_75, signal_rating, league_avg_for_boost, metric="prob75")
+                    boosted_prob_next_15 = _apply_auto_signal_prob_boost(base_prob_next_15, signal_rating, league_avg_for_boost, metric="prob_next_15")
                     boosted_prob_90 = _apply_auto_signal_prob_boost(base_prob_90, signal_rating, league_avg_for_boost, metric="prob90")
 
                     review_payload = {
                         "data": data,
-                        "prob": boosted_prob_75,
+                        "prob": boosted_prob_next_15,
                         "prob_90": boosted_prob_90,
                         "minute": minute,
                         "approved_by_admin": True,
@@ -8874,27 +12494,84 @@ def publish_signal_to_channel(fixture_id: int, review_info: Optional[Dict[str, A
             
         # Calculate probability for display (use existing compute logic)
         res = compute_lambda_and_probability(fixture_metrics, minute)
-        prob_actual_90 = review_info.get("prob_90")
-        if prob_actual_90 is None:
-            prob_actual_90 = res.get("prob_goal_either_to90", 0.0)
+        reputation_result = compute_probability_45_plus_with_reputation(
+            fixture_metrics,
+            minute,
+            application_context="admin_review_send",
+        )
+        prob_next_15 = reputation_result.get("prob_next_15", prob)
+        prob_actual_90 = reputation_result.get("prob_to90", 0.0)
+
+        channel_signal_filter = evaluate_channel_signal_filter(
+            prob_actual_90,
+            initial_score[0],
+            initial_score[1],
+            reputation_base_prob_to90=reputation_result.get(
+                "reputation_base_prob_to90"
+            ),
+            reputation_adjusted_prob_to90=reputation_result.get(
+                "reputation_adjusted_prob_to90"
+            ),
+            adjusted_intensity=reputation_result.get("adjusted_intensity"),
+            season_context_factor=reputation_result.get(
+                "season_context_factor_45p"
+            ),
+        )
+        logger.info(
+            "[CHANNEL_SIGNAL_FILTER] fixture_id=%s minute=%s route=admin_review "
+            "passed=%s reason=%s prob_to90=%.2f min_prob_to90=%.2f "
+            "score=%s-%s goals_at_snapshot=%s reputation_delta_to90_pp=%.2f "
+            "min_reputation_delta_to90_pp=%.2f adjusted_intensity=%.3f "
+            "min_adjusted_intensity=%.3f season_context_factor=%.3f "
+            "min_season_context_factor=%.3f version=%s",
+            fixture_id,
+            minute,
+            channel_signal_filter["passed"],
+            channel_signal_filter["reason"],
+            _safe_float(channel_signal_filter.get("prob_to90"), 0.0),
+            CHANNEL_SIGNAL_MIN_PROB_TO90,
+            channel_signal_filter.get("score_home"),
+            channel_signal_filter.get("score_away"),
+            channel_signal_filter.get("goals_at_snapshot"),
+            _safe_float(
+                channel_signal_filter.get("reputation_delta_to90_pp"), 0.0
+            ),
+            CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP,
+            _safe_float(channel_signal_filter.get("adjusted_intensity"), 0.0),
+            CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY,
+            _safe_float(channel_signal_filter.get("season_context_factor"), 0.0),
+            CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR,
+            CHANNEL_SIGNAL_FILTER_VERSION,
+        )
+        if not channel_signal_filter["passed"]:
+            logger.info(
+                "[REVIEW] Signal blocked by channel high-precision filter "
+                "fixture_id=%s reason=%s",
+                fixture_id,
+                channel_signal_filter["reason"],
+            )
+            return False
         
         # Format initial signal message: immutable snapshot header only
         is_admin_approved = review_info.get("approved_by_admin", False)
+        premium_badge = qualifies_for_premium_badge(channel_signal_filter)
         snapshot_data = _build_signal_snapshot_data(
             collected=data,
-            prob_display=prob,
+            prob_display=prob_next_15,
             signal_score=initial_score,
             signal_minute=minute,
             prob_display_90=prob_actual_90,
             is_admin_approved=is_admin_approved,
+            premium_badge=premium_badge,
         )
         header_text = build_signal_header(snapshot_data)
         msg = render_live_message(
             current_data=data,
             signal_score=initial_score,
-            prob_display=prob,
+            prob_display=prob_next_15,
             prob_display_90=prob_actual_90,
             is_admin_approved=is_admin_approved,
+            premium_badge=premium_badge,
         )
         
         # Send to channel
@@ -8916,14 +12593,20 @@ def publish_signal_to_channel(fixture_id: int, review_info: Optional[Dict[str, A
                     chat_id=int(TELEGRAM_CHAT_ID),
                     prob_to75=prob,
                     prob_to90=prob_actual_90,
+                    prob_next_15=prob_next_15,
+                    prob_until_end_decision=prob_actual_90,
+                    decision_remain_metric="prob_to90",
+                    signal_model="45_plus",
+                    signal_route="primary",
+                    premium_badge=premium_badge,
                 )
             # Calculate initial PressureIndex
             initial_pressure = calculate_pressure_index(fixture_metrics)
             initial_momentum = 0.0
             
-            # Extract probability values
-            prob_next_15 = res.get("prob_next_15", prob)
-            prob_until_end = res.get("prob_until_end", prob)
+            # Keep persisted/admin telemetry aligned with the expanded values
+            # that were actually displayed and passed the channel filter.
+            prob_until_end = prob_actual_90
             league_factor_used = res.get("league_factor", 1.0)
             _score01_final, match_score_value, _score_metrics = compute_match_score_v2(fixture_metrics, league_factor_used)
             
@@ -8962,15 +12645,14 @@ def publish_signal_to_channel(fixture_id: int, review_info: Optional[Dict[str, A
             xg_delta = xg_home - xg_away
             shots_ratio = (shots_on_target_home + 1.0) / (shots_on_target_away + 1.0) if shots_on_target_away + 1.0 > 0 else 1.0
             
-            total_saves = saves_home + saves_away
-            total_goals = initial_score[0] + initial_score[1]
-            total_sot = shots_on_target_home + shots_on_target_away
-            if total_sot <= 1.0:
-                save_stress = 0.0
-            else:
-                save_raw = (total_saves + 0.5 * total_goals) / 4.0
-                volume_factor_saves = min(1.0, total_sot / 4.0)
-                save_stress = min(save_raw * volume_factor_saves, 1.0)
+            save_stress = calculate_save_stress(
+                saves_home=saves_home,
+                saves_away=saves_away,
+                current_home_score=initial_score[0],
+                current_away_score=initial_score[1],
+                shots_on_target_home=shots_on_target_home,
+                shots_on_target_away=shots_on_target_away,
+            )
             
             possession_diff = abs(possession_home - possession_away)
             if possession_diff > 1.0:
@@ -9587,6 +13269,130 @@ def get_candidate_report_date_msk(now_dt_msk: Optional[datetime] = None):
     return now_val.date() - timedelta(days=1)
 
 
+def _load_local_jsonl_records(path: str) -> List[Dict[str, Any]]:
+    """Read valid dict records from a local JSONL file."""
+    records: List[Dict[str, Any]] = []
+    try:
+        if not path or not os.path.exists(path):
+            return records
+        with _jsonl_file_lock:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line_number, raw_line in enumerate(fh, start=1):
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        logger.warning(
+                            "[DAILY_STATS_LOCAL] invalid_jsonl path=%s line=%s",
+                            path,
+                            line_number,
+                        )
+                        continue
+                    if isinstance(payload, dict):
+                        records.append(payload)
+    except Exception:
+        logger.exception("[DAILY_STATS_LOCAL] failed_to_read path=%s", path)
+    return records
+
+
+def _local_record_signal_date_msk(record: Dict[str, Any]) -> Optional[str]:
+    explicit_date = str(record.get("date") or "").strip()
+    if explicit_date:
+        try:
+            return datetime.strptime(explicit_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    timestamp = _parse_api_datetime_utc(record.get("timestamp_utc"))
+    if timestamp is None:
+        return None
+    return timestamp.astimezone(_MSK_TZ).strftime("%Y-%m-%d")
+
+
+def collect_local_report_matches(report_date_msk) -> Dict[str, Any]:
+    """Collect one locally resolved outcome per signalled fixture for an MSK day."""
+    if isinstance(report_date_msk, str):
+        target_date = datetime.strptime(report_date_msk, "%Y-%m-%d").date()
+    elif isinstance(report_date_msk, datetime):
+        target_date = report_date_msk.astimezone(_MSK_TZ).date()
+    else:
+        target_date = report_date_msk
+    report_date_str = target_date.strftime("%Y-%m-%d")
+
+    candidate_ids: Set[int] = set(_get_relevant_report_match_ids(target_date))
+    snapshots = _load_local_jsonl_records(MATCH_SNAPSHOTS_JSONL_PATH)
+    outcomes = _load_local_jsonl_records(MATCH_OUTCOMES_JSONL_PATH)
+
+    for snapshot in snapshots:
+        if _local_record_signal_date_msk(snapshot) != report_date_str:
+            continue
+        fixture_id = _safe_int(snapshot.get("fixture_id"), 0)
+        if fixture_id > 0 and bool(snapshot.get("signal_sent", True)):
+            candidate_ids.add(fixture_id)
+
+    # State records are a recovery source when a snapshot write failed.
+    with state_lock:
+        training_records = state.get("training_signal_records", {})
+        training_values = list(training_records.values()) if isinstance(training_records, dict) else []
+    for record in training_values:
+        if not isinstance(record, dict) or _local_record_signal_date_msk(record) != report_date_str:
+            continue
+        fixture_id = _safe_int(record.get("fixture_id"), 0)
+        if fixture_id > 0:
+            candidate_ids.add(fixture_id)
+
+    outcome_by_fixture: Dict[int, Dict[str, Any]] = {}
+    outcome_order: Dict[int, str] = {}
+    for outcome in outcomes:
+        if _local_record_signal_date_msk(outcome) != report_date_str:
+            continue
+        fixture_id = _safe_int(outcome.get("fixture_id"), 0)
+        normal_time_result = str(outcome.get("normal_time_result") or "").upper()
+        if fixture_id <= 0 or normal_time_result not in {"WIN", "LOSS"}:
+            continue
+        candidate_ids.add(fixture_id)
+        order_key = str(
+            outcome.get("normal_time_resolved_at_utc")
+            or outcome.get("outcome_saved_utc")
+            or outcome.get("timestamp_utc")
+            or ""
+        )
+        if fixture_id not in outcome_by_fixture or order_key >= outcome_order.get(fixture_id, ""):
+            outcome_by_fixture[fixture_id] = dict(outcome)
+            outcome_order[fixture_id] = order_key
+
+    matches: List[Dict[str, Any]] = []
+    unresolved_ids: List[int] = []
+    for fixture_id in sorted(candidate_ids):
+        outcome = outcome_by_fixture.get(fixture_id)
+        if outcome is None:
+            unresolved_ids.append(fixture_id)
+            continue
+        matches.append(
+            {
+                "match_id": int(fixture_id),
+                "fixture_id": int(fixture_id),
+                "outcome": outcome,
+                "is_finished": True,
+                "source": "local_jsonl",
+            }
+        )
+
+    return {
+        "report_date": target_date,
+        "source": "local_jsonl",
+        "snapshots_loaded": len(snapshots),
+        "outcomes_loaded": len(outcomes),
+        "candidate_match_ids": sorted(candidate_ids),
+        "matches": matches,
+        "resolved_matches": len(matches),
+        "unresolved_ids": unresolved_ids,
+        "all_finished": bool(candidate_ids) and not unresolved_ids,
+    }
+
+
 def collect_report_matches(
     report_date_msk,
     client: Optional[APISportsMetricsClient] = None,
@@ -9694,14 +13500,26 @@ def build_daily_report(report_date_msk, matches: List[Dict[str, Any]]) -> Option
     first_goal_minutes: List[int] = []
 
     for item in matches:
-        row = item.get("row") or {}
-        goal_flag = str(row.get("гол до конца матча", "")).strip()
-        if goal_flag == "1":
-            plus += 1
-        elif goal_flag == "0":
-            minus += 1
+        outcome = item.get("outcome") if isinstance(item, dict) else None
+        if isinstance(outcome, dict):
+            normal_time_result = str(outcome.get("normal_time_result") or "").upper()
+            if normal_time_result == "WIN":
+                plus += 1
+            elif normal_time_result == "LOSS":
+                minus += 1
+            minute_val = _safe_int(outcome.get("first_goal_after_signal_minute"), -1)
+            if minute_val < 0:
+                minute_val = None
+        else:
+            # Legacy row support is retained for callers outside daily reporting.
+            row = item.get("row") or {}
+            goal_flag = str(row.get("гол до конца матча", "")).strip()
+            if goal_flag == "1":
+                plus += 1
+            elif goal_flag == "0":
+                minus += 1
+            minute_val = _parse_sheet_int(row.get("минута первого гола", ""))
 
-        minute_val = _parse_sheet_int(row.get("минута первого гола", ""))
         if minute_val is not None:
             first_goal_minutes.append(int(minute_val))
             if minute_val <= 60:
@@ -9932,7 +13750,7 @@ def _get_unfinished_match_ids(rows: list) -> List[str]:
 def format_daily_stats_message(date_str: str) -> str:
     """
     Format daily statistics message for Telegram.
-    Uses Google Sheets as single source of truth.
+    Uses local signal snapshots and resolved outcome JSONL as source of truth.
     
     Args:
         date_str: Date in YYYY-MM-DD format (MSK)
@@ -9941,12 +13759,15 @@ def format_daily_stats_message(date_str: str) -> str:
         Formatted message text or None if no data
     """
     try:
-        payload = build_daily_report_from_sheets(date_str, client=None, lookback_days=3, max_rows=2000)
+        collected = collect_local_report_matches(date_str)
+        if not bool(collected.get("all_finished", False)):
+            return None
+        payload = build_daily_report(date_str, list(collected.get("matches") or []))
         if not payload:
             return None
         return str(payload.get("message") or "") or None
     except Exception:
-        logger.exception("[SHEETS] Failed to format daily stats message for %s", date_str)
+        logger.exception("[DAILY_STATS_LOCAL] Failed to format daily stats message for %s", date_str)
         return None
 
 def format_red_eye_strategy_message() -> str:
@@ -10251,7 +14072,7 @@ def send_daily_stats():
         logger.info(f"[STATS] No data to send for {date_str}")
 
 def unpin_chat_message(message_id: int) -> bool:
-    """Unpin a specific message in the chat (deprecated - no longer used)."""
+    """Unpin a specific message in the channel."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/unpinChatMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id}
@@ -10267,7 +14088,7 @@ def unpin_chat_message(message_id: int) -> bool:
         return False
 
 def pin_chat_message(message_id: int) -> bool:
-    """Pin a message in the chat without notification (deprecated - no longer used)."""
+    """Pin a message in the channel without notification."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
         payload = {
@@ -10285,6 +14106,57 @@ def pin_chat_message(message_id: int) -> bool:
     except Exception:
         logger.exception(f"[TG] Error pinning message {message_id}")
         return False
+
+
+def rotate_pinned_daily_report(new_message_id: int) -> bool:
+    """Make the new daily report the only bot-managed pinned stats message.
+
+    The permanent instruction message has its own ID and is never touched here.
+    The new report is pinned first, so a temporary Telegram error cannot leave
+    the channel without the previous pinned statistics.
+    """
+    new_id = _safe_int(new_message_id, 0)
+    if new_id <= 0:
+        return False
+
+    with persistent_state_lock:
+        previous_id = (
+            persistent_state.get("pinned_daily_msg_id")
+            or persistent_state.get("pinned_daily_stats_message_id")
+            or STATS_MESSAGE_ID
+        )
+        instruction_id = persistent_state.get("instruction_message_id")
+
+    previous_id_int = _safe_int(previous_id, 0)
+    instruction_id_int = _safe_int(instruction_id, 0)
+
+    if not pin_chat_message(new_id):
+        logger.warning("[DAILY_STATS_PIN] failed_to_pin new_message_id=%s", new_id)
+        return False
+
+    if (
+        previous_id_int > 0
+        and previous_id_int != new_id
+        and previous_id_int != instruction_id_int
+    ):
+        if not unpin_chat_message(previous_id_int):
+            logger.warning(
+                "[DAILY_STATS_PIN] old_report_remains_pinned old_message_id=%s new_message_id=%s",
+                previous_id_int,
+                new_id,
+            )
+
+    with persistent_state_lock:
+        persistent_state["pinned_daily_msg_id"] = int(new_id)
+        persistent_state["pinned_daily_stats_message_id"] = int(new_id)
+    save_persistent_state()
+    logger.info(
+        "[DAILY_STATS_PIN] rotated old_message_id=%s new_message_id=%s instruction_untouched=%s",
+        previous_id_int or None,
+        new_id,
+        instruction_id_int or None,
+    )
+    return True
 
 def get_bot_username() -> Optional[str]:
     """Get bot username via Telegram API."""
@@ -10406,6 +14278,45 @@ def handle_message(message: Dict[str, Any]):
         
         # Only handle private messages
         if chat_type != "private":
+            return
+
+        analysis_key = (
+            signal_analysis_ui.parse_analysis_start(text)
+            if ENABLE_SIGNAL_ANALYSIS_UI and signal_analysis_ui is not None
+            else None
+        )
+        if analysis_key:
+            snapshot, snapshot_status = signal_analysis_ui.load_analysis_snapshot(
+                analysis_key,
+                SIGNAL_ANALYSIS_INDEX_FILE,
+                SIGNAL_ANALYSIS_CACHE_TTL_SECONDS,
+            )
+            logger.info(
+                "[ANALYSIS_UI_OPEN] user_id=%s signal_key=%s screen=overview snapshot_found=%s",
+                user_id, analysis_key, bool(snapshot),
+            )
+            if snapshot is not None and signal_analysis_ui.can_access_analysis(int(user_id or 0), snapshot):
+                analysis_text = signal_analysis_ui.build_analysis_overview(snapshot)
+                analysis_keyboard = signal_analysis_ui.build_navigation_keyboard(
+                    analysis_key, SIGNAL_ANALYSIS_CALLBACK_PREFIX
+                )
+            else:
+                analysis_text = "Аналитика этого сигнала уже недоступна. Основной сигнал остаётся в канале."
+                analysis_keyboard = None
+            try:
+                payload = {"chat_id": chat_id, "text": analysis_text, "parse_mode": "HTML"}
+                if analysis_keyboard:
+                    payload["reply_markup"] = json.dumps(analysis_keyboard, ensure_ascii=False)
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    data=payload,
+                    timeout=10,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[ANALYSIS_UI_ERROR] stage=deep_link signal_key=%s error_type=%s",
+                    analysis_key, type(exc).__name__,
+                )
             return
         
         logger.info(f"[TG] Received message from user {user_id}: {text}")
@@ -10533,6 +14444,47 @@ def handle_callback_query(callback_query: Dict[str, Any]):
         
         # Always answer callback to prevent infinite loading
         answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+
+        if ENABLE_SIGNAL_ANALYSIS_UI and signal_analysis_ui is not None and signal_analysis_ui.is_analysis_callback(
+            callback_data, SIGNAL_ANALYSIS_CALLBACK_PREFIX
+        ):
+            def answer_analysis(callback_query_id: str, text: str, show_alert: bool) -> bool:
+                response = requests.post(
+                    answer_url,
+                    data={"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert},
+                    timeout=5,
+                )
+                return bool(response.ok)
+
+            def edit_analysis(chat_id: int, message_id: int, text: str, keyboard: Dict[str, Any]) -> bool:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
+                    data={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "reply_markup": json.dumps(keyboard, ensure_ascii=False),
+                    },
+                    timeout=10,
+                )
+                if not response.ok:
+                    raise RuntimeError(f"Telegram editMessageText HTTP {response.status_code}")
+                body = response.json()
+                if not body.get("ok"):
+                    raise RuntimeError("Telegram editMessageText returned ok=False")
+                return True
+
+            signal_analysis_ui.handle_analysis_callback(
+                callback_query,
+                prefix=SIGNAL_ANALYSIS_CALLBACK_PREFIX,
+                index_file=SIGNAL_ANALYSIS_INDEX_FILE,
+                ttl_seconds=SIGNAL_ANALYSIS_CACHE_TTL_SECONDS,
+                answer_callback=answer_analysis,
+                edit_message=edit_analysis,
+                logger=logger,
+            )
+            return
         
         # Handle REVIEW mode callbacks (review_send:<fixture_id> or review_skip:<fixture_id>)
         if callback_data.startswith("review_"):
@@ -10938,43 +14890,51 @@ def maybe_send_daily_report(max_rows: int = 2500) -> None:
         logger.info("[DAILY_STATS] already_sent report_date=%s", report_date_str)
         return
 
-    api_client = APISportsMetricsClient(api_key=API_FOOTBALL_KEY, host=API_FOOTBALL_HOST, cache_ttl=CACHE_TTL)
+    _ = max_rows  # kept for backward-compatible callers; local JSONL is not row-limited
+    collected = collect_local_report_matches(report_date)
+    candidate_ids = list(collected.get("candidate_match_ids") or [])
+    unresolved_ids = list(collected.get("unresolved_ids") or [])
 
-    completion = _collect_report_matches_finish_state(report_date_msk=report_date, client=api_client)
-    report_matches_total = int(completion.get("report_matches_total", 0) or 0)
-    report_matches_finished = int(completion.get("report_matches_finished", 0) or 0)
-    unfinished_matches = int(completion.get("unfinished_matches", 0) or 0)
-    unfinished_ids = list(completion.get("unfinished_ids") or [])
+    # A finished fixture can occasionally miss its outcome write after a restart
+    # or temporary API failure. Recover it before deciding that the report is not ready.
+    if unresolved_ids:
+        api_client = APISportsMetricsClient(
+            api_key=API_FOOTBALL_KEY,
+            host=API_FOOTBALL_HOST,
+            cache_ttl=CACHE_TTL,
+        )
+        recovered = 0
+        for fixture_id in unresolved_ids:
+            if not _is_finished_match_for_stats(int(fixture_id), {}, api_client):
+                continue
+            process_match_outcomes_for_jsonl(int(fixture_id), api_client)
+            recovered += 1
+        if recovered:
+            collected = collect_local_report_matches(report_date)
+            candidate_ids = list(collected.get("candidate_match_ids") or [])
+            unresolved_ids = list(collected.get("unresolved_ids") or [])
 
-    logger.info("[DAILY_STATS] report_matches_total=%s", report_matches_total)
-    logger.info("[DAILY_STATS] report_matches_finished=%s", report_matches_finished)
-    logger.info("[DAILY_STATS] unfinished_matches=%s", unfinished_matches)
-    if unfinished_ids:
-        logger.info("[DAILY_STATS] unfinished_ids=%s", unfinished_ids)
-
-    if not bool(completion.get("all_finished", False)):
-        logger.info("[DAILY_STATS] waiting_for_all_matches_to_finish report_date=%s", report_date_str)
-        return
-
-    collected = collect_report_matches(report_date_msk=report_date, client=api_client, max_rows=max_rows)
-    rows_loaded = int(collected.get("rows_loaded", 0) or 0)
     matches = list(collected.get("matches") or [])
-
-    logger.info("[DAILY_STATS] rows_loaded=%s", rows_loaded)
-    logger.info("[DAILY_STATS] unique_matches_in_window=%s", len(matches))
-
-    all_finished, unfinished_ids = are_all_matches_finished(matches)
-    logger.info("[DAILY_STATS] unfinished_matches=%s", len(unfinished_ids))
-    if unfinished_ids:
-        logger.info("[DAILY_STATS] unfinished_ids=%s", unfinished_ids)
+    logger.info(
+        "[DAILY_STATS_LOCAL] report_date=%s candidates=%s resolved=%s unresolved=%s "
+        "snapshots_loaded=%s outcomes_loaded=%s source=local_jsonl",
+        report_date_str,
+        len(candidate_ids),
+        len(matches),
+        len(unresolved_ids),
+        int(collected.get("snapshots_loaded", 0) or 0),
+        int(collected.get("outcomes_loaded", 0) or 0),
+    )
+    if unresolved_ids:
+        logger.info("[DAILY_STATS_LOCAL] unresolved_ids=%s", unresolved_ids)
         logger.info("[DAILY_STATS] waiting_for_all_matches_to_finish report_date=%s", report_date_str)
         return
 
-    if not matches:
-        logger.info("[DAILY_STATS] waiting_for_all_matches_to_finish report_date=%s", report_date_str)
+    if not candidate_ids:
+        logger.info("[DAILY_STATS_LOCAL] no_signals report_date=%s", report_date_str)
         return
 
-    if not all_finished:
+    if not matches or not bool(collected.get("all_finished", False)):
         logger.info("[DAILY_STATS] waiting_for_all_matches_to_finish report_date=%s", report_date_str)
         return
 
@@ -10997,34 +14957,30 @@ def maybe_send_daily_report(max_rows: int = 2500) -> None:
         "reply_markup": json.dumps(get_channel_keyboard())
     }
     r = requests.post(url, data=payload, timeout=10)
+    new_daily_message_id = None
     if r.ok:
         logger.info("[DAILY_STATS] report sent report_date=%s", report_date_str)
+        try:
+            response_payload = r.json()
+            new_daily_message_id = _safe_int(
+                (response_payload.get("result") or {}).get("message_id"),
+                0,
+            )
+        except Exception:
+            logger.exception(
+                "[DAILY_STATS_PIN] send succeeded but message_id could not be parsed report_date=%s",
+                report_date_str,
+            )
     else:
         logger.warning("[DAILY_STATS] send failed report_date=%s err=%s", report_date_str, r.text)
 
-    pinned_id = None
-    with persistent_state_lock:
-        pinned_id = persistent_state.get("pinned_daily_msg_id") or persistent_state.get("pinned_daily_stats_message_id")
-        if pinned_id is None and STATS_MESSAGE_ID:
-            persistent_state["pinned_daily_msg_id"] = int(STATS_MESSAGE_ID)
-            persistent_state["pinned_daily_stats_message_id"] = int(STATS_MESSAGE_ID)
-            pinned_id = int(STATS_MESSAGE_ID)
-            save_persistent_state()
-
-    if pinned_id:
-        ok, status, retry_after = tg_edit_queue.edit_message_text(
-            chat_id=int(TELEGRAM_CHAT_ID),
-            message_id=int(pinned_id),
-            text=msg,
-            reply_markup=get_channel_keyboard(),
-            log_prefix="[DAILY_STATS] edit",
+    if r.ok and new_daily_message_id:
+        rotate_pinned_daily_report(new_daily_message_id)
+    elif r.ok:
+        logger.warning(
+            "[DAILY_STATS_PIN] report_not_rotated missing_message_id report_date=%s",
+            report_date_str,
         )
-        if ok:
-            logger.info("[DAILY_STATS] pinned message updated id=%s", pinned_id)
-        elif status in ("rate_limit", "chat_frozen"):
-            logger.info("[DAILY_STATS] pinned edit delayed retry_after=%ss", retry_after)
-        elif status not in ("unchanged", "not_modified"):
-            logger.warning("[DAILY_STATS] pinned edit failed status=%s", status)
 
     if r.ok:
         with persistent_state_lock:
@@ -11123,9 +15079,15 @@ def get_any_metric(fixture: Dict[str, Any], base_keys: List[str], side: str) -> 
 
     try:
         lower = {k.lower(): v for k, v in fixture.items() if isinstance(k, str)}
+        requested_side = side if side in ("home", "away") else None
+        opposite_side = "away" if requested_side == "home" else "home" if requested_side == "away" else None
         for bk in base_keys:
             bk_flat = bk.replace("_","")
             for k, v in lower.items():
+                if requested_side and opposite_side:
+                    key_flat = k.replace("-", "_")
+                    if key_flat.endswith(f"_{opposite_side}") or f"_{opposite_side}_" in key_flat:
+                        continue
                 if bk_flat in k.replace("_",""):
                     if isinstance(v, dict) and "value" in v:
                         try:
@@ -11311,25 +15273,116 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _metric_pair_available(fixture_metrics: Dict[str, Any], keys: List[str]) -> bool:
+    for side in ("home", "away"):
+        if has_value(get_any_metric(fixture_metrics, keys, side)):
+            return True
+    return False
+
+
+def build_stats_health_context(
+    fixture_metrics: Dict[str, Any],
+    has_raw_statistics: bool = False,
+) -> Dict[str, Any]:
+    """Diagnose whether raw statistics produced usable normalized live metrics."""
+    fixture_metrics = fixture_metrics if isinstance(fixture_metrics, dict) else {}
+    xg_available = _metric_pair_available(fixture_metrics, ["expected_goals"])
+    sot_available = _metric_pair_available(fixture_metrics, ["shots_on_target"])
+    box_available = _metric_pair_available(fixture_metrics, ["shots_insidebox", "shots_inside_box", "inside_box"])
+    total_shots_available = _metric_pair_available(fixture_metrics, ["total_shots"])
+    corners_available = _metric_pair_available(fixture_metrics, ["corner_kicks", "corners"])
+    attacks_available = _metric_pair_available(fixture_metrics, ["attacks", "dangerous_attacks"])
+    pressure_available = has_value(get_any_metric(fixture_metrics, ["pressure_index"], None)) or corners_available or attacks_available
+
+    metric_flags = {
+        "xg": xg_available,
+        "sot": sot_available,
+        "box": box_available,
+        "total_shots": total_shots_available,
+        "pressure": pressure_available,
+        "corners": corners_available,
+        "attacks": attacks_available,
+    }
+    normalized_metric_count = sum(1 for present in metric_flags.values() if present)
+    has_normalized_live_metrics = normalized_metric_count > 0
+    core_flags = {
+        "xg": xg_available,
+        "sot": sot_available,
+        "box": box_available,
+        "total_shots": total_shots_available,
+        "pressure": pressure_available,
+    }
+    missing_core_metrics = [name for name, present in core_flags.items() if not present]
+    if normalized_metric_count >= 3 and (xg_available or sot_available or box_available):
+        stats_health = "ok"
+    elif has_normalized_live_metrics:
+        stats_health = "partial"
+    else:
+        stats_health = "bad"
+
+    return {
+        "has_raw_statistics": bool(has_raw_statistics),
+        "has_normalized_live_metrics": bool(has_normalized_live_metrics),
+        "normalized_metric_count": int(normalized_metric_count),
+        "missing_core_metrics": missing_core_metrics,
+        "xg_available": bool(xg_available),
+        "sot_available": bool(sot_available),
+        "box_available": bool(box_available),
+        "total_shots_available": bool(total_shots_available),
+        "pressure_available": bool(pressure_available),
+        "corners_available": bool(corners_available),
+        "attacks_available": bool(attacks_available),
+        "stats_health": stats_health,
+    }
+
+
+def log_stats_health(
+    fixture_id: Any,
+    fixture_metrics: Dict[str, Any],
+    has_raw_statistics: bool,
+) -> Dict[str, Any]:
+    context = build_stats_health_context(fixture_metrics, has_raw_statistics=has_raw_statistics)
+    logger.info(
+        "[STATS_HEALTH] fixture_id=%s has_raw_statistics=%s has_normalized_live_metrics=%s normalized_metric_count=%s missing_core_metrics=%s xg_available=%s sot_available=%s box_available=%s pressure_available=%s stats_health=%s",
+        fixture_id,
+        context["has_raw_statistics"],
+        context["has_normalized_live_metrics"],
+        context["normalized_metric_count"],
+        "|".join(context["missing_core_metrics"]) or "none",
+        context["xg_available"],
+        context["sot_available"],
+        context["box_available"],
+        context["pressure_available"],
+        context["stats_health"],
+    )
+    if has_raw_statistics and not context["has_normalized_live_metrics"]:
+        logger.warning(
+            "[STATS_NORMALIZATION_WARNING] fixture_id=%s reason=raw_present_but_core_metrics_missing has_raw_statistics=True has_normalized_live_metrics=False missing_core_metrics=%s",
+            fixture_id,
+            "|".join(context["missing_core_metrics"]) or "none",
+        )
+    return context
+
+
 def compute_coverage_score(fixture_metrics: Dict[str, Any]) -> Tuple[float, List[str]]:
     """
     Вычислить coverage_score для матча с неполной статистикой.
-    
+
     Оценивает какой процент от требуемых метрик присутствует в данных.
     Используется только для FALLBACK режима.
-    
+
     Требуемые метрики (4 группы):
     1. shots_total (обе стороны должны иметь значение)
     2. shots_on_target (обе стороны)
     3. shots_in_box (обе стороны)
     4. saves (обе стороны)
-    
+
     Веса (сумма 1.0):
     - shots_total: 0.30
     - shots_on_target: 0.30
     - shots_in_box: 0.25
     - saves: 0.15
-    
+
     Args:
         fixture_metrics: Словарь метрик матча
         
@@ -11398,7 +15451,7 @@ def is_first_signal_snapshot_ready(
     fixture_metrics: Dict[str, Any],
     minute: int,
     prob_next_15: float,
-    prob_second_half_remain: float,
+    prob_to90: float,
 ) -> Tuple[bool, str]:
     """Check whether the first ordinary 47+ signal snapshot is stable enough.
 
@@ -11425,6 +15478,10 @@ def is_first_signal_snapshot_ready(
     xg_info = get_xg_with_fallback(fixture_metrics)
     xg_total = float(xg_info.get("xg_total") or 0.0)
     xg_source = str(xg_info.get("xg_source") or "fallback_estimated")
+    stats_health_context = build_stats_health_context(
+        fixture_metrics,
+        has_raw_statistics=bool(fixture_metrics.get("_has_raw_statistics", False)),
+    )
 
     shots_on_target_home = float(get_any_metric(fixture_metrics, ["shots_on_target"], "home") or 0.0)
     shots_on_target_away = float(get_any_metric(fixture_metrics, ["shots_on_target"], "away") or 0.0)
@@ -11464,17 +15521,20 @@ def is_first_signal_snapshot_ready(
     if minute >= 52 and xg_total < 0.05 and shots_on_target_total == 0 and shots_in_box_total == 0:
         return False, (
             f"critically missing data at minute={minute}: "
-            f"xg_total={xg_total:.2f} xg_source={xg_source} shots_on_target=0 shots_in_box=0"
+            f"xg_total={xg_total:.2f} xg_source={xg_source} shots_on_target=0 shots_in_box=0 "
+            f"has_raw_statistics={stats_health_context.get('has_raw_statistics')} "
+            f"has_normalized_live_metrics={stats_health_context.get('has_normalized_live_metrics')} "
+            f"stats_health={stats_health_context.get('stats_health')}"
         )
 
     # 6. Extreme probability with weak live metrics
-    if prob_second_half_remain >= 95.0 or prob_next_15 >= 85.0:
+    if prob_to90 >= 95.0 or prob_next_15 >= 85.0:
         if xg_total < 0.7 and shots_on_target_total < 3 and shots_in_box_total < 5:
             return False, "weak live metrics with extreme probability"
 
     # 7. Suspicious first snapshot (minute 47) with nearly zero live metrics
     if minute == REGULAR_SIGNAL_MIN_MINUTE:
-        if prob_second_half_remain >= 92.0 and xg_total < 0.4 and tempo < 0.5 and shots_on_target_total < 2:
+        if prob_to90 >= 92.0 and xg_total < 0.4 and tempo < 0.5 and shots_on_target_total < 2:
             return False, "suspicious first snapshot with almost zero live metrics"
 
     return True, ""
@@ -11857,27 +15917,75 @@ def estimate_xg_from_metrics_combined(fixture_metrics: Dict[str,Any], side: str)
     return xg_fallback
 
 
+def calculate_xg_fallback_coverage(
+    fixture_metrics: Dict[str, Any],
+    side: str,
+) -> Dict[str, Any]:
+    """Measure how much of the evidence used by fallback xG is actually present."""
+    metric_weights = (
+        ("total_shots", ["total_shots"], 0.20),
+        ("shots_on_target", ["shots_on_target"], 0.30),
+        ("shots_in_box", ["shots_insidebox", "shots_inside_box", "inside_box"], 0.40),
+        ("corners", ["corner_kicks", "corners"], 0.10),
+    )
+    present: List[str] = []
+    missing: List[str] = []
+    coverage = 0.0
+    for name, keys, weight in metric_weights:
+        if get_any_metric(fixture_metrics, keys, side) is None:
+            missing.append(name)
+        else:
+            present.append(name)
+            coverage += weight
+
+    coverage = clamp(coverage, 0.0, 1.0)
+    confidence = 0.0 if coverage <= 0.0 else clamp(0.35 + 0.40 * coverage, 0.35, 0.75)
+    return {
+        "coverage": coverage,
+        "confidence": confidence,
+        "present_metrics": present,
+        "missing_metrics": missing,
+    }
+
+
 def get_xg_with_fallback(fixture_metrics: Dict[str, Any]) -> Dict[str, Any]:
     """Resolve live xG from API when available, otherwise use fallback estimates."""
 
-    def _resolve_side_xg(side: str) -> Tuple[float, str]:
+    def _resolve_side_xg(side: str) -> Tuple[float, str, float, float]:
         raw_xg = get_any_metric(fixture_metrics, ["expected_goals"], side)
         try:
             raw_xg = float(raw_xg) if raw_xg not in (None, "", "N/A") else None
         except (TypeError, ValueError):
             raw_xg = None
 
-        if raw_xg is not None and raw_xg > 0.0:
-            return raw_xg, "api"
+        # A real API value of 0.00 is valid evidence, not a missing value.
+        if raw_xg is not None and raw_xg >= 0.0:
+            return raw_xg, "api", 1.0, 1.0
 
+        fallback_quality = calculate_xg_fallback_coverage(fixture_metrics, side)
         estimated_xg = max(0.0, float(estimate_xg_from_metrics_combined(fixture_metrics, side) or 0.0))
-        return estimated_xg, "fallback_estimated"
+        return (
+            estimated_xg,
+            "fallback_estimated",
+            float(fallback_quality["coverage"]),
+            float(fallback_quality["confidence"]),
+        )
 
-    xg_home, xg_home_source = _resolve_side_xg("home")
-    xg_away, xg_away_source = _resolve_side_xg("away")
+    xg_home, xg_home_source, xg_home_coverage, xg_home_confidence = _resolve_side_xg("home")
+    xg_away, xg_away_source, xg_away_coverage, xg_away_confidence = _resolve_side_xg("away")
     xg_total = xg_home + xg_away
     xg_delta = abs(xg_home - xg_away)
     xg_source = "api" if xg_home_source == "api" and xg_away_source == "api" else "fallback_estimated"
+    if xg_total > 0.0:
+        xg_confidence = (
+            xg_home * xg_home_confidence + xg_away * xg_away_confidence
+        ) / xg_total
+    else:
+        xg_confidence = (xg_home_confidence + xg_away_confidence) / 2.0
+    xg_confidence = clamp(xg_confidence, 0.0, 1.0)
+    # Dominance depends on both sides, so its reliability cannot exceed the
+    # less reliable side.
+    xg_delta_confidence = min(xg_home_confidence, xg_away_confidence)
 
     return {
         "xg_home": xg_home,
@@ -11887,6 +15995,12 @@ def get_xg_with_fallback(fixture_metrics: Dict[str, Any]) -> Dict[str, Any]:
         "xg_source": xg_source,
         "xg_home_source": xg_home_source,
         "xg_away_source": xg_away_source,
+        "xg_confidence": xg_confidence,
+        "xg_delta_confidence": xg_delta_confidence,
+        "xg_home_confidence": xg_home_confidence,
+        "xg_away_confidence": xg_away_confidence,
+        "xg_home_coverage": xg_home_coverage,
+        "xg_away_coverage": xg_away_coverage,
     }
 
 def get_metric_from_fixture(fixture: Dict[str,Any], key: str, default=None):
@@ -12074,9 +16188,287 @@ def compute_lambda_and_probability(fixture_metrics: Dict[str,Any], minute: int, 
         logger.exception("compute_lambda_and_probability")
         return {"lambda_home":0.001,"lambda_away":0.001,"prob_goal_either_to75":0.0,"prob_next_goal_home":0.0,"prob_next_goal_away":0.0,"pred_xg_home_to_75":0.0,"pred_xg_away_to_75":0.0}
 
+
+def _neutral_second_half_context() -> Dict[str, Any]:
+    return {
+        "league_id": 0,
+        "home_team_id": 0,
+        "away_team_id": 0,
+        "team_2h_factor": 1.0,
+        "league_2h_factor": 1.0,
+        "score_state_factor": 1.0,
+        "raw_context_multiplier": 1.0,
+        "context_multiplier": 1.0,
+        "sample_confidence": 0.0,
+        "fallback_reason": "neutral",
+        "home_2h_scored": 0.5,
+        "home_2h_conceded": 0.5,
+        "away_2h_scored": 0.5,
+        "away_2h_conceded": 0.5,
+        "league_2h_avg": 1.0,
+        "league_after60": 0.0,
+        "events_coverage": 0.0,
+        "team_sample_home": 0,
+        "team_sample_away": 0,
+        "league_sample": 0,
+    }
+
+
+def _compute_second_half_sample_confidence(
+    team_sample_home: int,
+    team_sample_away: int,
+    league_sample: int,
+    events_coverage: float,
+) -> float:
+    team_target = max(int(TEAM_STATS_SAMPLE_SIZE), 1)
+    league_target = max(int(LEAGUE_REFRESH_SAMPLE_TARGET * 0.5), 100)
+    home_conf = clamp(float(team_sample_home) / float(team_target), 0.0, 1.0)
+    away_conf = clamp(float(team_sample_away) / float(team_target), 0.0, 1.0)
+    league_conf = clamp(float(league_sample) / float(league_target), 0.0, 1.0)
+    coverage_conf = clamp(float(events_coverage), 0.0, 1.0)
+    confidence = (
+        0.30 * ((home_conf + away_conf) / 2.0)
+        + 0.45 * league_conf
+        + 0.25 * coverage_conf
+    )
+    return clamp(confidence, 0.0, 1.0)
+
+
+def _extract_halftime_score_for_2h(
+    fixture_metrics: Dict[str, Any],
+) -> Tuple[Optional[int], Optional[int], str]:
+    """Read the actual halftime score used by the historical 2H buckets."""
+    fixture_metrics = fixture_metrics if isinstance(fixture_metrics, dict) else {}
+    score_block = fixture_metrics.get("score")
+    if isinstance(score_block, dict) and "value" in score_block:
+        score_block = score_block.get("value")
+    score_block = score_block if isinstance(score_block, dict) else {}
+    halftime = score_block.get("halftime")
+    if isinstance(halftime, dict) and "value" in halftime:
+        halftime = halftime.get("value")
+    halftime = halftime if isinstance(halftime, dict) else {}
+
+    home = _unwrap_metric_int(halftime.get("home"))
+    away = _unwrap_metric_int(halftime.get("away"))
+    if home is not None and away is not None and home >= 0 and away >= 0:
+        return int(home), int(away), "score.halftime"
+
+    direct_home = _unwrap_metric_int(fixture_metrics.get("halftime_score_home"))
+    direct_away = _unwrap_metric_int(fixture_metrics.get("halftime_score_away"))
+    if (
+        direct_home is not None
+        and direct_away is not None
+        and direct_home >= 0
+        and direct_away >= 0
+    ):
+        return int(direct_home), int(direct_away), "direct_fields"
+    return None, None, "missing"
+
+
+def _log_second_half_context(fixture_id: int, minute: int, context: Dict[str, Any]) -> None:
+    logger.info(
+        "[2H_CONTEXT] fixture_id=%s minute=%s home_team_id=%s away_team_id=%s league_id=%s halftime_score=%s-%s score_state_source=%s team_2h_factor=%.3f league_2h_factor=%.3f score_state_factor=%.3f context_multiplier=%.3f sample_confidence=%.3f home_sample=%s away_sample=%s league_sample=%s raw_context_multiplier=%.3f fallback_reason=%s",
+        fixture_id,
+        minute,
+        int(context.get("home_team_id", 0) or 0),
+        int(context.get("away_team_id", 0) or 0),
+        int(context.get("league_id", 0) or 0),
+        context.get("halftime_score_home"),
+        context.get("halftime_score_away"),
+        str(context.get("score_state_source") or "missing"),
+        float(context.get("team_2h_factor", 1.0) or 1.0),
+        float(context.get("league_2h_factor", 1.0) or 1.0),
+        float(context.get("score_state_factor", 1.0) or 1.0),
+        float(context.get("context_multiplier", 1.0) or 1.0),
+        float(context.get("sample_confidence", 0.0) or 0.0),
+        int(context.get("team_sample_home", 0) or 0),
+        int(context.get("team_sample_away", 0) or 0),
+        int(context.get("league_sample", 0) or 0),
+        float(context.get("raw_context_multiplier", 1.0) or 1.0),
+        str(context.get("fallback_reason") or "none"),
+    )
+
+
+def _compute_second_half_context(fixture_metrics: Dict[str, Any], minute: Optional[int] = None) -> Dict[str, Any]:
+    fixture_id = get_fixture_id(fixture_metrics)
+    minute_i = int(minute or 0)
+    league_id = _unwrap_metric_int(fixture_metrics.get("league_id")) or 0
+    home_team_id = _unwrap_metric_int(fixture_metrics.get("team_home_id")) or 0
+    away_team_id = _unwrap_metric_int(fixture_metrics.get("team_away_id")) or 0
+    halftime_home, halftime_away, score_state_source = _extract_halftime_score_for_2h(
+        fixture_metrics
+    )
+
+    context = _neutral_second_half_context()
+    context["league_id"] = league_id
+    context["home_team_id"] = home_team_id
+    context["away_team_id"] = away_team_id
+    context["halftime_score_home"] = halftime_home
+    context["halftime_score_away"] = halftime_away
+    context["score_state_source"] = score_state_source
+
+    if league_id <= 0 or home_team_id <= 0 or away_team_id <= 0:
+        context["fallback_reason"] = "missing_ids"
+        if DEBUG_2H_LOGS:
+            _log_second_half_context(fixture_id, minute_i, context)
+        return context
+
+    try:
+        team_ctx = compute_team_2h_factor(home_team_id, away_team_id, league_id)
+        league_ctx = compute_league_2h_factor(league_id)
+        if halftime_home is not None and halftime_away is not None:
+            score_ctx = compute_score_state_factor(
+                halftime_home,
+                halftime_away,
+                home_team_id,
+                away_team_id,
+                league_id,
+            )
+        else:
+            score_ctx = {"factor": 1.0}
+    except Exception:
+        context["fallback_reason"] = "context_error"
+        logger.exception("[2H_CONTEXT_ERR] fixture_id=%s", fixture_id)
+        if DEBUG_2H_LOGS:
+            _log_second_half_context(fixture_id, minute_i, context)
+        return context
+
+    team_sample_home = int(team_ctx.get("team_sample_home", 0) or 0)
+    team_sample_away = int(team_ctx.get("team_sample_away", 0) or 0)
+    league_sample = int(league_ctx.get("league_sample", 0) or 0)
+    events_coverage = float(team_ctx.get("events_coverage", 0.0) or 0.0)
+
+    raw_context_multiplier = 1.0
+    raw_context_multiplier += 0.20 * (float(team_ctx.get("factor", 1.0) or 1.0) - 1.0)
+    raw_context_multiplier += 0.10 * (float(league_ctx.get("factor", 1.0) or 1.0) - 1.0)
+    raw_context_multiplier += 0.15 * (float(score_ctx.get("factor", 1.0) or 1.0) - 1.0)
+    raw_context_multiplier = clamp(float(raw_context_multiplier), 0.94, 1.08)
+
+    sample_confidence = _compute_second_half_sample_confidence(
+        team_sample_home,
+        team_sample_away,
+        league_sample,
+        events_coverage,
+    )
+    context_multiplier = 1.0 + (raw_context_multiplier - 1.0) * sample_confidence
+    context_multiplier = clamp(float(context_multiplier), 0.94, 1.08)
+
+    fallback_reasons: List[str] = []
+    if score_state_source == "missing":
+        fallback_reasons.append("missing_halftime_score")
+    if max(team_sample_home, team_sample_away, league_sample) <= 0:
+        raw_context_multiplier = 1.0
+        context_multiplier = 1.0
+        sample_confidence = 0.0
+        fallback_reasons.append("missing_2h_stats")
+    elif sample_confidence < 0.25:
+        fallback_reasons.append("small_sample")
+    fallback_reason = ",".join(fallback_reasons)
+
+    context = {
+        "league_id": league_id,
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
+        "team_2h_factor": float(team_ctx.get("factor", 1.0) or 1.0),
+        "league_2h_factor": float(league_ctx.get("factor", 1.0) or 1.0),
+        "score_state_factor": float(score_ctx.get("factor", 1.0) or 1.0),
+        "halftime_score_home": halftime_home,
+        "halftime_score_away": halftime_away,
+        "score_state_source": score_state_source,
+        "raw_context_multiplier": raw_context_multiplier,
+        "context_multiplier": context_multiplier,
+        "sample_confidence": sample_confidence,
+        "fallback_reason": fallback_reason,
+        "home_2h_scored": float(team_ctx.get("home_2h_scored_smoothed", 0.5) or 0.5),
+        "home_2h_conceded": float(team_ctx.get("home_2h_conceded_smoothed", 0.5) or 0.5),
+        "away_2h_scored": float(team_ctx.get("away_2h_scored_smoothed", 0.5) or 0.5),
+        "away_2h_conceded": float(team_ctx.get("away_2h_conceded_smoothed", 0.5) or 0.5),
+        "league_2h_avg": float(league_ctx.get("league_avg_2h_goals", 1.0) or 1.0),
+        "league_after60": float(league_ctx.get("avg_goals_after_60", 0.0) or 0.0),
+        "events_coverage": events_coverage,
+        "team_sample_home": team_sample_home,
+        "team_sample_away": team_sample_away,
+        "league_sample": league_sample,
+    }
+
+    if DEBUG_2H_LOGS:
+        _log_second_half_context(fixture_id, minute_i, context)
+
+    return context
+
 # -------------------------
 # New 45+ Minute Probability Model
 # -------------------------
+
+def calculate_attacking_tempo(fixture_metrics: Dict[str, Any], minute: int) -> Dict[str, Any]:
+    """
+    Estimate the attacking pace of the match.
+
+    Native attack counters are preferred and converted to a per-minute rate.
+    API-Sports usually does not provide those counters, so total-shot and corner
+    rates are used as a conservative fallback.  The fallback carries reduced
+    confidence because those inputs also appear elsewhere in the live model.
+    """
+    elapsed = _safe_float(minute, 0.0)
+    if elapsed <= 0.0:
+        elapsed = _safe_float(get_metric_from_fixture(fixture_metrics, "elapsed", 0), 0.0)
+    elapsed = max(1.0, elapsed)
+
+    dangerous_attacks_total = sum(
+        _safe_float(get_any_metric(fixture_metrics, ["dangerous_attacks"], side), 0.0)
+        for side in ("home", "away")
+    )
+    if dangerous_attacks_total > 0.0:
+        tempo_rate = dangerous_attacks_total / elapsed
+        tempo_norm = clamp(tempo_rate / 1.20, 0.0, 1.0)
+        return {
+            "tempo": tempo_rate,
+            "tempo_norm": tempo_norm,
+            "tempo_source": "dangerous_attacks",
+            "tempo_confidence": 1.0,
+        }
+
+    attacks_total = sum(
+        _safe_float(get_any_metric(fixture_metrics, ["attacks"], side), 0.0)
+        for side in ("home", "away")
+    )
+    if attacks_total > 0.0:
+        tempo_rate = attacks_total / elapsed
+        tempo_norm = clamp(tempo_rate / 2.20, 0.0, 1.0)
+        return {
+            "tempo": tempo_rate,
+            "tempo_norm": tempo_norm,
+            "tempo_source": "attacks",
+            "tempo_confidence": 1.0,
+        }
+
+    total_shots = sum(
+        _safe_float(get_any_metric(fixture_metrics, ["total_shots"], side), 0.0)
+        for side in ("home", "away")
+    )
+    corners_total = sum(
+        _safe_float(get_any_metric(fixture_metrics, ["corner_kicks", "corners"], side), 0.0)
+        for side in ("home", "away")
+    )
+    shots_rate = total_shots / elapsed
+    corners_rate = corners_total / elapsed
+
+    # 0.45 shots/minute and 0.16 corners/minute represent a very fast match.
+    # Shots describe most of the pace; corners provide a smaller supporting signal.
+    shots_pace_norm = clamp(shots_rate / 0.45, 0.0, 1.0)
+    corners_pace_norm = clamp(corners_rate / 0.16, 0.0, 1.0)
+    tempo_norm = clamp(0.80 * shots_pace_norm + 0.20 * corners_pace_norm, 0.0, 1.0)
+
+    return {
+        # Keep a readable rate-like value while tempo_norm remains the model input.
+        "tempo": 2.0 * tempo_norm,
+        "tempo_norm": tempo_norm,
+        "tempo_source": "shots_corners_proxy" if total_shots > 0.0 or corners_total > 0.0 else "missing",
+        "tempo_confidence": 0.65 if total_shots > 0.0 or corners_total > 0.0 else 0.0,
+        "tempo_proxy_total_shots": total_shots,
+        "tempo_proxy_corners": corners_total,
+    }
+
 
 def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) -> Dict[str, Any]:
     """
@@ -12087,16 +16479,20 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
     Returns:
         Dictionary with:
         - prob_next_15: probability of goal in next 15 minutes (%)
-        - prob_second_half_remain: probability of goal until end of second half (%)
+        - prob_next_25: probability of goal in the next capped 25-minute horizon (%)
+        - prob_second_half_remain: legacy alias for prob_next_25 (%)
         - prob_to75: legacy compatibility (%)
         - prob_to90: legacy compatibility (%)
         - lambda_2h: second half goal intensity per minute
         - game_state_factor: score-based multiplier
         - goal_xg_gap_factor: realization gap multiplier
-        - combined_m_2h: second half league/team context
+        - season_context_factor_45p: softened season league/team context for 45+ model
+        - combined_m_2h: legacy alias for season_context_factor_45p
         - time_zone_factor: time-based urgency multiplier
     """
     try:
+        fixture_id = get_fixture_id(fixture_metrics)
+        match_identity = build_match_identity_context(fixture_metrics)
         # Extract basic metrics
         xg_info = get_xg_with_fallback(fixture_metrics)
         xg_home = float(xg_info.get("xg_home") or 0.0)
@@ -12106,6 +16502,28 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         xg_source = str(xg_info.get("xg_source") or "fallback_estimated")
         xg_home_source = str(xg_info.get("xg_home_source") or "fallback_estimated")
         xg_away_source = str(xg_info.get("xg_away_source") or "fallback_estimated")
+        default_xg_confidence = 0.70 if xg_source == "fallback_estimated" else 1.0
+        xg_confidence = clamp(
+            _safe_float(xg_info.get("xg_confidence"), default_xg_confidence),
+            0.0,
+            1.0,
+        )
+        xg_delta_confidence = clamp(
+            _safe_float(xg_info.get("xg_delta_confidence"), xg_confidence),
+            0.0,
+            1.0,
+        )
+        xg_home_confidence = clamp(
+            _safe_float(xg_info.get("xg_home_confidence"), xg_confidence),
+            0.0,
+            1.0,
+        )
+        xg_away_confidence = clamp(
+            _safe_float(xg_info.get("xg_away_confidence"), xg_confidence),
+            0.0,
+            1.0,
+        )
+        xg_total_effective = xg_total * xg_confidence
         
         score_home = int(get_metric_from_fixture(fixture_metrics, "score_home", 0) or 0)
         score_away = int(get_metric_from_fixture(fixture_metrics, "score_away", 0) or 0)
@@ -12113,7 +16531,8 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         
         goal_xg_gap = total_goals - xg_total
         
-        pressure_index = float(calculate_pressure_index(fixture_metrics) or 0.0)
+        pressure_details = calculate_pressure_index_details(fixture_metrics)
+        pressure_index = _safe_float(pressure_details.get("pressure_index"), 0.0)
         pressure_norm = clamp(pressure_index / 25.0, 0.0, 1.0)
         
         shots_on_target_home = float(get_any_metric(fixture_metrics, ["shots_on_target"], "home") or 0.0)
@@ -12124,7 +16543,7 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         shots_in_box_home = float(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box"], "home") or 0.0)
         shots_in_box_away = float(get_any_metric(fixture_metrics, ["shots_insidebox", "shots_inside_box"], "away") or 0.0)
         shots_in_box_total = shots_in_box_home + shots_in_box_away
-        shots_in_box_norm = clamp(shots_in_box_total / 10.0, 0.0, 1.0)
+        shots_in_box_norm = smooth_saturation(shots_in_box_total, 5.8, 2.0)
         
         save_stress = calculate_save_stress(
             saves_home=float(get_any_metric(fixture_metrics, ["saves"], "home") or 0.0),
@@ -12136,10 +16555,11 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         )
         save_stress_norm = clamp(save_stress, 0.0, 1.0)
         
-        attacks_home = float(get_any_metric(fixture_metrics, ["attacks"], "home") or 0.0)
-        attacks_away = float(get_any_metric(fixture_metrics, ["attacks"], "away") or 0.0)
-        tempo = (attacks_home + attacks_away) / max(1.0, 24.0)  # attacks per minute baseline
-        tempo_norm = clamp(tempo / 2.0, 0.0, 1.0)
+        tempo_info = calculate_attacking_tempo(fixture_metrics, minute)
+        tempo = _safe_float(tempo_info.get("tempo"), 0.0)
+        tempo_norm = clamp(_safe_float(tempo_info.get("tempo_norm"), 0.0), 0.0, 1.0)
+        tempo_source = str(tempo_info.get("tempo_source") or "missing")
+        tempo_confidence = clamp(_safe_float(tempo_info.get("tempo_confidence"), 0.0), 0.0, 1.0)
         
         total_shots_home = float(get_any_metric(fixture_metrics, ["total_shots"], "home") or 0.0)
         total_shots_away = float(get_any_metric(fixture_metrics, ["total_shots"], "away") or 0.0)
@@ -12151,6 +16571,7 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         possession_diff = abs(possession_home - possession_away)
         possession_pressure = possession_diff / 100.0 if possession_diff > 1.0 else possession_diff
         possession_pressure_norm = clamp(possession_pressure, 0.0, 1.0)
+        xg_norm = clamp(xg_total / 2.0, 0.0, 1.0)
         
         # Game state factor based on current score
         score_state = f"{score_home}-{score_away}"
@@ -12164,7 +16585,7 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
                 0.3 * pressure_norm +
                 0.3 * shots_on_target_norm +
                 0.2 * shots_in_box_norm +
-                0.2 * clamp(xg_total / 2.0, 0.0, 1.0)
+                0.2 * clamp(xg_total / 2.0, 0.0, 1.0) * xg_confidence
             )
             if live_context_score > 0.6:
                 game_state_factor = 1.03  # Moderate boost for active 0-0 (cooled from 1.05)
@@ -12181,25 +16602,27 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         
         # Goal xG gap factor (realization gap)
         if goal_xg_gap < -1.5:
-            goal_xg_gap_factor = 1.06  # Strong under-realization -> boost (cooled from 1.12)
+            goal_xg_gap_factor_raw = 1.06  # Strong under-realization -> boost (cooled from 1.12)
         elif goal_xg_gap < -0.5:
-            goal_xg_gap_factor = 1.03  # Moderate under-realization -> slight boost (cooled from 1.06)
+            goal_xg_gap_factor_raw = 1.03  # Moderate under-realization -> slight boost (cooled from 1.06)
         elif goal_xg_gap > 1.5:
-            goal_xg_gap_factor = 0.94  # Strong over-realization -> cool down (cooled from 0.88)
+            goal_xg_gap_factor_raw = 0.94  # Strong over-realization -> cool down (cooled from 0.88)
         elif goal_xg_gap > 0.5:
-            goal_xg_gap_factor = 0.97  # Moderate over-realization -> slight cool down (cooled from 0.94)
+            goal_xg_gap_factor_raw = 0.97  # Moderate over-realization -> slight cool down (cooled from 0.94)
         else:
-            goal_xg_gap_factor = 1.0  # Neutral
+            goal_xg_gap_factor_raw = 1.0  # Neutral
+        goal_xg_gap_factor = 1.0 + (goal_xg_gap_factor_raw - 1.0) * xg_confidence
         
         # XG delta factor (helps matches where one team dominates)
         if xg_delta >= 1.5:
-            xg_delta_factor = 1.08  # Strong dominance -> moderate boost
+            xg_delta_factor_raw = 1.08  # Strong dominance -> moderate boost
         elif xg_delta >= 0.8:
-            xg_delta_factor = 1.04  # Moderate dominance -> slight boost
+            xg_delta_factor_raw = 1.04  # Moderate dominance -> slight boost
         elif xg_delta >= 0.3:
-            xg_delta_factor = 1.02  # Slight dominance -> minimal boost
+            xg_delta_factor_raw = 1.02  # Slight dominance -> minimal boost
         else:
-            xg_delta_factor = 1.0  # Balanced or close -> neutral
+            xg_delta_factor_raw = 1.0  # Balanced or close -> neutral
+        xg_delta_factor = 1.0 + (xg_delta_factor_raw - 1.0) * xg_delta_confidence
         
         # Urgency factor (smarter time-based urgency considering score)
         score_diff = abs(score_home - score_away)
@@ -12223,20 +16646,41 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         
         # League/team context (use existing but softer)
         team_boosts = calc_match_team_boost_v2(fixture_metrics)
-        combined_m_2h = float(team_boosts.get("combined_m", 1.0) or 1.0)
+        season_context_factor_45p = float(team_boosts.get("combined_m", 1.0) or 1.0)
         # Soften the league/team influence for 45+ model
-        combined_m_2h = 1.0 + (combined_m_2h - 1.0) * 0.6  # Reduce influence by 40%
-        combined_m_2h = clamp(combined_m_2h, 0.85, 1.25)
+        season_context_factor_45p = 1.0 + (season_context_factor_45p - 1.0) * 0.6  # Reduce influence by 40%
+        season_context_factor_45p = clamp(season_context_factor_45p, 0.85, 1.25)
+        combined_m_2h = season_context_factor_45p
+        _log_season_factor_context(match_identity, team_boosts, season_context_factor_45p)
+
+        xg_weight = 0.25
+        pressure_weight = 0.20
+        sot_weight = 0.18
+        box_weight = 0.15
+        save_weight = 0.08
+        tempo_weight = 0.10
+        total_shots_weight = 0.00
+
+        xg_weight_effective = xg_weight * xg_confidence
+        pressure_weight_effective = pressure_weight
+        xg_contribution = xg_weight_effective * xg_norm
+        pressure_contribution = pressure_weight * pressure_norm
+        sot_contribution = sot_weight * shots_on_target_norm
+        box_contribution = box_weight * shots_in_box_norm
+        save_contribution = save_weight * save_stress_norm
+        tempo_weight_effective = tempo_weight * tempo_confidence
+        tempo_contribution = tempo_weight_effective * tempo_norm
+        total_shots_contribution = total_shots_weight * total_shots_norm
         
         # Live intensity base (normalized metrics combination)
         live_intensity = (
-            0.25 * clamp(xg_total / 2.0, 0.0, 1.0) +
-            0.20 * pressure_norm +
-            0.18 * shots_on_target_norm +
-            0.15 * shots_in_box_norm +
-            0.12 * save_stress_norm +
-            0.10 * tempo_norm +  # Increased from 0.08
-            0.00 * total_shots_norm  # Reduced from 0.02, now minimal
+            xg_contribution +
+            pressure_contribution +
+            sot_contribution +
+            box_contribution +
+            save_contribution +
+            tempo_contribution +
+            total_shots_contribution
         )
         
         # Apply multipliers with softened combined boost (instead of direct multiplication)
@@ -12244,7 +16688,7 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         game_state_boost = game_state_factor - 1.0
         goal_xg_gap_boost = goal_xg_gap_factor - 1.0
         xg_delta_boost = xg_delta_factor - 1.0
-        combined_m_boost = combined_m_2h - 1.0
+        combined_m_boost = season_context_factor_45p - 1.0
         urgency_boost = urgency_factor - 1.0
         
         # Soften each boost by 50% and combine additively, then apply to base
@@ -12270,23 +16714,26 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         
         # Remaining time in second half (assume 90 min total) - softened for cooling
         remaining_minutes = max(0, 90 - minute)
-        remaining_minutes_adjusted = min(remaining_minutes, 25.0)  # Cap at 25 minutes to cool down
-        prob_second_half_remain = 1.0 - math.exp(-lambda_2h * remaining_minutes_adjusted)
-        prob_second_half_remain_pct = prob_second_half_remain * 100.0
+        horizon_minutes = min(remaining_minutes, 25.0)  # Cap at 25 minutes to cool down
+        prob_next_25 = 1.0 - math.exp(-lambda_2h * horizon_minutes)
+        prob_next_25_pct = prob_next_25 * 100.0
+        prob_second_half_remain = prob_next_25
+        prob_second_half_remain_pct = prob_next_25_pct
         
         anti_garbage_passed = True
 
         # Anti-garbage filter for weak matches
-        if prob_second_half_remain_pct > 80.0:
+        if prob_next_25_pct > 80.0:
             is_weak_match = (
-                xg_total < 1.0 or
+                xg_total_effective < 1.0 or
                 shots_on_target_total < 4 or
                 shots_in_box_total < 6
             )
             if is_weak_match:
                 anti_garbage_passed = False
-                prob_second_half_remain_pct *= 0.75  # Cool down by 25% for weak matches
-                prob_second_half_remain_pct = min(prob_second_half_remain_pct, 85.0)  # Cap at 85%
+                prob_next_25_pct *= 0.75  # Cool down by 25% for weak matches
+                prob_next_25_pct = min(prob_next_25_pct, 85.0)  # Cap at 85%
+                prob_second_half_remain_pct = prob_next_25_pct
 
         # Legacy compat: prob_to75 / prob_to90 (explicit Poisson estimates)
         remain_to75 = max(0.0, 75.0 - float(minute))
@@ -12294,59 +16741,343 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
         prob_to75 = (1.0 - math.exp(-lambda_2h * remain_to75)) * 100.0
         prob_to90 = (1.0 - math.exp(-lambda_2h * remain_to90)) * 100.0
 
+        baseline_prob_next_15_pct = prob_next_15_pct
+        baseline_prob_next_25_pct = prob_next_25_pct
+        baseline_prob_second_half_remain_pct = prob_second_half_remain_pct
+        baseline_prob_to75 = prob_to75
+        baseline_prob_to90 = prob_to90
+
+        second_half_context = _neutral_second_half_context()
+        raw_context_multiplier = 1.0
+        applied_context_multiplier = 1.0
+        apply_mode = "disabled"
+        probability_changed = False
+        if ENABLE_2H_FACTORS or ENABLE_2H_SOFT_APPLY:
+            second_half_context = _compute_second_half_context(fixture_metrics, minute)
+            raw_context_multiplier = float(second_half_context.get("context_multiplier", 1.0) or 1.0)
+            applied_context_multiplier = clamp(
+                raw_context_multiplier,
+                1.0 - float(SOFT_APPLY_MAX_ANTIBOOST_PCT),
+                1.0 + float(SOFT_APPLY_MAX_BOOST_PCT),
+            )
+            adjusted_prob_next_15 = clamp(prob_next_15_pct * applied_context_multiplier, 0.0, 100.0)
+            adjusted_prob_next_25 = clamp(prob_next_25_pct * applied_context_multiplier, 0.0, 100.0)
+            adjusted_prob_to75 = clamp(prob_to75 * applied_context_multiplier, 0.0, 100.0)
+            adjusted_prob_to90 = clamp(prob_to90 * applied_context_multiplier, 0.0, 100.0)
+            apply_mode = "soft_apply" if ENABLE_2H_SOFT_APPLY else "log_only"
+
+            if ENABLE_2H_SOFT_APPLY:
+                prob_next_15_pct = adjusted_prob_next_15
+                prob_next_25_pct = adjusted_prob_next_25
+                prob_second_half_remain_pct = prob_next_25_pct
+                prob_to75 = adjusted_prob_to75
+                prob_to90 = adjusted_prob_to90
+
+            probability_changed = (
+                not math.isclose(prob_next_15_pct, baseline_prob_next_15_pct, abs_tol=0.005)
+                or not math.isclose(prob_next_25_pct, baseline_prob_next_25_pct, abs_tol=0.005)
+            )
+
+            if DEBUG_2H_LOGS:
+                raw_context_log = ""
+                if not math.isclose(raw_context_multiplier, applied_context_multiplier, abs_tol=0.0005):
+                    raw_context_log = f" raw_context_multiplier={raw_context_multiplier:.3f}"
+                logger.info(
+                    "[2H_APPLY] fixture_id=%s enabled=%s apply_mode=%s baseline_prob_next_15=%.2f baseline_prob_next_25=%.2f context_multiplier=%.3f%s applied_context_multiplier=%.3f soft_apply_max_antiboost_pct=%.2f soft_apply_max_boost_pct=%.2f final_prob_next_15=%.2f final_prob_next_25=%.2f delta_next15=%.2f delta_next25=%.2f probability_changed=%s",
+                    fixture_id,
+                    ENABLE_2H_FACTORS or ENABLE_2H_SOFT_APPLY,
+                    apply_mode,
+                    baseline_prob_next_15_pct,
+                    baseline_prob_next_25_pct,
+                    raw_context_multiplier,
+                    raw_context_log,
+                    applied_context_multiplier,
+                    float(SOFT_APPLY_MAX_ANTIBOOST_PCT),
+                    float(SOFT_APPLY_MAX_BOOST_PCT),
+                    prob_next_15_pct,
+                    prob_next_25_pct,
+                    prob_next_15_pct - baseline_prob_next_15_pct,
+                    prob_next_25_pct - baseline_prob_next_25_pct,
+                    probability_changed,
+                )
+
+        second_half_context["applied_context_multiplier"] = applied_context_multiplier
+        second_half_context["probability_changed"] = probability_changed
+        if ENABLE_FACTOR_CONTEXT_LOGS:
+            try:
+                team_2h_stats = load_team_2h_stats()
+                league_2h_stats = load_league_2h_stats()
+            except Exception:
+                logger.exception("[2H_FACTOR_CONTEXT_STATS_LOAD_ERR] fixture_id=%s", fixture_id)
+                team_2h_stats = {"teams": {}}
+                league_2h_stats = {"leagues": {}}
+            factor_context = build_2h_factor_context(
+                match_identity,
+                second_half_context,
+                team_2h_stats,
+                league_2h_stats,
+            )
+            _log_2h_factor_context(match_identity, factor_context, minute)
+            _log_factor_stack(
+                match_identity,
+                minute,
+                score_state,
+                live_intensity,
+                game_state_factor,
+                goal_xg_gap_factor,
+                xg_delta_factor,
+                urgency_factor,
+                season_context_factor_45p,
+                second_half_context,
+                applied_context_multiplier,
+                baseline_prob_next_15_pct,
+                prob_next_15_pct,
+                baseline_prob_to90,
+                prob_to90,
+            )
+
+        if LOG_PROB_HORIZON:
+            logger.info(
+                "[PROB_HORIZON] fixture_id=%s minute=%s horizon_minutes=%.1f metric=prob_next_25 prob_next_15=%.2f prob_next_25=%.2f prob_to75=%.2f prob_to90=%.2f legacy_name=prob_second_half_remain legacy_prob_second_half_remain=%.2f legacy_alias_for=prob_next_25",
+                fixture_id,
+                minute,
+                horizon_minutes,
+                prob_next_15_pct,
+                prob_next_25_pct,
+                prob_to75,
+                prob_to90,
+                prob_second_half_remain_pct,
+            )
+
+        if LOG_PROB_COMPONENTS:
+            logger.info(
+                "[SATURATION_V2] fixture_id=%s minute=%s shots_in_box_total=%.1f box_norm=%.4f box_method=hill half=5.8 exponent=2 save_stress=%.4f save_method=hill_saves half=4.0 save_weight=%.3f pressure_version=%s",
+                fixture_id,
+                minute,
+                shots_in_box_total,
+                shots_in_box_norm,
+                save_stress_norm,
+                save_weight,
+                str(pressure_details.get("pressure_index_version") or "v3_smooth"),
+            )
+            logger.info(
+                "[XG_CONFIDENCE] fixture_id=%s minute=%s xg_source=%s home_source=%s away_source=%s home_confidence=%.3f away_confidence=%.3f total_confidence=%.3f delta_confidence=%.3f xg_total=%.3f xg_total_effective=%.3f nominal_weight=%.3f effective_weight=%.3f goal_xg_gap_factor_raw=%.3f goal_xg_gap_factor_applied=%.3f xg_delta_factor_raw=%.3f xg_delta_factor_applied=%.3f",
+                fixture_id,
+                minute,
+                xg_source,
+                xg_home_source,
+                xg_away_source,
+                xg_home_confidence,
+                xg_away_confidence,
+                xg_confidence,
+                xg_delta_confidence,
+                xg_total,
+                xg_total_effective,
+                xg_weight,
+                xg_weight_effective,
+                goal_xg_gap_factor_raw,
+                goal_xg_gap_factor,
+                xg_delta_factor_raw,
+                xg_delta_factor,
+            )
+            logger.info(
+                "[PROB_45+_COMP] fixture_id=%s minute=%s xg_total=%.2f pressure_index=%.2f pressure_version=%s pressure_attempt=%.3f pressure_corner=%.3f pressure_dominance=%.3f pressure_offside=%.3f shots_on_target_total=%.1f shots_in_box_total=%.1f save_stress=%.3f tempo=%.3f tempo_source=%s tempo_confidence=%.2f xg_norm=%.3f pressure_norm=%.3f sot_norm=%.3f box_norm=%.3f save_norm=%.3f tempo_norm=%.3f xg_weight=%.2f pressure_weight=%.2f sot_weight=%.2f box_weight=%.2f save_weight=%.2f tempo_weight=%.2f tempo_weight_effective=%.3f xg_contrib=%.3f pressure_contrib=%.3f sot_contrib=%.3f box_contrib=%.3f save_contrib=%.3f tempo_contrib=%.3f live_intensity=%.3f game_state_factor=%.3f goal_xg_gap_factor=%.3f xg_delta_factor=%.3f urgency_factor=%.3f season_context_factor_45p=%.3f total_boost=%.3f adjusted_intensity=%.3f lambda_2h=%.4f horizon_minutes=%.1f prob_next_15=%.2f prob_next_25=%.2f prob_to75=%.2f prob_to90=%.2f legacy_prob_second_half_remain=%.2f legacy_alias_for=prob_next_25",
+                fixture_id,
+                minute,
+                xg_total,
+                pressure_index,
+                str(pressure_details.get("pressure_index_version") or "v3_smooth"),
+                _safe_float(pressure_details.get("attempt_component"), 0.0),
+                _safe_float(pressure_details.get("corner_component"), 0.0),
+                _safe_float(pressure_details.get("dominance_component"), 0.0),
+                _safe_float(pressure_details.get("offside_component"), 0.0),
+                shots_on_target_total,
+                shots_in_box_total,
+                save_stress,
+                tempo,
+                tempo_source,
+                tempo_confidence,
+                xg_norm,
+                pressure_norm,
+                shots_on_target_norm,
+                shots_in_box_norm,
+                save_stress_norm,
+                tempo_norm,
+                xg_weight,
+                pressure_weight_effective,
+                sot_weight,
+                box_weight,
+                save_weight,
+                tempo_weight,
+                tempo_weight_effective,
+                xg_contribution,
+                pressure_contribution,
+                sot_contribution,
+                box_contribution,
+                save_contribution,
+                tempo_contribution,
+                live_intensity,
+                game_state_factor,
+                goal_xg_gap_factor,
+                xg_delta_factor,
+                urgency_factor,
+                season_context_factor_45p,
+                total_boost,
+                adjusted_intensity,
+                lambda_2h,
+                horizon_minutes,
+                prob_next_15_pct,
+                prob_next_25_pct,
+                prob_to75,
+                prob_to90,
+                prob_second_half_remain_pct,
+            )
+
         logger.info(
-            f"[PROB_45+] fixture_id={get_fixture_id(fixture_metrics)} minute={minute} score_state={score_state} "
+            f"[PROB_45+] fixture_id={fixture_id} minute={minute} score_state={score_state} "
             f"xg_source={xg_source} xg_home_source={xg_home_source} xg_away_source={xg_away_source} "
             f"xg_home={xg_home:.2f} xg_away={xg_away:.2f} xg_total={xg_total:.2f} xg_delta={xg_delta:.2f} goal_xg_gap={goal_xg_gap:.2f} "
             f"pressure_index={pressure_index:.2f} shots_on_target_total={shots_on_target_total:.1f} "
-            f"shots_in_box_total={shots_in_box_total:.1f} save_stress={save_stress:.3f} tempo={tempo:.2f} "
+            f"shots_in_box_total={shots_in_box_total:.1f} save_stress={save_stress:.3f} tempo={tempo:.3f} "
+            f"tempo_source={tempo_source} tempo_confidence={tempo_confidence:.2f} tempo_norm={tempo_norm:.3f} "
             f"live_intensity={live_intensity:.3f} adjusted_intensity={adjusted_intensity:.3f} "
             f"game_state_factor={game_state_factor:.3f} "
             f"goal_xg_gap_factor={goal_xg_gap_factor:.3f} xg_delta_factor={xg_delta_factor:.3f} "
-            f"combined_m_2h={combined_m_2h:.3f} urgency_factor={urgency_factor:.3f} "
-            f"lambda_2h={lambda_2h:.4f} remaining_minutes_adjusted={remaining_minutes_adjusted:.1f} "
-            f"prob_next_15={prob_next_15_pct:.2f}% prob_second_half_remain={prob_second_half_remain_pct:.2f}%"
+            f"season_context_factor_45p={season_context_factor_45p:.3f} combined_m_2h={combined_m_2h:.3f} urgency_factor={urgency_factor:.3f} "
+            f"lambda_2h={lambda_2h:.4f} horizon_minutes={horizon_minutes:.1f} "
+            f"context_multiplier={raw_context_multiplier:.3f} applied_context_multiplier={applied_context_multiplier:.3f} apply_mode={apply_mode} "
+            f"prob_next_15={prob_next_15_pct:.2f}% prob_next_25={prob_next_25_pct:.2f}% prob_to75={prob_to75:.2f}% prob_to90={prob_to90:.2f}% "
+            f"legacy_prob_second_half_remain={prob_second_half_remain_pct:.2f}% legacy_alias_for=prob_next_25"
         )
-        
+
         return {
             "prob_next_15": round(prob_next_15_pct, 2),
+            "horizon_minutes": round(horizon_minutes, 1),
+            "prob_next_25": round(prob_next_25_pct, 2),
+            "prob_next_25_pct": round(prob_next_25_pct, 2),
             "prob_second_half_remain": round(prob_second_half_remain_pct, 2),
+            "prob_second_half_remain_pct": round(prob_second_half_remain_pct, 2),
             "prob_to75": round(prob_to75, 2),
             "prob_to90": round(prob_to90, 2),
             "lambda_2h": round(lambda_2h, 4),
             "game_state_factor": round(game_state_factor, 3),
             "goal_xg_gap_factor": round(goal_xg_gap_factor, 3),
+            "goal_xg_gap_factor_raw": round(goal_xg_gap_factor_raw, 3),
             "xg_delta_factor": round(xg_delta_factor, 3),
+            "xg_delta_factor_raw": round(xg_delta_factor_raw, 3),
+            "season_context_factor_45p": round(season_context_factor_45p, 3),
+            "legacy_combined_m_2h": round(combined_m_2h, 3),
             "combined_m_2h": round(combined_m_2h, 3),
             "urgency_factor": round(urgency_factor, 3),
             # Additional metadata
             "live_intensity": round(live_intensity, 3),
             "adjusted_intensity": round(adjusted_intensity, 3),
-            "remaining_minutes_adjusted": round(remaining_minutes_adjusted, 1),
+            "remaining_minutes_adjusted": round(horizon_minutes, 1),
             "xg_total": round(xg_total, 2),
+            "xg_home": round(xg_home, 2),
+            "xg_away": round(xg_away, 2),
+            "xg_source": xg_source,
             "xg_delta": round(xg_delta, 2),
+            "xg_total_effective": round(xg_total_effective, 3),
+            "xg_confidence": round(xg_confidence, 3),
+            "xg_delta_confidence": round(xg_delta_confidence, 3),
+            "xg_home_confidence": round(xg_home_confidence, 3),
+            "xg_away_confidence": round(xg_away_confidence, 3),
+            "xg_home_coverage": round(_safe_float(xg_info.get("xg_home_coverage"), 1.0 if xg_home_source == "api" else 0.0), 3),
+            "xg_away_coverage": round(_safe_float(xg_info.get("xg_away_coverage"), 1.0 if xg_away_source == "api" else 0.0), 3),
+            "xg_weight_effective": round(xg_weight_effective, 3),
             "pressure_index": round(pressure_index, 2),
+            "pressure_index_version": str(pressure_details.get("pressure_index_version") or "v3_smooth"),
+            "pressure_components": {
+                key: pressure_details.get(key)
+                for key in (
+                    "attempt_component",
+                    "corner_component",
+                    "dominance_component",
+                    "offside_component",
+                    "attempt_pace_norm",
+                    "corner_pace_norm",
+                    "territorial_dominance_norm",
+                    "offside_pace_norm",
+                    "non_target_attempts_total",
+                    "corners_total",
+                    "offsides_total",
+                )
+            },
+            "pressure_weight_effective": round(pressure_weight_effective, 3),
             "shots_on_target_total": round(shots_on_target_total, 1),
             "shots_in_box_total": round(shots_in_box_total, 1),
+            "shots_in_box_norm": round(shots_in_box_norm, 4),
+            "shots_in_box_normalization": "hill_half_5.8_exp_2",
             "save_stress": round(save_stress, 3),
-            "tempo": round(tempo, 2),
+            "save_stress_norm": round(save_stress_norm, 4),
+            "save_stress_normalization": "hill_saves_half_4_exp_2",
+            "save_weight_effective": round(save_weight, 3),
+            "tempo": round(tempo, 3),
+            "tempo_norm": round(tempo_norm, 3),
+            "tempo_source": tempo_source,
+            "tempo_confidence": round(tempo_confidence, 2),
+            "tempo_weight_effective": round(tempo_weight_effective, 3),
             "total_shots": round(total_shots, 1),
             "score_state": score_state,
             "goal_xg_gap": round(goal_xg_gap, 2),
             "anti_garbage_passed": anti_garbage_passed,
+            "baseline_prob_next_15": round(baseline_prob_next_15_pct, 2),
+            "baseline_prob_next_25": round(baseline_prob_next_25_pct, 2),
+            "baseline_prob_second_half_remain": round(baseline_prob_second_half_remain_pct, 2),
+            "baseline_prob_to75": round(baseline_prob_to75, 2),
+            "baseline_prob_to90": round(baseline_prob_to90, 2),
+            "team_2h_factor": round(float(second_half_context.get("team_2h_factor", 1.0) or 1.0), 3),
+            "league_2h_factor": round(float(second_half_context.get("league_2h_factor", 1.0) or 1.0), 3),
+            "score_state_factor": round(float(second_half_context.get("score_state_factor", 1.0) or 1.0), 3),
+            "context_multiplier": round(raw_context_multiplier, 3),
+            "raw_context_multiplier": round(raw_context_multiplier, 3),
+            "applied_context_multiplier": round(applied_context_multiplier, 3),
+            "apply_mode": apply_mode,
+            "probability_changed": probability_changed,
+            "sample_confidence": round(float(second_half_context.get("sample_confidence", 0.0) or 0.0), 3),
+            "fallback_reason": str(second_half_context.get("fallback_reason") or ""),
+            "events_coverage": round(float(second_half_context.get("events_coverage", 0.0) or 0.0), 3),
+            "team_sample_home": int(second_half_context.get("team_sample_home", 0) or 0),
+            "team_sample_away": int(second_half_context.get("team_sample_away", 0) or 0),
+            "league_sample": int(second_half_context.get("league_sample", 0) or 0),
+            "league_avg_goals": round(float(team_boosts.get("league_avg_goals", 0.0) or 0.0), 3),
+            "league_factor": round(float(team_boosts.get("league_factor", 1.0) or 1.0), 3),
+            "team_mix_factor": round(float(team_boosts.get("team_mix_factor", 1.0) or 1.0), 3),
+            "home_matches": int(team_boosts.get("home_matches", 0) or 0),
+            "away_matches": int(team_boosts.get("away_matches", 0) or 0),
+            "home_avg_scored": team_boosts.get("home_avg_scored_raw"),
+            "home_avg_conceded": team_boosts.get("home_avg_conceded_raw"),
+            "away_avg_scored": team_boosts.get("away_avg_scored_raw"),
+            "away_avg_conceded": team_boosts.get("away_avg_conceded_raw"),
+            "home_attack_factor": round(float(team_boosts.get("home_attack_factor", 1.0) or 1.0), 3),
+            "home_defense_factor": round(float(team_boosts.get("home_defense_factor", 1.0) or 1.0), 3),
+            "away_attack_factor": round(float(team_boosts.get("away_attack_factor", 1.0) or 1.0), 3),
+            "away_defense_factor": round(float(team_boosts.get("away_defense_factor", 1.0) or 1.0), 3),
+            "legacy_live_gate_passed_count": 0,
+            "garbage_weak_count": 0,
+            "live_gate_garbage": False,
         }
-        
+
     except Exception:
         logger.exception("compute_probability_45_plus")
         return {
             "prob_next_15": 0.0,
+            "horizon_minutes": 0.0,
+            "prob_next_25": 0.0,
+            "prob_next_25_pct": 0.0,
             "prob_second_half_remain": 0.0,
+            "prob_second_half_remain_pct": 0.0,
             "prob_to75": 0.0,
             "prob_to90": 0.0,
             "lambda_2h": 0.001,
             "game_state_factor": 1.0,
             "goal_xg_gap_factor": 1.0,
+            "goal_xg_gap_factor_raw": 1.0,
             "xg_delta_factor": 1.0,
+            "xg_delta_factor_raw": 1.0,
+            "season_context_factor_45p": 1.0,
+            "legacy_combined_m_2h": 1.0,
             "combined_m_2h": 1.0,
             "urgency_factor": 1.0,
             "live_intensity": 0.0,
@@ -12354,16 +17085,11463 @@ def compute_probability_45_plus(fixture_metrics: Dict[str, Any], minute: int) ->
             "remaining_minutes_adjusted": 0.0,
             "xg_total": 0.0,
             "xg_delta": 0.0,
+            "xg_total_effective": 0.0,
+            "xg_confidence": 0.0,
+            "xg_delta_confidence": 0.0,
+            "xg_home_confidence": 0.0,
+            "xg_away_confidence": 0.0,
+            "xg_home_coverage": 0.0,
+            "xg_away_coverage": 0.0,
+            "xg_weight_effective": 0.0,
             "pressure_index": 0.0,
+            "pressure_index_version": "v3_smooth_error",
+            "pressure_components": {},
+            "pressure_weight_effective": 0.20,
             "shots_on_target_total": 0.0,
             "shots_in_box_total": 0.0,
+            "shots_in_box_norm": 0.0,
+            "shots_in_box_normalization": "error",
             "save_stress": 0.0,
+            "save_stress_norm": 0.0,
+            "save_stress_normalization": "error",
+            "save_weight_effective": 0.0,
             "tempo": 0.0,
+            "tempo_norm": 0.0,
+            "tempo_source": "error",
+            "tempo_confidence": 0.0,
+            "tempo_weight_effective": 0.0,
             "total_shots": 0.0,
             "score_state": "0-0",
             "goal_xg_gap": 0.0,
             "anti_garbage_passed": False,
+            "baseline_prob_next_15": 0.0,
+            "baseline_prob_next_25": 0.0,
+            "baseline_prob_second_half_remain": 0.0,
+            "baseline_prob_to75": 0.0,
+            "baseline_prob_to90": 0.0,
+            "team_2h_factor": 1.0,
+            "league_2h_factor": 1.0,
+            "score_state_factor": 1.0,
+            "context_multiplier": 1.0,
+            "raw_context_multiplier": 1.0,
+            "applied_context_multiplier": 1.0,
+            "apply_mode": "disabled",
+            "probability_changed": False,
+            "sample_confidence": 0.0,
+            "fallback_reason": "",
+            "events_coverage": 0.0,
+            "team_sample_home": 0,
+            "team_sample_away": 0,
+            "league_sample": 0,
+            "legacy_live_gate_passed_count": 0,
+            "garbage_weak_count": 0,
+            "live_gate_garbage": False,
         }
+
+
+def evaluate_window_2_live_gate(
+    xg_total: float,
+    shots_on_target_total: float,
+    shots_in_box_total: float,
+    pressure_index: float,
+    garbage_only: Optional[bool] = None,
+) -> Dict[str, Any]:
+    legacy_live_gate_checks = {
+        "xg_total": float(xg_total) >= 1.10,
+        "shots_on_target_total": float(shots_on_target_total) >= 4.0,
+        "shots_in_box_total": float(shots_in_box_total) >= 7.0,
+        "pressure_index": float(pressure_index) >= 18.0,
+    }
+    legacy_live_gate_passed_count = sum(1 for passed in legacy_live_gate_checks.values() if passed)
+
+    garbage_checks = {
+        "xg_weak": float(xg_total) < 0.80,
+        "sot_weak": float(shots_on_target_total) < 2.0,
+        "box_weak": float(shots_in_box_total) < 4.0,
+        "pressure_weak": float(pressure_index) < 14.0,
+    }
+    garbage_weak_count = sum(1 for passed in garbage_checks.values() if passed)
+    live_gate_garbage = garbage_weak_count >= 3
+    use_garbage_only = LIVE_GATE_GARBAGE_ONLY if garbage_only is None else bool(garbage_only)
+
+    return {
+        "legacy_live_gate_checks": legacy_live_gate_checks,
+        "legacy_live_gate_passed_count": legacy_live_gate_passed_count,
+        "live_gate_checks": dict(legacy_live_gate_checks),
+        "live_gate_passed_count": legacy_live_gate_passed_count,
+        "garbage_checks": garbage_checks,
+        "garbage_weak_count": garbage_weak_count,
+        "live_gate_garbage": live_gate_garbage,
+        "mode": "garbage_only" if use_garbage_only else "legacy",
+        "blocked": live_gate_garbage if use_garbage_only else legacy_live_gate_passed_count < WINDOW_2_LIVE_GATE_MIN_PASSED,
+        "block_reason": "live-gate-garbage" if use_garbage_only and live_gate_garbage else ("live-gate" if legacy_live_gate_passed_count < WINDOW_2_LIVE_GATE_MIN_PASSED else "pass"),
+    }
+
+
+def evaluate_45_plus_probability_gates(
+    prob_next_15_decision: float,
+    prob_until_end_decision: float,
+    threshold_next15: float,
+    threshold_remain: float,
+) -> Tuple[bool, Optional[str]]:
+    if float(prob_next_15_decision) < float(threshold_next15):
+        return False, "next15"
+    if float(prob_until_end_decision) < float(threshold_remain):
+        return False, "until_end"
+    return True, None
+
+
+_decision_snapshot_lock = threading.RLock()
+_decision_snapshot_keys_by_file: Dict[str, Set[str]] = {}
+_decision_snapshot_order_by_file: Dict[str, deque] = {}
+_decision_snapshot_indexes_by_file: Dict[str, Dict[str, Any]] = {}
+
+
+def _decision_value(mapping: Any, key: str, default: Any = None) -> Any:
+    return mapping.get(key, default) if isinstance(mapping, dict) else default
+
+
+def _decision_float(mapping: Any, key: str, default: Optional[float] = None) -> Optional[float]:
+    value = _decision_value(mapping, key, default)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _decision_snapshot_id(
+    fixture_id: Any,
+    minute: Any,
+    window_name: Any,
+    final_decision: Any,
+    schema_version: Optional[int] = None,
+) -> str:
+    """Return a bounded per-minute ID that preserves BLOCK→ALLOW changes."""
+    normalized_window = (
+        "WINDOW_2" if "WINDOW_2" in str(window_name).upper() else "WINDOW_1"
+    )
+    decision_state = (
+        "ALLOW" if str(final_decision or "BLOCK").upper() == "ALLOW" else "BLOCK"
+    )
+    schema = int(
+        DECISION_SNAPSHOT_SCHEMA_VERSION
+        if schema_version is None
+        else schema_version
+    )
+    return (
+        f"{int(fixture_id)}:{int(minute)}:{normalized_window}:"
+        f"{decision_state}:v{schema}"
+    )
+
+
+def build_decision_snapshot(
+    *,
+    fixture_id,
+    minute,
+    window_name,
+    match_identity,
+    score_home,
+    score_away,
+    probability_result,
+    threshold_result,
+    threshold_next15,
+    readiness_result,
+    live_gate_result,
+    anti_garbage_passed,
+    final_decision,
+    block_reason,
+    factor_context,
+    created_at_utc: Optional[str] = None,
+    decision_created_at_utc: Optional[str] = None,
+) -> dict:
+    """Build a complete, side-effect-free ordinary 45+ decision record."""
+    probability_result = probability_result if isinstance(probability_result, dict) else {}
+    threshold_result = threshold_result if isinstance(threshold_result, dict) else {}
+    readiness_result = readiness_result if isinstance(readiness_result, dict) else {}
+    live_gate_result = live_gate_result if isinstance(live_gate_result, dict) else {}
+    factor_context = factor_context if isinstance(factor_context, dict) else {}
+    match_identity = match_identity if isinstance(match_identity, dict) else {}
+
+    fixture_id_int = int(fixture_id)
+    minute_int = int(minute)
+    schema_version = int(DECISION_SNAPSHOT_SCHEMA_VERSION)
+    normalized_window = "WINDOW_2" if "WINDOW_2" in str(window_name).upper() else "WINDOW_1"
+    decision_key = _decision_snapshot_id(
+        fixture_id_int,
+        minute_int,
+        normalized_window,
+        final_decision,
+        schema_version,
+    )
+    prob_next15 = float(_decision_float(probability_result, "prob_next_15", 0.0) or 0.0)
+    prob_to90 = float(_decision_float(probability_result, "prob_to90", 0.0) or 0.0)
+    prob_until_end = float(_decision_float(probability_result, "prob_until_end_decision", prob_to90) or 0.0)
+    selected_threshold = float(_decision_float(threshold_result, "threshold", 0.0) or 0.0)
+    old_fixed_threshold = float(_decision_float(threshold_result, "fallback_threshold", selected_threshold) or 0.0)
+    threshold_next15_float = float(threshold_next15)
+
+    passes_next15 = prob_next15 >= threshold_next15_float
+    passes_dynamic_to90 = prob_until_end >= selected_threshold
+    passes_old_fixed_to90 = prob_until_end >= old_fixed_threshold
+    threshold_allow_dynamic = passes_next15 and passes_dynamic_to90
+    threshold_allow_old = passes_next15 and passes_old_fixed_to90
+    channel_signal_filter = dict(
+        probability_result.get("channel_signal_filter") or {}
+    )
+    channel_signal_filter_passed = (
+        bool(channel_signal_filter.get("passed"))
+        if channel_signal_filter
+        else None
+    )
+    channel_filter_evaluated = bool(channel_signal_filter)
+    channel_filter_contract_current = bool(
+        channel_filter_evaluated
+        and channel_signal_filter.get("version")
+        == CHANNEL_SIGNAL_FILTER_VERSION
+    )
+
+    readiness_passed = bool(readiness_result.get("passed", True))
+    live_gate_required = bool(live_gate_result.get("required", False))
+    live_gate_passed = bool(live_gate_result.get("passed", not live_gate_required))
+    other_hard_gates_passed = bool(readiness_result.get("other_hard_gates_passed", True))
+    common_gates_passed = readiness_passed and bool(anti_garbage_passed) and (not live_gate_required or live_gate_passed) and other_hard_gates_passed
+    overall_allow_dynamic = threshold_allow_dynamic and common_gates_passed
+    overall_allow_old = threshold_allow_old and common_gates_passed
+    publication_context_passed = readiness_passed and other_hard_gates_passed
+    active_publication_allow = bool(
+        publication_context_passed
+        and channel_filter_contract_current
+        and channel_signal_filter.get("passed") is True
+    )
+    wide_research_router = dict(
+        probability_result.get("wide_research_router") or {}
+    )
+    wide_research_applied = bool(
+        wide_research_router.get("applied") is True
+        and wide_research_router.get("source") == "wide_research_champion"
+    )
+    if wide_research_applied:
+        active_publication_allow = bool(
+            publication_context_passed
+            and wide_research_router.get("allow") is True
+        )
+    legacy_selection_gates = dict(
+        probability_result.get("legacy_selection_gates") or {}
+    )
+    publication_policy = {
+        "name": (
+            "wide_research_champion"
+            if wide_research_applied
+            else "base_p90_75_channel_gate"
+        ),
+        "active": True,
+        "filter_version": CHANNEL_SIGNAL_FILTER_VERSION,
+        "filter_evaluated": channel_filter_evaluated,
+        "filter_contract_current": channel_filter_contract_current,
+        "publication_context_passed": publication_context_passed,
+        "publication_allow": active_publication_allow,
+        "readiness_policy": "snapshot_integrity",
+        "pre_send_validation_required": True,
+        "channel_signal_filter_required": not wide_research_applied,
+        "next15_probability_required": False,
+        "dynamic_to90_threshold_required": False,
+        "live_gate_required": False,
+        "anti_garbage_required": False,
+        "rescue_route_active": False,
+        "score_limit_required_for_send": False,
+        "score_limit_presentation_only": True,
+    }
+    if wide_research_applied:
+        publication_policy.update(
+            {
+                "wide_research_router_applied": True,
+                "wide_research_rule_id": wide_research_router.get("rule_id"),
+                "wide_research_phase_id": wide_research_router.get("phase_id"),
+                "wide_research_generation": wide_research_router.get(
+                    "generation"
+                ),
+            }
+        )
+
+    score_home_int = int(score_home or 0)
+    score_away_int = int(score_away or 0)
+    probabilities = {
+        "prob_next_15": prob_next15,
+        "prob_next_25": _decision_float(probability_result, "prob_next_25"),
+        "prob_to75": _decision_float(probability_result, "prob_to75"),
+        "prob_to90": prob_to90,
+        "prob_until_end_decision": prob_until_end,
+        "decision_remain_metric": str(probability_result.get("decision_remain_metric") or "prob_to90"),
+        "baseline_prob_next_15": _decision_float(probability_result, "baseline_prob_next_15"),
+        "final_prob_next_15": _decision_float(probability_result, "prob_next_15"),
+        "baseline_prob_next_25": _decision_float(probability_result, "baseline_prob_next_25"),
+        "final_prob_next_25": _decision_float(probability_result, "prob_next_25"),
+        "baseline_prob_to75": _decision_float(probability_result, "baseline_prob_to75"),
+        "final_prob_to75": _decision_float(probability_result, "prob_to75"),
+        "baseline_prob_to90": _decision_float(probability_result, "baseline_prob_to90"),
+        "final_prob_to90": _decision_float(probability_result, "prob_to90"),
+        "reputation_base_prob_next_15": _decision_float(
+            probability_result, "reputation_base_prob_next_15", prob_next15
+        ),
+        "reputation_adjusted_prob_next_15": _decision_float(
+            probability_result, "reputation_adjusted_prob_next_15", prob_next15
+        ),
+        "reputation_base_prob_to90": _decision_float(
+            probability_result, "reputation_base_prob_to90", prob_to90
+        ),
+        "reputation_adjusted_prob_to90": _decision_float(
+            probability_result, "reputation_adjusted_prob_to90", prob_to90
+        ),
+        "legacy_prob_second_half_remain": _decision_float(probability_result, "legacy_prob_second_half_remain", _decision_float(probability_result, "prob_second_half_remain")),
+        "legacy_alias_for": "prob_next_25",
+    }
+    decision = {
+        "final_decision": str(final_decision or "BLOCK").upper(),
+        "block_reason": str(block_reason) if block_reason else None,
+        "signal_route": str(probability_result.get("signal_route") or "primary"),
+        "threshold_next15": threshold_next15_float,
+        "selected_prob_to90_threshold": selected_threshold,
+        "threshold_source": str(threshold_result.get("source") or "unknown"),
+        "minute_bucket": threshold_result.get("minute_bucket"),
+        "dynamic_threshold_enabled": bool(threshold_result.get("dynamic_enabled", False)),
+        "old_fixed_threshold": old_fixed_threshold,
+        "decision_margin_to90": round(prob_until_end - selected_threshold, 2),
+        "decision_margin_next15": round(prob_next15 - threshold_next15_float, 2),
+        "passes_next15": passes_next15,
+        "passes_dynamic_to90": passes_dynamic_to90,
+        "passes_old_fixed_to90": passes_old_fixed_to90,
+        "would_allow_dynamic_threshold_only": threshold_allow_dynamic,
+        "would_allow_old_fixed_threshold_only": threshold_allow_old,
+        "decision_changed_vs_old_threshold_only": threshold_allow_dynamic != threshold_allow_old,
+        "overall_allow_dynamic": overall_allow_dynamic,
+        "overall_allow_old_fixed": overall_allow_old,
+        "overall_decision_changed_vs_old": overall_allow_dynamic != overall_allow_old,
+        "active_publication_allow": active_publication_allow,
+        "legacy_thresholds_publication_active": False,
+        "channel_signal_filter_passed": channel_signal_filter_passed,
+        "channel_signal_filter_reason": channel_signal_filter.get("reason"),
+        "wide_research_router": wide_research_router,
+    }
+    observation_created_at = str(
+        created_at_utc or datetime.now(timezone.utc).isoformat()
+    )
+    explicit_decision_time = str(
+        decision_created_at_utc or observation_created_at
+    )
+    return {
+        "record_type": "decision",
+        "decision_id": decision_key,
+        "decision_key": decision_key,
+        "fixture_id": fixture_id_int,
+        "created_at_utc": observation_created_at,
+        "decision_created_at_utc": explicit_decision_time,
+        "minute": minute_int,
+        "window_name": normalized_window,
+        "schema_version": schema_version,
+        "model_version": "45_plus_v2",
+        "runtime": _observation_config_snapshot(),
+        "match": {
+            "home_team_id": match_identity.get("home_team_id"),
+            "home_team_name": match_identity.get("home_team_name") or "unknown",
+            "away_team_id": match_identity.get("away_team_id"),
+            "away_team_name": match_identity.get("away_team_name") or "unknown",
+            "league_id": match_identity.get("league_id"),
+            "league_name": match_identity.get("league_name") or "unknown",
+            "league_country": match_identity.get("league_country") or "unknown",
+            "league_type": match_identity.get("league_type") or "unknown",
+            "is_cup": match_identity.get("is_cup"),
+            "is_cup_source": match_identity.get("is_cup_source") or "unknown",
+            "score_home": score_home_int,
+            "score_away": score_away_int,
+            "score_state": probability_result.get("score_state") or f"{score_home_int}-{score_away_int}",
+        },
+        "probabilities": probabilities,
+        "reputation_application": dict(
+            probability_result.get("reputation_application") or {}
+        ),
+        "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+        "normal_time_boundary_mode": NORMAL_TIME_BOUNDARY_MODE,
+        "decision": decision,
+        "publication_policy": publication_policy,
+        "channel_signal_filter": channel_signal_filter,
+        "legacy_selection_gates": legacy_selection_gates,
+        "rescue": dict(probability_result.get("rescue_evaluation") or {}),
+        "gates": {
+            "readiness_passed": readiness_passed,
+            "readiness_reason": readiness_result.get("reason"),
+            "readiness_policy": "snapshot_integrity",
+            "anti_garbage_passed": bool(anti_garbage_passed),
+            "anti_garbage_publication_required": False,
+            "other_hard_gates_passed": other_hard_gates_passed,
+            "publication_context_passed": publication_context_passed,
+            "active_publication_allow": active_publication_allow,
+            "channel_signal_filter_required": not wide_research_applied,
+            "channel_signal_filter_passed": channel_signal_filter_passed,
+            "wide_research_router_applied": wide_research_applied,
+            "wide_research_router_passed": (
+                bool(wide_research_router.get("allow"))
+                if wide_research_applied
+                else None
+            ),
+            "live_gate_required": live_gate_required,
+            "live_gate_passed": live_gate_passed,
+            "live_gate_publication_required": False,
+            "next15_probability_publication_required": False,
+            "dynamic_to90_threshold_publication_required": False,
+            "live_gate_passed_count": live_gate_result.get("live_gate_passed_count"),
+            "legacy_live_gate_passed_count": live_gate_result.get("legacy_live_gate_passed_count"),
+            "garbage_weak_count": live_gate_result.get("garbage_weak_count", 0),
+            "live_gate_garbage": bool(live_gate_result.get("live_gate_garbage", False)),
+            "rule_path": readiness_result.get("rule_path") or live_gate_result.get("rule_path") or "",
+        },
+        "factors": {key: _decision_value(factor_context, key) for key in (
+            "live_intensity", "adjusted_intensity", "lambda_2h", "game_state_factor",
+            "goal_xg_gap_factor", "xg_delta_factor", "urgency_factor",
+            "season_context_factor_45p", "team_2h_factor", "league_2h_factor",
+            "score_state_factor", "context_multiplier", "applied_context_multiplier",
+            "sample_confidence", "fallback_reason", "xg_confidence",
+            "xg_delta_confidence", "xg_weight_effective",
+        )},
+        "live_metrics": {key: _decision_value(factor_context, key) for key in (
+            "xg_total", "xg_home", "xg_away", "pressure_index", "shots_on_target_total",
+            "shots_in_box_total", "save_stress", "tempo", "xg_source",
+            "xg_total_effective", "xg_home_confidence", "xg_away_confidence",
+            "goal_xg_gap",
+        )},
+        "outcome": {
+            "outcome_schema_version": DECISION_OUTCOME_SCHEMA_VERSION,
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "status": "pending", "final_score_home": None, "final_score_away": None,
+            "goals_after_snapshot": None, "first_goal_minute_after_snapshot": None,
+            "goal_within_15": None, "goal_within_25": None, "goal_before_75": None,
+            "goal_to90": None, "resolved_at_utc": None,
+        },
+    }
+
+
+def _is_timestamped_jsonl_archive_name(
+    candidate: str,
+    *,
+    stem: str,
+    extension: str,
+) -> bool:
+    prefix = stem + "."
+    if not candidate.startswith(prefix):
+        return False
+    if candidate.endswith(extension + ".gz"):
+        suffix = extension + ".gz"
+    elif candidate.endswith(extension):
+        suffix = extension
+    else:
+        return False
+    archive_part = candidate[len(prefix):-len(suffix)]
+    timestamp = archive_part.split(".", 1)[0]
+    if not timestamp:
+        return False
+    for pattern in ("%Y%m%dT%H%M%S%fZ", "%Y%m%dT%H%M%SZ"):
+        try:
+            datetime.strptime(timestamp, pattern)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_decision_snapshot_archive_name(
+    candidate: str,
+    *,
+    stem: str,
+    extension: str,
+) -> bool:
+    return _is_timestamped_jsonl_archive_name(
+        candidate,
+        stem=stem,
+        extension=extension,
+    )
+
+
+def _decision_snapshot_paths(path: Optional[str] = None) -> List[str]:
+    """Return rotated archives followed by the active JSONL file."""
+    active = os.path.abspath(path or DECISION_SNAPSHOTS_FILE)
+    parent = os.path.dirname(active) or os.curdir
+    filename = os.path.basename(active)
+    stem, extension = os.path.splitext(filename)
+    archives: List[str] = []
+    try:
+        for candidate in os.listdir(parent):
+            if candidate != filename and _is_decision_snapshot_archive_name(
+                candidate,
+                stem=stem,
+                extension=extension,
+            ):
+                archives.append(os.path.join(parent, candidate))
+    except FileNotFoundError:
+        pass
+    archives.sort()
+    if os.path.exists(active):
+        archives.append(active)
+    return archives
+
+
+def iter_decision_snapshot_records(path: Optional[str] = None):
+    """Yield valid records across archives; malformed lines are isolated."""
+    for source_path in _decision_snapshot_paths(path):
+        try:
+            opener = gzip.open if source_path.endswith(".gz") else open
+            with opener(source_path, "rt", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "[DECISION_SNAPSHOT_INVALID_LINE] file=%s line=%s",
+                            source_path, line_number,
+                        )
+                        continue
+                    if isinstance(record, dict):
+                        yield record
+        except OSError:
+            logger.exception("[DECISION_SNAPSHOT_ERROR] action=read file=%s", source_path)
+
+
+def _decision_record_id(
+    record: Mapping[str, Any],
+    *,
+    source: str = "reader",
+    strict: bool = False,
+) -> str:
+    decision_key = str(record.get("decision_key") or "").strip()
+    decision_id = str(record.get("decision_id") or "").strip()
+    if decision_key and decision_id and decision_key != decision_id:
+        logger.warning(
+            "[DECISION_SNAPSHOT_ID_MISMATCH] source=%s decision_key=%s decision_id=%s",
+            source,
+            decision_key,
+            decision_id,
+        )
+        if strict:
+            raise ValueError(
+                f"mismatched decision_key={decision_key!r} "
+                f"and decision_id={decision_id!r}"
+            )
+        return ""
+    canonical_id = decision_key or decision_id
+    if strict and not canonical_id:
+        raise ValueError("record has no non-empty decision_id or decision_key")
+    return canonical_id
+
+
+def load_joined_decision_snapshots(
+    path: Optional[str] = None,
+    *,
+    include_pending: bool = True,
+    strict_ids: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return one decision row with the newest outcome joined by decision_id."""
+    decisions: Dict[str, Dict[str, Any]] = {}
+    outcomes: Dict[str, Dict[str, Any]] = {}
+    for record in iter_decision_snapshot_records(path):
+        decision_id = _decision_record_id(
+            record,
+            source="joined_reader",
+            strict=strict_ids,
+        )
+        if not decision_id:
+            continue
+        if record.get("record_type") == "decision":
+            current = decisions.get(decision_id)
+            rank = (int(record.get("schema_version") or 1), str(record.get("created_at_utc") or ""))
+            current_rank = (
+                int(current.get("schema_version") or 1), str(current.get("created_at_utc") or "")
+            ) if current else (-1, "")
+            if rank >= current_rank:
+                decisions[decision_id] = record
+        elif record.get("record_type") == "outcome":
+            current = outcomes.get(decision_id)
+            rank = outcome_record_rank(record)
+            current_rank = outcome_record_rank(current)
+            if rank >= current_rank:
+                outcomes[decision_id] = record
+
+    joined: List[Dict[str, Any]] = []
+    for decision_id, decision in decisions.items():
+        item = dict(decision)
+        outcome_record = outcomes.get(decision_id)
+        if outcome_record:
+            item["outcome"] = dict(outcome_record.get("outcome") or {})
+            item["outcome_schema_version"] = int(outcome_record.get("outcome_schema_version") or 1)
+            revision = get_outcome_revision(outcome_record)
+            if revision > 0:
+                item["outcome_revision"] = revision
+            item["outcome_record_created_at_utc"] = outcome_record.get("created_at_utc")
+        if include_pending or str((item.get("outcome") or {}).get("status")) != "pending":
+            joined.append(item)
+    joined.sort(key=lambda item: (str(item.get("created_at_utc") or ""), str(item.get("decision_id") or "")))
+    return joined
+
+
+_observation_history_lock = threading.RLock()
+# Compatibility marker used by tests and memory telemetry.  Durable dedupe
+# keys now live in the disk-backed reconcile index instead of a Python set;
+# keeping ~778k strings resident was both expensive and redundant.
+_observation_history_keys: Optional[Set[str]] = None
+_observation_history_key_count = 0
+_observation_reconcile_index: Optional[Dict[str, Any]] = None
+_OBSERVATION_RECONCILE_INDEX_SCHEMA_VERSION = 2
+_OBSERVATION_RECONCILE_REBUILD_RETRY_SECONDS = 300.0
+
+
+def _observation_config_snapshot() -> Dict[str, Any]:
+    values = {
+        "dynamic_to90_enabled": bool(ENABLE_DYNAMIC_PROB_TO90_THRESHOLD),
+        "dynamic_to90_46_49": float(DYNAMIC_TO90_THRESHOLD_46_49),
+        "dynamic_to90_50_53": float(DYNAMIC_TO90_THRESHOLD_50_53),
+        "dynamic_to90_54_57": float(DYNAMIC_TO90_THRESHOLD_54_57),
+        "dynamic_to90_58_60": float(DYNAMIC_TO90_THRESHOLD_58_60),
+        "window_1_next15": float(WINDOW_1_NEXT_15_THRESHOLD),
+        "window_2_next15": float(WINDOW_2_NEXT_15_THRESHOLD),
+        "channel_signal_filter_version": str(CHANNEL_SIGNAL_FILTER_VERSION),
+        "channel_signal_min_prob_to90": float(CHANNEL_SIGNAL_MIN_PROB_TO90),
+        "channel_signal_min_reputation_delta_to90_pp": float(
+            CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP
+        ),
+        "channel_signal_min_adjusted_intensity": float(
+            CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY
+        ),
+        "channel_signal_min_season_context_factor": float(
+            CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR
+        ),
+        "premium_badge_rule_version": str(PREMIUM_BADGE_RULE_VERSION),
+        "premium_badge_max_goals_at_snapshot": int(
+            PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT
+        ),
+        "rescue_enabled": bool(ENABLE_RESCUE_SIGNALS),
+        "rescue_max_shortfall_pp": float(RESCUE_MAX_THRESHOLD_SHORTFALL_PP),
+        "rescue_min_score": float(RESCUE_MIN_CONTROLLER_SCORE),
+        "rescue_min_reliability": float(RESCUE_MIN_RELIABILITY),
+        "rescue_confirmation_observations": int(RESCUE_CONFIRMATION_OBSERVATIONS),
+        "live_gate_garbage_only": bool(LIVE_GATE_GARBAGE_ONLY),
+        "normal_time_boundary_mode": str(NORMAL_TIME_BOUNDARY_MODE),
+        "second_half_factors_enabled": bool(ENABLE_2H_FACTORS),
+        "second_half_soft_apply_enabled": bool(ENABLE_2H_SOFT_APPLY),
+        "second_half_max_antiboost_pct": float(SOFT_APPLY_MAX_ANTIBOOST_PCT),
+        "second_half_max_boost_pct": float(SOFT_APPLY_MAX_BOOST_PCT),
+        "pressure_aux_mode": bool(PRESSURE_AUX_MODE),
+        "signal_reputation_shadow_enabled": bool(ENABLE_SIGNAL_REPUTATION_SHADOW),
+        "signal_reputation_auto_apply_enabled": bool(
+            ENABLE_SIGNAL_REPUTATION_AUTO_APPLY
+        ),
+        "signal_reputation_production_cohort": (
+            "expanded_blend"
+            if ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY
+            else "telegram_signals"
+        ),
+        "signal_reputation_expanded_shadow_enabled": bool(
+            ENABLE_SIGNAL_REPUTATION_EXPANDED_SHADOW
+        ),
+        "signal_reputation_expanded_production_apply": bool(
+            ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY
+        ),
+        "signal_reputation_blend_to90_telegram_weight": float(
+            SIGNAL_REPUTATION_BLEND_TELEGRAM_WEIGHT
+        ),
+        "signal_reputation_blend_next15_telegram_weight": float(
+            SIGNAL_REPUTATION_BLEND_NEXT15_TELEGRAM_WEIGHT
+        ),
+        "signal_reputation_blend_recommended_caps_pp": {
+            "next15": 1.0,
+            "to90": 2.0,
+        },
+        "signal_reputation_half_life_days": float(
+            SIGNAL_REPUTATION_HALF_LIFE_DAYS
+        ),
+        "signal_reputation_prior_global": float(SIGNAL_REPUTATION_PRIOR_GLOBAL),
+        "signal_reputation_prior_league": float(SIGNAL_REPUTATION_PRIOR_LEAGUE),
+        "signal_reputation_prior_team": float(SIGNAL_REPUTATION_PRIOR_TEAM),
+        "signal_reputation_prior_team_league": float(
+            SIGNAL_REPUTATION_PRIOR_TEAM_LEAGUE
+        ),
+        "signal_reputation_prior_role": float(SIGNAL_REPUTATION_PRIOR_ROLE),
+    }
+    factor_versions = {
+        "probability": "45_plus_v2",
+        "pressure": "v3_smooth",
+        "box_and_save_saturation": "hill_v2",
+        "second_half_parser": str(SECOND_HALF_PARSER_VERSION),
+        "second_half_history_schema": int(SECOND_HALF_HISTORY_SCHEMA_VERSION),
+        "dynamic_threshold": "minute_bucket_v1",
+        "rescue_controller": "v1_retired_from_publication",
+        "channel_signal_filter": str(CHANNEL_SIGNAL_FILTER_VERSION),
+        "premium_badge": str(PREMIUM_BADGE_RULE_VERSION),
+        "signal_reputation": "v1",
+        "signal_reputation_expanded_blend": (
+            "convex_v1_production"
+            if ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY
+            else "convex_v1_shadow"
+        ),
+    }
+    serialized = json.dumps(
+        {"values": values, "factor_versions": factor_versions},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    code_hash = getattr(_observation_config_snapshot, "_code_hash", None)
+    if not code_hash:
+        try:
+            with open(__file__, "rb") as source:
+                code_hash = hashlib.sha256(source.read()).hexdigest()[:16]
+        except OSError:
+            code_hash = "unavailable"
+        setattr(_observation_config_snapshot, "_code_hash", code_hash)
+    return {
+        "config_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16],
+        "code_hash": code_hash,
+        "values": values,
+        "model_version": "45_plus_v2",
+        "pressure_version": "v3_smooth",
+        "factor_versions": factor_versions,
+        "observation_schema_version": int(OBSERVATION_SCHEMA_VERSION),
+    }
+
+
+def _observation_metric(
+    fixture_metrics: Dict[str, Any],
+    aliases: List[str],
+    side: str,
+    *,
+    integer: bool = False,
+) -> Tuple[Optional[Any], bool]:
+    value = get_any_metric(fixture_metrics, aliases, side)
+    if value is None or value == "" or str(value).strip().upper() in {"N/A", "NULL", "NONE", "-"}:
+        return None, False
+    try:
+        return (int(float(value)) if integer else round(float(value), 4)), True
+    except (TypeError, ValueError):
+        return None, False
+
+
+def _build_observation_raw_metrics(
+    fixture_metrics: Dict[str, Any],
+    probability_result: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, bool], Dict[str, Any]]:
+    probability_result = probability_result if isinstance(probability_result, dict) else {}
+    specs = {
+        "xg": (["expected_goals"], False),
+        "shots_on_target": (["shots_on_target"], True),
+        "shots_in_box": (["shots_insidebox", "shots_inside_box", "inside_box"], True),
+        "total_shots": (["total_shots"], True),
+        "saves": (["saves", "goalkeeper_saves"], True),
+        "corners": (["corner_kicks", "corners"], True),
+        "possession": (["ball_possession", "passes_%"], False),
+        "yellow_cards": (["yellow_cards"], True),
+        "red_cards": (["red_cards"], True),
+        "attacks": (["attacks"], False),
+        "dangerous_attacks": (["dangerous_attacks"], False),
+    }
+    raw: Dict[str, Any] = {}
+    availability: Dict[str, bool] = {}
+    for name, (aliases, integer) in specs.items():
+        for side in ("home", "away"):
+            value, available = _observation_metric(
+                fixture_metrics, aliases, side, integer=integer
+            )
+            key = f"{name}_{side}"
+            raw[key] = value
+            availability[key] = bool(available)
+
+    quality = {
+        "has_raw_statistics": bool(fixture_metrics.get("_has_raw_statistics", False)),
+        "stats_health": str(
+            ((fixture_metrics.get("_stats_health") or {}).get("stats_health"))
+            if isinstance(fixture_metrics.get("_stats_health"), dict)
+            else "unknown"
+        ),
+        "xg_source": str(probability_result.get("xg_source") or "missing"),
+        "xg_confidence": _safe_float(probability_result.get("xg_confidence"), 0.0),
+        "tempo_source": str(probability_result.get("tempo_source") or "missing"),
+        "tempo_confidence": _safe_float(probability_result.get("tempo_confidence"), 0.0),
+        "available_metric_count": sum(1 for value in availability.values() if value),
+        "total_metric_count": len(availability),
+    }
+    return raw, availability, quality
+
+
+def build_observation_from_decision(
+    decision_snapshot: Dict[str, Any],
+    fixture_metrics: Dict[str, Any],
+    probability_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    decision_id = str(
+        decision_snapshot.get("decision_key")
+        or decision_snapshot.get("decision_id")
+        or ""
+    )
+    raw_metrics, availability, data_quality = _build_observation_raw_metrics(
+        fixture_metrics, probability_result
+    )
+    return {
+        "record_type": "observation",
+        "observation_id": decision_id,
+        "observation_key": decision_id,
+        "fixture_id": _safe_int(decision_snapshot.get("fixture_id"), 0),
+        "created_at_utc": str(decision_snapshot.get("created_at_utc") or _utc_now_iso()),
+        "decision_created_at_utc": str(
+            decision_snapshot.get("decision_created_at_utc")
+            or decision_snapshot.get("created_at_utc")
+            or _utc_now_iso()
+        ),
+        "schema_version": int(OBSERVATION_SCHEMA_VERSION),
+        "stage": "decision_pipeline",
+        "minute": _safe_int(decision_snapshot.get("minute"), 0),
+        "window_name": decision_snapshot.get("window_name"),
+        "config": _observation_config_snapshot(),
+        "match": dict(decision_snapshot.get("match") or {}),
+        "raw_metrics": raw_metrics,
+        "availability": availability,
+        "data_quality": data_quality,
+        "features": {
+            "pressure_index": probability_result.get("pressure_index"),
+            "pressure_components": dict(probability_result.get("pressure_components") or {}),
+            "save_stress": probability_result.get("save_stress"),
+            "tempo": probability_result.get("tempo"),
+            "live_intensity": probability_result.get("live_intensity"),
+            "adjusted_intensity": probability_result.get("adjusted_intensity"),
+            "lambda_2h": probability_result.get("lambda_2h"),
+            "game_state_factor": probability_result.get("game_state_factor"),
+            "goal_xg_gap": probability_result.get("goal_xg_gap"),
+            "goal_xg_gap_factor": probability_result.get("goal_xg_gap_factor"),
+            "xg_delta_factor": probability_result.get("xg_delta_factor"),
+            "season_context_factor": probability_result.get("season_context_factor_45p"),
+            "team_2h_factor": probability_result.get("team_2h_factor"),
+            "league_2h_factor": probability_result.get("league_2h_factor"),
+            "score_state_factor": probability_result.get("score_state_factor"),
+            "sample_confidence": probability_result.get("sample_confidence"),
+        },
+        "probabilities": dict(decision_snapshot.get("probabilities") or {}),
+        "gates": dict(decision_snapshot.get("gates") or {}),
+        "decision": dict(decision_snapshot.get("decision") or {}),
+        "publication_policy": dict(
+            decision_snapshot.get("publication_policy") or {}
+        ),
+        "channel_signal_filter": dict(
+            decision_snapshot.get("channel_signal_filter") or {}
+        ),
+        "legacy_selection_gates": dict(
+            decision_snapshot.get("legacy_selection_gates") or {}
+        ),
+        "rescue": dict(decision_snapshot.get("rescue") or {}),
+        "telegram": dict(decision_snapshot.get("telegram") or {}),
+        "outcome": {"status": "pending", "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value},
+    }
+
+
+def build_wide_monitor_observation(
+    *,
+    fixture_id: int,
+    minute: int,
+    fixture_metrics: Dict[str, Any],
+    probability_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a post-send research row without re-entering publication logic.
+
+    The main decision pipeline stops evaluating a fixture after its Telegram
+    signal is sent.  The monitor already owns a fresh full-statistics snapshot,
+    so this row removes that selection censoring at negligible API cost.  It is
+    never itself a publication decision.
+    """
+
+    fixture_id_int = int(fixture_id)
+    minute_int = int(minute)
+    raw_metrics, availability, data_quality = _build_observation_raw_metrics(
+        fixture_metrics,
+        probability_result,
+    )
+    match = build_match_identity_context(fixture_metrics)
+    score_home = _safe_int(_unwrap_value(fixture_metrics.get("score_home")), 0)
+    score_away = _safe_int(_unwrap_value(fixture_metrics.get("score_away")), 0)
+    match.update(
+        {
+            "score_home": score_home,
+            "score_away": score_away,
+            "score_state": f"{score_home}-{score_away}",
+        }
+    )
+    observation_id = (
+        f"{fixture_id_int}:{minute_int}:WIDE_MONITOR:"
+        f"v{int(OBSERVATION_SCHEMA_VERSION)}"
+    )
+    probability_fields = {
+        "prob_next_15": probability_result.get("prob_next_15"),
+        "prob_next_25": probability_result.get("prob_next_25"),
+        "prob_to75": probability_result.get("prob_to75"),
+        "prob_to90": probability_result.get("prob_to90"),
+        "prob_until_end_decision": probability_result.get("prob_to90"),
+        "baseline_prob_next_15": probability_result.get(
+            "baseline_prob_next_15"
+        ),
+        "baseline_prob_next_25": probability_result.get(
+            "baseline_prob_next_25"
+        ),
+        "baseline_prob_to75": probability_result.get("baseline_prob_to75"),
+        "baseline_prob_to90": probability_result.get("baseline_prob_to90"),
+        "final_prob_next_15": probability_result.get("prob_next_15"),
+        "final_prob_next_25": probability_result.get("prob_next_25"),
+        "final_prob_to75": probability_result.get("prob_to75"),
+        "final_prob_to90": probability_result.get("prob_to90"),
+        "reputation_base_prob_next_15": probability_result.get(
+            "reputation_base_prob_next_15"
+        ),
+        "reputation_adjusted_prob_next_15": probability_result.get(
+            "reputation_adjusted_prob_next_15"
+        ),
+        "reputation_base_prob_to90": probability_result.get(
+            "reputation_base_prob_to90"
+        ),
+        "reputation_adjusted_prob_to90": probability_result.get(
+            "reputation_adjusted_prob_to90"
+        ),
+    }
+    return {
+        "record_type": "observation",
+        "observation_id": observation_id,
+        "observation_key": observation_id,
+        "fixture_id": fixture_id_int,
+        "created_at_utc": _utc_now_iso(),
+        "schema_version": int(OBSERVATION_SCHEMA_VERSION),
+        "stage": "wide_monitor",
+        "minute": minute_int,
+        "window_name": (
+            "WINDOW_1"
+            if minute_int <= REGULAR_SIGNAL_WINDOW_1_MAX_MINUTE
+            else "WINDOW_2"
+        ),
+        "config": _observation_config_snapshot(),
+        "match": match,
+        "raw_metrics": raw_metrics,
+        "availability": availability,
+        "data_quality": data_quality,
+        "features": {
+            "pressure_index": probability_result.get("pressure_index"),
+            "pressure_components": dict(
+                probability_result.get("pressure_components") or {}
+            ),
+            "save_stress": probability_result.get("save_stress"),
+            "tempo": probability_result.get("tempo"),
+            "live_intensity": probability_result.get("live_intensity"),
+            "adjusted_intensity": probability_result.get(
+                "adjusted_intensity"
+            ),
+            "lambda_2h": probability_result.get("lambda_2h"),
+            "game_state_factor": probability_result.get("game_state_factor"),
+            "goal_xg_gap": probability_result.get("goal_xg_gap"),
+            "goal_xg_gap_factor": probability_result.get(
+                "goal_xg_gap_factor"
+            ),
+            "xg_delta_factor": probability_result.get("xg_delta_factor"),
+            "season_context_factor": probability_result.get(
+                "season_context_factor_45p"
+            ),
+            "team_2h_factor": probability_result.get("team_2h_factor"),
+            "league_2h_factor": probability_result.get("league_2h_factor"),
+            "score_state_factor": probability_result.get(
+                "score_state_factor"
+            ),
+            "sample_confidence": probability_result.get("sample_confidence"),
+        },
+        "probabilities": probability_fields,
+        "gates": {
+            "readiness_passed": True,
+            "other_hard_gates_passed": True,
+            "publication_context_passed": True,
+        },
+        "publication_policy": {
+            "publication_context_passed": True,
+            "publication_allow": False,
+            "monitor_only": True,
+        },
+        "channel_signal_filter": {},
+        "decision": {
+            "final_decision": "NOT_EVALUATED",
+            "block_reason": "post_send_wide_monitor",
+            "active_publication_allow": False,
+            "signal_route": "none",
+        },
+        "telegram": {
+            "send_attempted": False,
+            "send_ok": False,
+            "monitor_only": True,
+        },
+        "outcome": {
+            "status": "pending",
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+        },
+    }
+
+
+def build_prefilter_observation(
+    *,
+    fixture_id: int,
+    minute: int,
+    reason: str,
+    fixture_metrics: Optional[Dict[str, Any]] = None,
+    raw_fixture: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    fixture_metrics = fixture_metrics if isinstance(fixture_metrics, dict) else {}
+    raw_fixture = raw_fixture if isinstance(raw_fixture, dict) else {}
+    raw_metrics, availability, data_quality = _build_observation_raw_metrics(fixture_metrics)
+    raw_goals = raw_fixture.get("goals") if isinstance(raw_fixture.get("goals"), dict) else {}
+    score_home = _safe_int(_unwrap_value(fixture_metrics.get("score_home")), _safe_int(raw_goals.get("home"), 0))
+    score_away = _safe_int(_unwrap_value(fixture_metrics.get("score_away")), _safe_int(raw_goals.get("away"), 0))
+    observation_id = f"{int(fixture_id)}:{int(minute)}:PREFILTER:v{OBSERVATION_SCHEMA_VERSION}"
+    identity = build_match_identity_context(fixture_metrics)
+    raw_teams = raw_fixture.get("teams") if isinstance(raw_fixture.get("teams"), dict) else {}
+    raw_league = raw_fixture.get("league") if isinstance(raw_fixture.get("league"), dict) else {}
+    raw_fixture_obj = raw_fixture.get("fixture") if isinstance(raw_fixture.get("fixture"), dict) else {}
+    raw_status = raw_fixture_obj.get("status") if isinstance(raw_fixture_obj.get("status"), dict) else {}
+    identity.update({
+        "home_team_id": identity.get("home_team_id") or _safe_int((raw_teams.get("home") or {}).get("id"), 0) or None,
+        "home_team_name": identity.get("home_team_name") if identity.get("home_team_name") != "unknown" else str((raw_teams.get("home") or {}).get("name") or "unknown"),
+        "away_team_id": identity.get("away_team_id") or _safe_int((raw_teams.get("away") or {}).get("id"), 0) or None,
+        "away_team_name": identity.get("away_team_name") if identity.get("away_team_name") != "unknown" else str((raw_teams.get("away") or {}).get("name") or "unknown"),
+        "league_id": identity.get("league_id") or _safe_int(raw_league.get("id"), 0) or None,
+        "league_name": identity.get("league_name") if identity.get("league_name") != "unknown" else str(raw_league.get("name") or "unknown"),
+        "league_country": identity.get("league_country") if identity.get("league_country") != "unknown" else str(raw_league.get("country") or "unknown"),
+        "status_short": _normalize_status_short(fixture_metrics) or str(raw_status.get("short") or ""),
+    })
+    identity.update({
+        "score_home": score_home,
+        "score_away": score_away,
+        "score_state": f"{score_home}-{score_away}",
+    })
+    return {
+        "record_type": "observation",
+        "observation_id": observation_id,
+        "observation_key": observation_id,
+        "fixture_id": int(fixture_id),
+        "created_at_utc": _utc_now_iso(),
+        "schema_version": int(OBSERVATION_SCHEMA_VERSION),
+        "stage": "prefilter",
+        "minute": int(minute),
+        "window_name": None,
+        "config": _observation_config_snapshot(),
+        "match": identity,
+        "raw_metrics": raw_metrics,
+        "availability": availability,
+        "data_quality": data_quality,
+        "features": {},
+        "probabilities": {},
+        "gates": {},
+        "decision": {
+            "final_decision": "BLOCK",
+            "block_reason": str(reason),
+            "signal_route": "none",
+        },
+        "rescue": {},
+        "telegram": {"send_attempted": False, "send_ok": False},
+        "outcome": {"status": "pending", "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value},
+    }
+
+
+_ROLLING_DYNAMICS_SEED_SLOTS: Tuple[Tuple[str, int, int, int], ...] = (
+    # With the normal one-minute polling cadence these slots capture at
+    # 36/39/41/44.  Together with decision observations from minute 46 onward,
+    # that keeps both rolling windows available through minute 60 while the
+    # tracker still enforces honest 5-7 and 10-12 minute spans.
+    ("10m", 10, 36, 39),
+    ("10m_bridge", 10, 39, 41),
+    ("5m", 5, 41, 44),
+    ("5m_bridge", 5, 44, 46),
+)
+
+
+def rolling_dynamics_seed_slot(minute: int) -> Optional[Tuple[str, int]]:
+    """Return the single prospective seed slot for this match minute."""
+    minute_i = _safe_int(minute, 0)
+    for slot_name, window, start_minute, stop_minute in _ROLLING_DYNAMICS_SEED_SLOTS:
+        if start_minute <= minute_i < stop_minute:
+            return slot_name, window
+    return None
+
+
+def build_rolling_dynamics_seed_observation(
+    *,
+    fixture_id: int,
+    minute: int,
+    slot_name: str,
+    target_window_minutes: int,
+    fixture_metrics: Optional[Dict[str, Any]] = None,
+    raw_fixture: Optional[Dict[str, Any]] = None,
+    fetch_status: str = "unknown",
+    fetch_duration_seconds: Optional[float] = None,
+    fetch_attempt_statuses: Optional[List[str]] = None,
+    fetch_attempt_durations_seconds: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """Build an outcome-free statistics baseline used only by rolling telemetry."""
+    observation = build_prefilter_observation(
+        fixture_id=fixture_id,
+        minute=minute,
+        reason="rolling_dynamics_seed",
+        fixture_metrics=fixture_metrics,
+        raw_fixture=raw_fixture,
+    )
+    observation_id = (
+        f"{int(fixture_id)}:ROLLING_SEED_{str(slot_name).upper()}:"
+        f"rv{ROLLING_DYNAMICS_SCHEMA_VERSION}:v{OBSERVATION_SCHEMA_VERSION}"
+    )
+    observation["observation_id"] = observation_id
+    observation["observation_key"] = observation_id
+    observation["stage"] = "rolling_seed"
+    observation["window_name"] = None
+
+    availability = (
+        observation.get("availability")
+        if isinstance(observation.get("availability"), dict)
+        else {}
+    )
+    data_quality = (
+        observation.get("data_quality")
+        if isinstance(observation.get("data_quality"), dict)
+        else {}
+    )
+    if (
+        availability.get("xg_home") is True
+        and availability.get("xg_away") is True
+    ):
+        data_quality["xg_source"] = "api"
+        data_quality["xg_confidence"] = 1.0
+    else:
+        data_quality["xg_source"] = "missing"
+        data_quality["xg_confidence"] = 0.0
+    observation["data_quality"] = data_quality
+
+    fixture_metrics = fixture_metrics if isinstance(fixture_metrics, dict) else {}
+    stats_health = (
+        fixture_metrics.get("_stats_health")
+        if isinstance(fixture_metrics.get("_stats_health"), dict)
+        else {}
+    )
+    pressure_index: Optional[float] = None
+    if stats_health.get("pressure_available") is True:
+        pressure_index = round(float(calculate_pressure_index(fixture_metrics)), 4)
+    observation["features"] = {"pressure_index": pressure_index}
+    attempt_statuses = [
+        str(status or "unknown")
+        for status in (fetch_attempt_statuses or [fetch_status])
+    ]
+    attempt_durations = [
+        round(max(0.0, float(duration)), 3)
+        for duration in (fetch_attempt_durations_seconds or [])
+    ]
+    observation["rolling_seed"] = {
+        "slot": str(slot_name),
+        "target_window_minutes": int(target_window_minutes),
+        "captured_minute": int(minute),
+        "statistics_fetch_status": str(fetch_status or "unknown"),
+        "statistics_fetch_attempt_count": len(attempt_statuses),
+        "statistics_fetch_attempt_statuses": attempt_statuses,
+        "statistics_fetch_attempt_durations_seconds": attempt_durations,
+        "statistics_fetch_retry_used": len(attempt_statuses) > 1,
+        "statistics_fetch_duration_seconds": (
+            round(float(fetch_duration_seconds), 3)
+            if fetch_duration_seconds is not None
+            else None
+        ),
+        "shadow_only": True,
+        "production_applied": False,
+    }
+    observation["decision"] = {
+        "final_decision": "NOT_EVALUATED",
+        "block_reason": "rolling_dynamics_seed",
+        "signal_route": "none",
+    }
+    observation["telegram"] = {"send_attempted": False, "send_ok": False}
+    # A telemetry seed is intentionally never labelled as a prediction target.
+    observation["outcome"] = {
+        "status": "void",
+        "void_reason": "rolling_dynamics_seed",
+        "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+    }
+    return observation
+
+
+def _observation_history_paths(path: Optional[str] = None) -> List[str]:
+    active = os.path.abspath(path or OBSERVATION_HISTORY_FILE)
+    parent = os.path.dirname(active) or os.curdir
+    filename = os.path.basename(active)
+    stem, extension = os.path.splitext(filename)
+    archives: List[str] = []
+    try:
+        for candidate in os.listdir(parent):
+            if (
+                candidate != filename
+                and _is_timestamped_jsonl_archive_name(
+                    candidate,
+                    stem=stem,
+                    extension=extension,
+                )
+            ):
+                archives.append(os.path.join(parent, candidate))
+    except FileNotFoundError:
+        pass
+    archives.sort()
+    if os.path.exists(active):
+        archives.append(active)
+    return archives
+
+
+def iter_observation_history_records(path: Optional[str] = None):
+    for source_path in _observation_history_paths(path):
+        opener = gzip.open if source_path.endswith(".gz") else open
+        try:
+            with opener(source_path, "rt", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "[OBSERVATION_INVALID_LINE] file=%s line=%s",
+                            source_path, line_number,
+                        )
+                        continue
+                    if isinstance(record, dict):
+                        yield record
+        except OSError:
+            logger.exception("[OBSERVATION_ERROR] action=read file=%s", source_path)
+
+
+def _rotate_observation_history_if_needed(path: str, incoming_bytes: int) -> Optional[str]:
+    if OBSERVATION_ROTATE_MAX_BYTES <= 0 or not os.path.exists(path):
+        return None
+    if os.path.getsize(path) + max(0, int(incoming_bytes)) <= OBSERVATION_ROTATE_MAX_BYTES:
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stem, extension = os.path.splitext(path)
+    archive = f"{stem}.{stamp}{extension}.gz"
+    temporary_archive = archive + ".tmp"
+    with open(path, "rb") as source, gzip.open(temporary_archive, "wb", compresslevel=6) as target:
+        shutil.copyfileobj(source, target, length=1024 * 1024)
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary_archive, archive)
+    _fsync_parent_directory(archive)
+    os.remove(path)
+    _fsync_parent_directory(path)
+    logger.info("[OBSERVATION_ROTATE] source=%s archive=%s", path, archive)
+    return archive
+
+
+def _observation_history_dedupe_key(record: Mapping[str, Any]) -> str:
+    observation_id = str(
+        record.get("observation_key") or record.get("observation_id") or ""
+    )
+    if not observation_id:
+        return ""
+    record_type = str(record.get("record_type") or "observation")
+    schema = _safe_int(
+        record.get("outcome_schema_version")
+        if record_type == "observation_outcome"
+        else record.get("schema_version"),
+        1,
+    )
+    revision = (
+        get_outcome_revision(record)
+        if record_type == "observation_outcome"
+        else 0
+    )
+    suffix = f":r{revision}" if revision > 0 else ""
+    return f"{observation_id}:{record_type}:v{schema}{suffix}"
+
+
+def _observation_history_source_signature(
+    path: str,
+) -> Tuple[Tuple[str, int, int, int, int], ...]:
+    """Return a cheap content identity for archives plus the active journal.
+
+    ``ctime`` is deliberately excluded.  Snapshot workers used to create hard
+    links to immutable archives; adding or removing a link changes inode ctime
+    without changing one byte of journal content.  Device + inode still detect
+    replacement, while size + mtime detect ordinary appends and rewrites.
+    """
+    signature: List[Tuple[str, int, int, int, int]] = []
+    for source_path in _observation_history_paths(path):
+        try:
+            stat_result = os.stat(source_path)
+        except OSError:
+            continue
+        signature.append(
+            (
+                os.path.abspath(source_path),
+                int(stat_result.st_size),
+                int(stat_result.st_mtime_ns),
+                int(stat_result.st_dev),
+                int(stat_result.st_ino),
+            )
+        )
+    return tuple(signature)
+
+
+def _observation_reconcile_projection(record: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep only fields consumed by outcome reconciliation.
+
+    The source observations can contain large feature/debug payloads.  The
+    reconcile cache deliberately stores a narrow projection on disk so it
+    does not become a second copy of the multi-gigabyte journal in RSS.
+    """
+    observation_id = str(
+        record.get("observation_key") or record.get("observation_id") or ""
+    )
+    projection: Dict[str, Any] = {
+        "record_type": "observation",
+        "observation_id": str(record.get("observation_id") or observation_id),
+        "observation_key": str(record.get("observation_key") or observation_id),
+        "fixture_id": _safe_int(record.get("fixture_id"), -1),
+        "created_at_utc": str(record.get("created_at_utc") or ""),
+        "schema_version": _safe_int(record.get("schema_version"), 1),
+        "stage": str(record.get("stage") or ""),
+        "minute": _safe_int(record.get("minute"), 0),
+        "match": copy.deepcopy(
+            record.get("match") if isinstance(record.get("match"), Mapping) else {}
+        ),
+        "outcome": copy.deepcopy(
+            record.get("outcome")
+            if isinstance(record.get("outcome"), Mapping)
+            else {}
+        ),
+    }
+    rolling = record.get("rolling_dynamics")
+    if isinstance(rolling, Mapping):
+        # Eligibility needs the contract markers, not every rolling feature.
+        projection["rolling_dynamics"] = {
+            "schema_version": _safe_int(rolling.get("schema_version"), 0),
+            "production_applied": rolling.get("production_applied"),
+            "mode": str(rolling.get("mode") or ""),
+            "windows": {} if isinstance(rolling.get("windows"), Mapping) else None,
+        }
+    return projection
+
+
+def _observation_outcome_projection(record: Mapping[str, Any]) -> Dict[str, Any]:
+    observation_id = str(
+        record.get("observation_key") or record.get("observation_id") or ""
+    )
+    return {
+        "record_type": "observation_outcome",
+        "observation_id": str(record.get("observation_id") or observation_id),
+        "observation_key": str(record.get("observation_key") or observation_id),
+        "fixture_id": _safe_int(record.get("fixture_id"), -1),
+        "outcome_schema_version": get_outcome_schema_version(record),
+        "outcome_revision": get_outcome_revision(record),
+        "created_at_utc": str(record.get("created_at_utc") or ""),
+        "outcome": copy.deepcopy(
+            record.get("outcome")
+            if isinstance(record.get("outcome"), Mapping)
+            else {}
+        ),
+    }
+
+
+def _observation_timestamp_value(value: Any) -> Optional[float]:
+    parsed = _parse_iso_utc(value)
+    return parsed.timestamp() if parsed is not None else None
+
+
+def _observation_reconcile_index_path(history_path: str) -> str:
+    return os.path.abspath(history_path) + ".reconcile.sqlite3"
+
+
+@contextmanager
+def _observation_history_process_lock(history_path: str):
+    """Serialize journal rotation/index commits across accidental processes."""
+
+    lock_path = _observation_reconcile_index_path(history_path) + ".lock"
+    parent = os.path.dirname(lock_path) or os.curdir
+    os.makedirs(parent, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _fsync_parent_directory(path: str) -> None:
+    """Make a newly created/replaced journal entry durable on POSIX."""
+
+    parent = os.path.dirname(os.path.abspath(path)) or os.curdir
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _observation_source_signature_digest(
+    signature: Tuple[Tuple[str, int, int, int, int], ...],
+) -> str:
+    payload = json.dumps(signature, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _create_observation_reconcile_connection(
+    database_path: str,
+) -> sqlite3.Connection:
+    # Build into a sibling temporary file and atomically publish it.  The
+    # durable sidecar is derived data: the JSONL journal remains authoritative.
+    connection = sqlite3.connect(database_path, check_same_thread=False)
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA cache_size=-8192")
+    connection.executescript(
+        """
+        CREATE TABLE observation_records (
+            observation_id TEXT PRIMARY KEY,
+            has_observation INTEGER NOT NULL DEFAULT 0,
+            fixture_id INTEGER NOT NULL DEFAULT -1,
+            observation_schema INTEGER NOT NULL DEFAULT -1,
+            observation_created_at TEXT NOT NULL DEFAULT '',
+            observation_created_ts REAL,
+            embedded_status TEXT NOT NULL DEFAULT '',
+            stage TEXT NOT NULL DEFAULT '',
+            observation_payload TEXT,
+            outcome_schema INTEGER NOT NULL DEFAULT -1,
+            outcome_revision INTEGER NOT NULL DEFAULT -1,
+            outcome_created_at TEXT NOT NULL DEFAULT '',
+            outcome_created_ts REAL,
+            outcome_status TEXT NOT NULL DEFAULT '',
+            outcome_payload TEXT,
+            effective_status TEXT NOT NULL DEFAULT ''
+        ) WITHOUT ROWID;
+        CREATE TABLE observation_dedupe_keys (
+            dedupe_key TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        CREATE TABLE fixture_reconcile_summary (
+            fixture_id INTEGER PRIMARY KEY,
+            pending INTEGER NOT NULL,
+            pending_oldest_ts REAL,
+            collectable_2h INTEGER NOT NULL
+        );
+        CREATE TABLE observation_reconcile_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) WITHOUT ROWID;
+        """
+    )
+    return connection
+
+
+def _observation_reconcile_cutoff_timestamp() -> Optional[float]:
+    cutoff = _parse_iso_utc(SECOND_HALF_ALL_MATCHES_SINCE_UTC)
+    return cutoff.timestamp() if cutoff is not None else None
+
+
+def _populate_observation_reconcile_summaries(
+    index: Dict[str, Any],
+) -> None:
+    """Cache small fixture-level cohorts derived from the SQLite rows."""
+
+    connection = index.get("connection")
+    if not isinstance(connection, sqlite3.Connection):
+        raise RuntimeError("observation reconcile index has no connection")
+    pending_rows = connection.execute(
+        """
+        SELECT fixture_id, MIN(observation_created_ts)
+        FROM observation_records
+        WHERE has_observation = 1
+          AND fixture_id >= 0
+          AND effective_status NOT IN ('resolved', 'void', 'quarantine')
+        GROUP BY fixture_id
+        """
+    ).fetchall()
+    pending_fixtures = {int(row[0]) for row in pending_rows}
+    pending_oldest_ts = {
+        int(row[0]): float(row[1])
+        for row in pending_rows
+        if row[1] is not None
+    }
+    cutoff_ts = _observation_reconcile_cutoff_timestamp()
+    if cutoff_ts is None:
+        collectable_query = """
+            SELECT DISTINCT fixture_id
+            FROM observation_records
+            WHERE has_observation = 1
+              AND fixture_id >= 0
+              AND stage != 'rolling_seed'
+              AND effective_status NOT IN ('resolved', 'void', 'quarantine')
+        """
+        params: Tuple[Any, ...] = ()
+    else:
+        collectable_query = """
+            SELECT DISTINCT fixture_id
+            FROM observation_records
+            WHERE has_observation = 1
+              AND fixture_id >= 0
+              AND stage != 'rolling_seed'
+              AND effective_status NOT IN ('void', 'quarantine')
+              AND observation_created_ts >= ?
+        """
+        params = (cutoff_ts,)
+    collectable_2h = {
+        int(row[0])
+        for row in connection.execute(collectable_query, params).fetchall()
+    }
+    index["pending_fixtures"] = pending_fixtures
+    index["pending_oldest_ts"] = pending_oldest_ts
+    index["collectable_2h_fixtures"] = collectable_2h
+    index["second_half_cutoff_ts"] = cutoff_ts
+    connection.execute("DELETE FROM fixture_reconcile_summary")
+    all_fixtures = pending_fixtures | collectable_2h
+    connection.executemany(
+        "INSERT INTO fixture_reconcile_summary "
+        "(fixture_id, pending, pending_oldest_ts, collectable_2h) "
+        "VALUES (?, ?, ?, ?)",
+        [
+            (
+                fixture_id,
+                int(fixture_id in pending_fixtures),
+                pending_oldest_ts.get(fixture_id),
+                int(fixture_id in collectable_2h),
+            )
+            for fixture_id in all_fixtures
+        ],
+    )
+
+
+def _refresh_observation_reconcile_fixture(
+    index: Dict[str, Any], fixture_id: int
+) -> None:
+    """Refresh one fixture summary after an indexed append or revision."""
+
+    fixture_id = int(fixture_id)
+    if fixture_id < 0:
+        return
+    connection = index.get("connection")
+    if not isinstance(connection, sqlite3.Connection):
+        return
+    pending_row = connection.execute(
+        """
+        SELECT COUNT(*), MIN(observation_created_ts)
+        FROM observation_records
+        WHERE has_observation = 1
+          AND fixture_id = ?
+          AND effective_status NOT IN ('resolved', 'void', 'quarantine')
+        """,
+        (fixture_id,),
+    ).fetchone()
+    pending_fixtures: Set[int] = index.setdefault("pending_fixtures", set())
+    pending_oldest_ts: Dict[int, float] = index.setdefault(
+        "pending_oldest_ts", {}
+    )
+    if pending_row and int(pending_row[0]) > 0:
+        pending_fixtures.add(fixture_id)
+        if pending_row[1] is None:
+            pending_oldest_ts.pop(fixture_id, None)
+        else:
+            pending_oldest_ts[fixture_id] = float(pending_row[1])
+    else:
+        pending_fixtures.discard(fixture_id)
+        pending_oldest_ts.pop(fixture_id, None)
+
+    cutoff_ts = index.get("second_half_cutoff_ts")
+    if cutoff_ts is None:
+        collectable_clause = (
+            "effective_status NOT IN ('resolved', 'void', 'quarantine')"
+        )
+        collectable_params: Tuple[Any, ...] = (fixture_id,)
+    else:
+        collectable_clause = (
+            "effective_status NOT IN ('void', 'quarantine') "
+            "AND observation_created_ts >= ?"
+        )
+        collectable_params = (fixture_id, float(cutoff_ts))
+    collectable = connection.execute(
+        "SELECT 1 FROM observation_records "
+        "WHERE has_observation = 1 AND fixture_id = ? "
+        "AND stage != 'rolling_seed' "
+        f"AND {collectable_clause} LIMIT 1",
+        collectable_params,
+    ).fetchone()
+    collectable_fixtures: Set[int] = index.setdefault(
+        "collectable_2h_fixtures", set()
+    )
+    if collectable is None:
+        collectable_fixtures.discard(fixture_id)
+    else:
+        collectable_fixtures.add(fixture_id)
+    is_pending = fixture_id in pending_fixtures
+    is_collectable = fixture_id in collectable_fixtures
+    if is_pending or is_collectable:
+        connection.execute(
+            "INSERT INTO fixture_reconcile_summary "
+            "(fixture_id, pending, pending_oldest_ts, collectable_2h) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(fixture_id) DO UPDATE SET "
+            "pending = excluded.pending, "
+            "pending_oldest_ts = excluded.pending_oldest_ts, "
+            "collectable_2h = excluded.collectable_2h",
+            (
+                fixture_id,
+                int(is_pending),
+                pending_oldest_ts.get(fixture_id),
+                int(is_collectable),
+            ),
+        )
+    else:
+        connection.execute(
+            "DELETE FROM fixture_reconcile_summary WHERE fixture_id = ?",
+            (fixture_id,),
+        )
+
+
+def _apply_observation_reconcile_record(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+) -> None:
+    """Apply one append-only row using the canonical schema/revision ranks."""
+    observation_id = str(
+        record.get("observation_key") or record.get("observation_id") or ""
+    )
+    if not observation_id:
+        return
+    record_type = str(record.get("record_type") or "observation")
+    if record_type == "observation":
+        schema_version = _safe_int(record.get("schema_version"), 1)
+        created_at_utc = str(record.get("created_at_utc") or "")
+        embedded = (
+            record.get("outcome")
+            if isinstance(record.get("outcome"), Mapping)
+            else {}
+        )
+        connection.execute(
+            """
+            INSERT INTO observation_records (
+                observation_id, has_observation, fixture_id,
+                observation_schema, observation_created_at,
+                observation_created_ts, embedded_status, stage,
+                observation_payload, effective_status
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(observation_id) DO UPDATE SET
+                has_observation = 1,
+                fixture_id = excluded.fixture_id,
+                observation_schema = excluded.observation_schema,
+                observation_created_at = excluded.observation_created_at,
+                observation_created_ts = excluded.observation_created_ts,
+                embedded_status = excluded.embedded_status,
+                stage = excluded.stage,
+                observation_payload = excluded.observation_payload,
+                effective_status = CASE
+                    WHEN observation_records.outcome_schema >= 0
+                    THEN observation_records.outcome_status
+                    ELSE excluded.embedded_status
+                END
+            WHERE
+                excluded.observation_schema > observation_records.observation_schema
+                OR (
+                    excluded.observation_schema = observation_records.observation_schema
+                    AND excluded.observation_created_at
+                        >= observation_records.observation_created_at
+                )
+            """,
+            (
+                observation_id,
+                _safe_int(record.get("fixture_id"), -1),
+                schema_version,
+                created_at_utc,
+                _observation_timestamp_value(created_at_utc),
+                str(embedded.get("status") or ""),
+                str(record.get("stage") or ""),
+                json.dumps(
+                    _observation_reconcile_projection(record),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+                str(embedded.get("status") or ""),
+            ),
+        )
+        return
+    if record_type != "observation_outcome":
+        return
+
+    outcome = (
+        record.get("outcome")
+        if isinstance(record.get("outcome"), Mapping)
+        else {}
+    )
+    schema_version = get_outcome_schema_version(record)
+    revision = get_outcome_revision(record)
+    created_at_utc = str(record.get("created_at_utc") or "")
+    status = str(outcome.get("status") or "")
+    connection.execute(
+        """
+        INSERT INTO observation_records (
+            observation_id, fixture_id, outcome_schema, outcome_revision,
+            outcome_created_at, outcome_created_ts, outcome_status,
+            outcome_payload, effective_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(observation_id) DO UPDATE SET
+            fixture_id = CASE
+                WHEN observation_records.has_observation = 1
+                THEN observation_records.fixture_id
+                ELSE excluded.fixture_id
+            END,
+            outcome_schema = excluded.outcome_schema,
+            outcome_revision = excluded.outcome_revision,
+            outcome_created_at = excluded.outcome_created_at,
+            outcome_created_ts = excluded.outcome_created_ts,
+            outcome_status = excluded.outcome_status,
+            outcome_payload = excluded.outcome_payload,
+            effective_status = excluded.outcome_status
+        WHERE
+            excluded.outcome_schema > observation_records.outcome_schema
+            OR (
+                excluded.outcome_schema = observation_records.outcome_schema
+                AND excluded.outcome_revision
+                    > observation_records.outcome_revision
+            )
+            OR (
+                excluded.outcome_schema = observation_records.outcome_schema
+                AND excluded.outcome_revision
+                    = observation_records.outcome_revision
+                AND excluded.outcome_created_at
+                    >= observation_records.outcome_created_at
+            )
+        """,
+        (
+            observation_id,
+            _safe_int(record.get("fixture_id"), -1),
+            schema_version,
+            revision,
+            created_at_utc,
+            _observation_timestamp_value(created_at_utc),
+            status,
+            json.dumps(
+                _observation_outcome_projection(record),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ),
+            status,
+        ),
+    )
+
+
+def _persist_observation_reconcile_meta(
+    index: Mapping[str, Any], key_count: int
+) -> None:
+    connection = index.get("connection")
+    signature = index.get("source_signature")
+    if not isinstance(connection, sqlite3.Connection) or not isinstance(
+        signature, tuple
+    ):
+        raise RuntimeError("cannot persist incomplete observation index metadata")
+    cutoff_ts = index.get("second_half_cutoff_ts")
+    values = {
+        "schema_version": str(_OBSERVATION_RECONCILE_INDEX_SCHEMA_VERSION),
+        "history_path": str(index.get("history_path") or ""),
+        "source_signature_digest": _observation_source_signature_digest(
+            signature
+        ),
+        "second_half_cutoff_ts": (
+            "null" if cutoff_ts is None else repr(float(cutoff_ts))
+        ),
+        "dedupe_key_count": str(max(0, int(key_count))),
+    }
+    connection.executemany(
+        "INSERT INTO observation_reconcile_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        list(values.items()),
+    )
+
+
+def _load_observation_reconcile_summaries(index: Dict[str, Any]) -> None:
+    connection = index.get("connection")
+    if not isinstance(connection, sqlite3.Connection):
+        raise RuntimeError("observation reconcile index has no connection")
+    pending_fixtures: Set[int] = set()
+    pending_oldest_ts: Dict[int, float] = {}
+    collectable_2h: Set[int] = set()
+    for fixture_id, pending, oldest_ts, collectable in connection.execute(
+        "SELECT fixture_id, pending, pending_oldest_ts, collectable_2h "
+        "FROM fixture_reconcile_summary"
+    ):
+        fixture_value = int(fixture_id)
+        if int(pending):
+            pending_fixtures.add(fixture_value)
+            if oldest_ts is not None:
+                pending_oldest_ts[fixture_value] = float(oldest_ts)
+        if int(collectable):
+            collectable_2h.add(fixture_value)
+    index["pending_fixtures"] = pending_fixtures
+    index["pending_oldest_ts"] = pending_oldest_ts
+    index["collectable_2h_fixtures"] = collectable_2h
+
+
+def _open_persisted_observation_reconcile_index_locked(
+    history_path: str,
+    source_signature: Tuple[Tuple[str, int, int, int, int], ...],
+) -> Optional[Dict[str, Any]]:
+    """Open a sidecar only when it exactly matches the source journal."""
+
+    global _observation_history_keys, _observation_history_key_count
+    database_path = _observation_reconcile_index_path(history_path)
+    if not os.path.exists(database_path):
+        return None
+    connection: Optional[sqlite3.Connection] = None
+    try:
+        connection = sqlite3.connect(
+            database_path, timeout=30.0, check_same_thread=False
+        )
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA cache_size=-8192")
+        metadata = dict(
+            connection.execute(
+                "SELECT key, value FROM observation_reconcile_meta"
+            ).fetchall()
+        )
+        expected_digest = _observation_source_signature_digest(
+            source_signature
+        )
+        if (
+            _safe_int(metadata.get("schema_version"), -1)
+            != _OBSERVATION_RECONCILE_INDEX_SCHEMA_VERSION
+            or metadata.get("history_path") != os.path.abspath(history_path)
+            or metadata.get("source_signature_digest") != expected_digest
+        ):
+            connection.close()
+            return None
+        stored_cutoff = metadata.get("second_half_cutoff_ts", "null")
+        index: Dict[str, Any] = {
+            "connection": connection,
+            "database_path": database_path,
+            "history_path": os.path.abspath(history_path),
+            "source_signature": source_signature,
+            "second_half_cutoff_ts": (
+                None if stored_cutoff == "null" else float(stored_cutoff)
+            ),
+            "invalid": False,
+        }
+        current_cutoff = _observation_reconcile_cutoff_timestamp()
+        if index["second_half_cutoff_ts"] != current_cutoff:
+            _populate_observation_reconcile_summaries(index)
+            index["second_half_cutoff_ts"] = current_cutoff
+            _persist_observation_reconcile_meta(
+                index, _safe_int(metadata.get("dedupe_key_count"), 0)
+            )
+            connection.commit()
+        else:
+            _load_observation_reconcile_summaries(index)
+        key_count = _safe_int(metadata.get("dedupe_key_count"), -1)
+        if key_count < 0:
+            key_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM observation_dedupe_keys"
+                ).fetchone()[0]
+            )
+        _observation_history_keys = set()
+        _observation_history_key_count = key_count
+        logger.info(
+            "[OBSERVATION_RECONCILE_INDEX] file=%s database=%s "
+            "dedupe_keys=%s action=reused storage=sqlite_sidecar",
+            history_path,
+            database_path,
+            key_count,
+        )
+        return index
+    except Exception:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        logger.warning(
+            "[OBSERVATION_RECONCILE_INDEX] file=%s database=%s "
+            "action=rebuild reason=invalid_or_incompatible",
+            history_path,
+            database_path,
+            exc_info=True,
+        )
+        return None
+
+
+def _close_observation_reconcile_index_locked() -> None:
+    global _observation_reconcile_index
+    current = _observation_reconcile_index
+    _observation_reconcile_index = None
+    if current and isinstance(current.get("connection"), sqlite3.Connection):
+        try:
+            current["connection"].close()
+        except sqlite3.Error:
+            pass
+
+
+def _invalidate_observation_reconcile_index() -> None:
+    """Drop only the derived cache; the append-only journal is untouched."""
+    global _observation_history_keys, _observation_history_key_count
+    with _observation_history_lock:
+        _close_observation_reconcile_index_locked()
+        _observation_history_keys = None
+        _observation_history_key_count = 0
+
+
+def _build_observation_reconcile_index_locked(path: str) -> Dict[str, Any]:
+    global _observation_history_keys, _observation_history_key_count
+    connection: Optional[sqlite3.Connection] = None
+    temporary_path: Optional[str] = None
+    started = time.monotonic()
+    rows = 0
+    try:
+        database_path = _observation_reconcile_index_path(path)
+        database_parent = os.path.dirname(database_path) or os.curdir
+        os.makedirs(database_parent, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".observation-reconcile-",
+            suffix=".sqlite3",
+            dir=database_parent,
+        )
+        os.close(descriptor)
+        source_signature_before = _observation_history_source_signature(path)
+        connection = _create_observation_reconcile_connection(temporary_path)
+        for existing in iter_observation_history_records(path):
+            dedupe_key = _observation_history_dedupe_key(existing)
+            if dedupe_key:
+                connection.execute(
+                    "INSERT OR IGNORE INTO observation_dedupe_keys VALUES (?)",
+                    (dedupe_key,),
+                )
+            _apply_observation_reconcile_record(connection, existing)
+            rows += 1
+        connection.executescript(
+            """
+            CREATE INDEX observation_effective_fixture_idx
+                ON observation_records(effective_status, fixture_id);
+            CREATE INDEX observation_outcome_time_idx
+                ON observation_records(outcome_created_ts, effective_status, fixture_id);
+            CREATE INDEX observation_created_stage_idx
+                ON observation_records(
+                    observation_created_ts, stage, effective_status, fixture_id
+                );
+            CREATE INDEX observation_fixture_status_idx
+                ON observation_records(
+                    fixture_id, effective_status, observation_created_ts
+                );
+            """
+        )
+        connection.commit()
+        source_signature_after = _observation_history_source_signature(path)
+        if source_signature_after != source_signature_before:
+            raise RuntimeError(
+                "observation journal changed while reconcile index was built"
+            )
+        key_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM observation_dedupe_keys"
+            ).fetchone()[0]
+        )
+        record_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM observation_records WHERE has_observation = 1"
+            ).fetchone()[0]
+        )
+        index = {
+            "connection": connection,
+            "history_path": os.path.abspath(path),
+            "source_signature": source_signature_after,
+            "invalid": False,
+        }
+        _populate_observation_reconcile_summaries(index)
+        source_signature_after = _observation_history_source_signature(path)
+        if source_signature_after != source_signature_before:
+            raise RuntimeError(
+                "observation journal changed while reconcile summaries were built"
+            )
+        index["source_signature"] = source_signature_after
+        _persist_observation_reconcile_meta(index, key_count)
+        connection.commit()
+        connection.close()
+        connection = None
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.remove(database_path + suffix)
+            except FileNotFoundError:
+                pass
+        os.replace(temporary_path, database_path)
+        temporary_path = None
+        persisted = _open_persisted_observation_reconcile_index_locked(
+            path, source_signature_after
+        )
+        if persisted is None:
+            raise RuntimeError("published observation reconcile index is invalid")
+        logger.info(
+            "[OBSERVATION_RECONCILE_INDEX] file=%s database=%s journal_rows=%s "
+            "observations=%s dedupe_keys=%s build_seconds=%.3f "
+            "action=built storage=sqlite_sidecar rss_payload_cache=bounded",
+            path,
+            database_path,
+            rows,
+            record_count,
+            key_count,
+            time.monotonic() - started,
+        )
+        return persisted
+    except Exception:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        if temporary_path:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+        _observation_history_keys = None
+        _observation_history_key_count = 0
+        logger.exception(
+            "[OBSERVATION_RECONCILE_INDEX_ERROR] action=build file=%s "
+            "fallback=stream",
+            path,
+        )
+        return {
+            "history_path": os.path.abspath(path),
+            "source_signature": _observation_history_source_signature(path),
+            "invalid": True,
+            "retry_after_monotonic": (
+                time.monotonic()
+                + _OBSERVATION_RECONCILE_REBUILD_RETRY_SECONDS
+            ),
+        }
+
+
+def _get_observation_reconcile_index_locked(path: str) -> Dict[str, Any]:
+    global _observation_reconcile_index
+    active = os.path.abspath(path)
+    current_signature = _observation_history_source_signature(active)
+    cached = _observation_reconcile_index
+    if (
+        cached is not None
+        and cached.get("history_path") == active
+        and cached.get("invalid")
+        and time.monotonic()
+        < float(cached.get("retry_after_monotonic") or 0.0)
+    ):
+        # Continue using the authoritative streaming fallback during a bounded
+        # cooldown even if a direct writer changes the journal.  Otherwise
+        # every append after an unstable build could immediately allocate
+        # another multi-gigabyte temporary SQLite database.
+        cached["source_signature"] = current_signature
+        return cached
+    if (
+        cached is not None
+        and cached.get("history_path") == active
+        and cached.get("source_signature") == current_signature
+        and _observation_history_keys is not None
+    ):
+        current_cutoff_ts = _observation_reconcile_cutoff_timestamp()
+        if cached.get("second_half_cutoff_ts") != current_cutoff_ts:
+            _populate_observation_reconcile_summaries(cached)
+            cached["second_half_cutoff_ts"] = current_cutoff_ts
+            _persist_observation_reconcile_meta(
+                cached, _observation_history_key_count
+            )
+            connection = cached.get("connection")
+            if isinstance(connection, sqlite3.Connection):
+                connection.commit()
+        return cached
+    _close_observation_reconcile_index_locked()
+    cached = _open_persisted_observation_reconcile_index_locked(
+        active, current_signature
+    )
+    if cached is None:
+        cached = _build_observation_reconcile_index_locked(active)
+    _observation_reconcile_index = cached
+    return cached
+
+
+def _ensure_observation_history_keys_locked(path: str) -> Dict[str, Any]:
+    """Hydrate the shared disk-backed dedupe/reconcile index once."""
+    return _get_observation_reconcile_index_locked(path)
+
+
+def _observation_history_key_exists_locked(
+    index: Mapping[str, Any],
+    dedupe_key: str,
+    path: str,
+) -> bool:
+    connection = index.get("connection")
+    if not index.get("invalid") and isinstance(connection, sqlite3.Connection):
+        return connection.execute(
+            "SELECT 1 FROM observation_dedupe_keys WHERE dedupe_key = ? LIMIT 1",
+            (dedupe_key,),
+        ).fetchone() is not None
+    return any(
+        _observation_history_dedupe_key(existing) == dedupe_key
+        for existing in iter_observation_history_records(path)
+    )
+
+
+def observation_history_record_exists(record: Mapping[str, Any]) -> bool:
+    """Return true only when this exact schema record is already persisted."""
+    if not ENABLE_OBSERVATION_HISTORY:
+        return False
+    dedupe_key = _observation_history_dedupe_key(record)
+    if not dedupe_key:
+        return False
+    path = os.path.abspath(OBSERVATION_HISTORY_FILE)
+    with _observation_history_lock, _observation_history_process_lock(path):
+        index = _ensure_observation_history_keys_locked(path)
+        return _observation_history_key_exists_locked(index, dedupe_key, path)
+
+
+def append_observation_history(record: Dict[str, Any]) -> bool:
+    global _observation_history_key_count, _observation_history_keys
+    if not ENABLE_OBSERVATION_HISTORY:
+        return False
+    try:
+        payload = dict(record)
+        dedupe_key = _observation_history_dedupe_key(payload)
+        if not dedupe_key:
+            raise ValueError("observation record has no observation_id")
+        path = os.path.abspath(OBSERVATION_HISTORY_FILE)
+        with _observation_history_lock, _observation_history_process_lock(path):
+            index = _ensure_observation_history_keys_locked(path)
+            if _observation_history_key_exists_locked(index, dedupe_key, path):
+                return False
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+            _rotate_observation_history_if_needed(path, len(line.encode("utf-8")))
+            active_existed = os.path.exists(path)
+            with open(path, "a", encoding="utf-8", newline="\n") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if not active_existed:
+                _fsync_parent_directory(path)
+            connection = index.get("connection")
+            if not index.get("invalid") and isinstance(
+                connection, sqlite3.Connection
+            ):
+                try:
+                    observation_id = str(
+                        payload.get("observation_key")
+                        or payload.get("observation_id")
+                        or ""
+                    )
+                    previous_fixture_row = connection.execute(
+                        "SELECT fixture_id FROM observation_records "
+                        "WHERE observation_id = ?",
+                        (observation_id,),
+                    ).fetchone()
+                    connection.execute(
+                        "INSERT INTO observation_dedupe_keys VALUES (?)",
+                        (dedupe_key,),
+                    )
+                    _apply_observation_reconcile_record(connection, payload)
+                    current_fixture_row = connection.execute(
+                        "SELECT fixture_id FROM observation_records "
+                        "WHERE observation_id = ?",
+                        (observation_id,),
+                    ).fetchone()
+                    affected_fixtures = {
+                        int(row[0])
+                        for row in (previous_fixture_row, current_fixture_row)
+                        if row is not None and int(row[0]) >= 0
+                    }
+                    for affected_fixture in affected_fixtures:
+                        _refresh_observation_reconcile_fixture(
+                            index, affected_fixture
+                        )
+                    new_source_signature = (
+                        _observation_history_source_signature(path)
+                    )
+                    index["source_signature"] = new_source_signature
+                    new_key_count = _observation_history_key_count + 1
+                    _persist_observation_reconcile_meta(
+                        index, new_key_count
+                    )
+                    connection.commit()
+                    _observation_history_key_count = new_key_count
+                except Exception:
+                    _close_observation_reconcile_index_locked()
+                    _observation_history_keys = None
+                    _observation_history_key_count = 0
+                    logger.exception(
+                        "[OBSERVATION_RECONCILE_INDEX_ERROR] action=append "
+                        "file=%s fallback=rebuild",
+                        path,
+                    )
+        if (
+            payload.get("record_type") == "observation"
+            and payload.get("stage") in {"decision_pipeline", "wide_monitor"}
+        ):
+            _research_health_note(
+                "note_observation",
+                str(payload.get("created_at_utc") or _utc_now_iso()),
+            )
+        return True
+    except Exception:
+        logger.exception("[OBSERVATION_ERROR] action=append")
+        return False
+
+
+_rolling_dynamics_lock = threading.RLock()
+_rolling_dynamics_tracker: Optional[RollingDynamicsTracker] = None
+_rolling_dynamics_tracker_signature: Optional[Tuple[str, int]] = None
+_rolling_dynamics_seed_attempted: Set[str] = set()
+_rolling_dynamics_seed_attempt_order: deque[str] = deque()
+_rolling_dynamics_seed_capacity = threading.BoundedSemaphore(
+    ROLLING_DYNAMICS_SEED_WORKERS
+)
+
+
+def _reset_rolling_dynamics_tracker_for_tests() -> None:
+    global _rolling_dynamics_tracker, _rolling_dynamics_tracker_signature
+    with _rolling_dynamics_lock:
+        _rolling_dynamics_tracker = None
+        _rolling_dynamics_tracker_signature = None
+        _rolling_dynamics_seed_attempted.clear()
+        _rolling_dynamics_seed_attempt_order.clear()
+
+
+def _ensure_rolling_dynamics_tracker_locked() -> RollingDynamicsTracker:
+    """Hydrate rolling baselines once from active and rotated observations."""
+    global _rolling_dynamics_tracker, _rolling_dynamics_tracker_signature
+    signature = (
+        os.path.abspath(OBSERVATION_HISTORY_FILE),
+        int(ROLLING_DYNAMICS_MAX_EXTRA_MINUTES),
+    )
+    if (
+        _rolling_dynamics_tracker is not None
+        and _rolling_dynamics_tracker_signature == signature
+    ):
+        return _rolling_dynamics_tracker
+
+    tracker = RollingDynamicsTracker(
+        windows=(5, 10),
+        max_extra_minutes=ROLLING_DYNAMICS_MAX_EXTRA_MINUTES,
+    )
+    hydrated_observations = 0
+    if ENABLE_OBSERVATION_HISTORY:
+        with _observation_history_lock:
+            for record in iter_observation_history_records(signature[0]):
+                if record.get("record_type") != "observation":
+                    continue
+                hydrated_observations += 1
+                tracker.ingest(record)
+
+    _rolling_dynamics_tracker = tracker
+    _rolling_dynamics_tracker_signature = signature
+    logger.info(
+        "[ROLLING_DYNAMICS_HYDRATE] observations=%s file=%s shadow_only=true",
+        hydrated_observations,
+        signature[0],
+    )
+    return tracker
+
+
+def freeze_observation_rolling_dynamics(
+    observation: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Attach prospective rolling telemetry without mutating the input row."""
+    if not ENABLE_ROLLING_DYNAMICS_SHADOW:
+        return copy.deepcopy(dict(observation))
+    with _rolling_dynamics_lock:
+        return _ensure_rolling_dynamics_tracker_locked().freeze(observation)
+
+
+def register_observation_rolling_baseline(
+    observation: Mapping[str, Any],
+) -> bool:
+    if not ENABLE_ROLLING_DYNAMICS_SHADOW:
+        return False
+    with _rolling_dynamics_lock:
+        return _ensure_rolling_dynamics_tracker_locked().ingest(observation)
+
+
+def _claim_rolling_dynamics_seed(
+    fixture_id: int,
+    minute: int,
+) -> Optional[Tuple[str, int, str]]:
+    if not ENABLE_ROLLING_DYNAMICS_SHADOW or not ENABLE_OBSERVATION_HISTORY:
+        return None
+    slot = rolling_dynamics_seed_slot(minute)
+    if slot is None:
+        return None
+    slot_name, target_window = slot
+    observation_id = (
+        f"{int(fixture_id)}:ROLLING_SEED_{slot_name.upper()}:"
+        f"rv{ROLLING_DYNAMICS_SCHEMA_VERSION}:v{OBSERVATION_SCHEMA_VERSION}"
+    )
+    probe = {
+        "record_type": "observation",
+        "observation_id": observation_id,
+        "observation_key": observation_id,
+        "schema_version": int(OBSERVATION_SCHEMA_VERSION),
+    }
+    with _rolling_dynamics_lock:
+        if observation_id in _rolling_dynamics_seed_attempted:
+            return None
+        if observation_history_record_exists(probe):
+            return None
+        # Keep the claim even if normalization or persistence later fails.
+        # This bounds collection to one worker job (with its configured,
+        # bounded fetch attempts) per slot for this process.
+        _rolling_dynamics_seed_attempted.add(observation_id)
+        _rolling_dynamics_seed_attempt_order.append(observation_id)
+        while len(_rolling_dynamics_seed_attempt_order) > 10_000:
+            expired_id = _rolling_dynamics_seed_attempt_order.popleft()
+            _rolling_dynamics_seed_attempted.discard(expired_id)
+    return slot_name, target_window, observation_id
+
+
+def _capture_claimed_rolling_dynamics_seed(
+    client: APISportsMetricsClient,
+    raw_fixture: Dict[str, Any],
+    fixture_id: int,
+    minute: int,
+    slot_name: str,
+    target_window: int,
+) -> bool:
+    """Execute a claimed seed fetch; errors never escape into the main loop."""
+
+    raw_stats: List[Dict[str, Any]] = []
+    fetch_status = "empty"
+    fetch_attempt_statuses: List[str] = []
+    fetch_attempt_durations: List[float] = []
+    fetch_started = time.monotonic()
+    for attempt_number in range(1, ROLLING_DYNAMICS_SEED_MAX_FETCH_ATTEMPTS + 1):
+        attempt_started = time.monotonic()
+        try:
+            raw_stats = client.fetch_fixture_statistics(int(fixture_id)) or []
+            fetch_status = "ok" if raw_stats else "empty"
+        except Exception:
+            raw_stats = []
+            fetch_status = "error"
+            logger.exception(
+                "[ROLLING_DYNAMICS_SEED_FETCH_ERROR] fixture_id=%s minute=%s slot=%s attempt=%s/%s production_unchanged=true",
+                fixture_id,
+                minute,
+                slot_name,
+                attempt_number,
+                ROLLING_DYNAMICS_SEED_MAX_FETCH_ATTEMPTS,
+            )
+        fetch_attempt_statuses.append(fetch_status)
+        fetch_attempt_durations.append(max(0.0, time.monotonic() - attempt_started))
+        if fetch_status == "ok":
+            break
+        if attempt_number < ROLLING_DYNAMICS_SEED_MAX_FETCH_ATTEMPTS:
+            logger.info(
+                "[ROLLING_DYNAMICS_SEED_FETCH_RETRY] fixture_id=%s minute=%s slot=%s previous_status=%s next_attempt=%s/%s shadow_only=true production_unchanged=true",
+                fixture_id,
+                minute,
+                slot_name,
+                fetch_status,
+                attempt_number + 1,
+                ROLLING_DYNAMICS_SEED_MAX_FETCH_ATTEMPTS,
+            )
+
+    try:
+        fixture_metrics = client._normalize_fixture_basic(raw_fixture)
+        normalized_stats = client._normalize_statistics(
+            raw_stats,
+            raw_fixture,
+            fixture_metrics,
+        )
+        if normalized_stats:
+            fixture_metrics.update(normalized_stats)
+        fixture_metrics["_has_raw_statistics"] = bool(raw_stats)
+        fixture_metrics["_stats_health"] = build_stats_health_context(
+            fixture_metrics,
+            has_raw_statistics=bool(raw_stats),
+        )
+        observation = build_rolling_dynamics_seed_observation(
+            fixture_id=fixture_id,
+            minute=minute,
+            slot_name=slot_name,
+            target_window_minutes=target_window,
+            fixture_metrics=fixture_metrics,
+            raw_fixture=raw_fixture,
+            fetch_status=fetch_status,
+            fetch_duration_seconds=max(0.0, time.monotonic() - fetch_started),
+            fetch_attempt_statuses=fetch_attempt_statuses,
+            fetch_attempt_durations_seconds=fetch_attempt_durations,
+        )
+        frozen = freeze_observation_rolling_dynamics(observation)
+        written = append_observation_history(frozen)
+        if written or observation_history_record_exists(frozen):
+            register_observation_rolling_baseline(frozen)
+        logger.info(
+            "[ROLLING_DYNAMICS_SEED] fixture_id=%s minute=%s slot=%s fetch_status=%s fetch_attempts=%s metrics=%s written=%s shadow_only=true production_unchanged=true",
+            fixture_id,
+            minute,
+            slot_name,
+            fetch_status,
+            len(fetch_attempt_statuses),
+            (frozen.get("data_quality") or {}).get("available_metric_count", 0),
+            written,
+        )
+        return bool(written)
+    except Exception:
+        logger.exception(
+            "[ROLLING_DYNAMICS_SEED_ERROR] fixture_id=%s minute=%s slot=%s production_unchanged=true",
+            fixture_id,
+            minute,
+            slot_name,
+        )
+        return False
+
+
+def maybe_capture_rolling_dynamics_seed(
+    client: APISportsMetricsClient,
+    raw_fixture: Dict[str, Any],
+    fixture_id: int,
+    minute: int,
+) -> bool:
+    """Synchronously capture one seed; primarily useful for tests and tools."""
+    claimed = _claim_rolling_dynamics_seed(fixture_id, minute)
+    if claimed is None:
+        return False
+    slot_name, target_window, _observation_id = claimed
+    return _capture_claimed_rolling_dynamics_seed(
+        client,
+        raw_fixture,
+        fixture_id,
+        minute,
+        slot_name,
+        target_window,
+    )
+
+
+def _capture_scheduled_rolling_dynamics_seed(
+    client: APISportsMetricsClient,
+    raw_fixture: Dict[str, Any],
+    fixture_id: int,
+    minute: int,
+    slot_name: str,
+    target_window: int,
+) -> bool:
+    try:
+        return _capture_claimed_rolling_dynamics_seed(
+            client,
+            raw_fixture,
+            fixture_id,
+            minute,
+            slot_name,
+            target_window,
+        )
+    finally:
+        _rolling_dynamics_seed_capacity.release()
+
+
+def schedule_rolling_dynamics_seed(
+    executor: ThreadPoolExecutor,
+    client: APISportsMetricsClient,
+    raw_fixture: Dict[str, Any],
+    fixture_id: int,
+    minute: int,
+) -> bool:
+    """Queue a seed without delaying production fixture processing."""
+    if not _rolling_dynamics_seed_capacity.acquire(blocking=False):
+        logger.debug(
+            "[ROLLING_DYNAMICS_SEED_DEFERRED] fixture_id=%s minute=%s reason=workers_busy",
+            fixture_id,
+            minute,
+        )
+        return False
+    claimed = _claim_rolling_dynamics_seed(fixture_id, minute)
+    if claimed is None:
+        _rolling_dynamics_seed_capacity.release()
+        return False
+    slot_name, target_window, observation_id = claimed
+    try:
+        executor.submit(
+            _capture_scheduled_rolling_dynamics_seed,
+            client,
+            copy.deepcopy(raw_fixture),
+            int(fixture_id),
+            int(minute),
+            slot_name,
+            int(target_window),
+        )
+        logger.info(
+            "[ROLLING_DYNAMICS_SEED_QUEUED] fixture_id=%s minute=%s slot=%s shadow_only=true production_unchanged=true",
+            fixture_id,
+            minute,
+            slot_name,
+        )
+        return True
+    except Exception:
+        _rolling_dynamics_seed_capacity.release()
+        with _rolling_dynamics_lock:
+            _rolling_dynamics_seed_attempted.discard(observation_id)
+            try:
+                _rolling_dynamics_seed_attempt_order.remove(observation_id)
+            except ValueError:
+                pass
+        logger.exception(
+            "[ROLLING_DYNAMICS_SEED_QUEUE_ERROR] fixture_id=%s minute=%s slot=%s production_unchanged=true",
+            fixture_id,
+            minute,
+            slot_name,
+        )
+        return False
+
+
+def load_joined_observation_history(
+    path: Optional[str] = None,
+    *,
+    include_pending: bool = True,
+) -> List[Dict[str, Any]]:
+    observations: Dict[str, Dict[str, Any]] = {}
+    outcomes: Dict[str, Dict[str, Any]] = {}
+    for record in iter_observation_history_records(path):
+        observation_id = str(record.get("observation_key") or record.get("observation_id") or "")
+        if not observation_id:
+            continue
+        if record.get("record_type") == "observation":
+            current = observations.get(observation_id)
+            rank = (
+                _safe_int(record.get("schema_version"), 1),
+                str(record.get("created_at_utc") or ""),
+            )
+            current_rank = (
+                _safe_int(current.get("schema_version"), 1),
+                str(current.get("created_at_utc") or ""),
+            ) if current else (-1, "")
+            if rank >= current_rank:
+                observations[observation_id] = record
+        elif record.get("record_type") == "observation_outcome":
+            current = outcomes.get(observation_id)
+            rank = outcome_record_rank(record)
+            current_rank = outcome_record_rank(current)
+            if rank >= current_rank:
+                outcomes[observation_id] = record
+    joined: List[Dict[str, Any]] = []
+    for observation_id, observation in observations.items():
+        item = dict(observation)
+        outcome_record = outcomes.get(observation_id)
+        if outcome_record:
+            item["outcome"] = dict(outcome_record.get("outcome") or {})
+            item["outcome_schema_version"] = _safe_int(
+                outcome_record.get("outcome_schema_version"), 1
+            )
+            revision = get_outcome_revision(outcome_record)
+            if revision > 0:
+                item["outcome_revision"] = revision
+            item["outcome_record_created_at_utc"] = outcome_record.get(
+                "created_at_utc"
+            )
+        if include_pending or str((item.get("outcome") or {}).get("status")) != "pending":
+            joined.append(item)
+    joined.sort(key=lambda item: (str(item.get("created_at_utc") or ""), item.get("observation_id") or ""))
+    return joined
+
+
+def load_shadow_ml_training_history(
+    path: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Prepare only possible ML rows using a disk-backed canonical join."""
+
+    return materialize_training_history(
+        iter_observation_history_records(path),
+        include_pending=False,
+    )
+
+
+def _stream_observation_fixture_reconcile_sets(
+    *,
+    recent_terminal_since: Optional[datetime] = None,
+    recent_terminal_until: Optional[datetime] = None,
+    pending_oldest_by_fixture: Optional[Dict[int, str]] = None,
+) -> Tuple[Set[int], Set[int], Set[int]]:
+    """Return pending, 2H and optionally recent terminal fixtures in one scan."""
+    observations: Dict[str, Tuple[Tuple[int, str], int, str, str, str]] = {}
+    outcomes: Dict[str, Tuple[Tuple[int, int, str], str, str]] = {}
+    terminal_statuses = {"resolved", "void", "quarantine"}
+    second_half_cutoff = _parse_iso_utc(SECOND_HALF_ALL_MATCHES_SINCE_UTC)
+    for record in iter_observation_history_records():
+        observation_id = str(
+            record.get("observation_key") or record.get("observation_id") or ""
+        )
+        if not observation_id:
+            continue
+        record_type = str(record.get("record_type") or "")
+        if record_type == "observation":
+            rank = (
+                _safe_int(record.get("schema_version"), 1),
+                str(record.get("created_at_utc") or ""),
+            )
+            current = observations.get(observation_id)
+            if current is None or rank >= current[0]:
+                embedded = (
+                    record.get("outcome")
+                    if isinstance(record.get("outcome"), dict)
+                    else {}
+                )
+                observations[observation_id] = (
+                    rank,
+                    _safe_int(record.get("fixture_id"), -1),
+                    str(embedded.get("status") or ""),
+                    str(record.get("stage") or ""),
+                    str(record.get("created_at_utc") or ""),
+                )
+        elif record_type == "observation_outcome":
+            rank = outcome_record_rank(record)
+            current = outcomes.get(observation_id)
+            if current is None or rank >= current[0]:
+                outcome = (
+                    record.get("outcome")
+                    if isinstance(record.get("outcome"), dict)
+                    else {}
+                )
+                outcomes[observation_id] = (
+                    rank,
+                    str(outcome.get("status") or ""),
+                    str(record.get("created_at_utc") or ""),
+                )
+
+    pending: Set[int] = set()
+    collectable_2h: Set[int] = set()
+    recent_terminal: Set[int] = set()
+    oldest_pending_observation: Optional[str] = None
+    oldest_pending_value: Optional[datetime] = None
+    pending_fixture_times: Dict[int, datetime] = {}
+    for observation_id, observation_entry in observations.items():
+        _rank, fixture_id, embedded_status, stage, created_at_utc = observation_entry
+        outcome_entry = outcomes.get(
+            observation_id, ((-1, -1, ""), embedded_status, "")
+        )
+        status = outcome_entry[1]
+        if status not in terminal_statuses and fixture_id >= 0:
+            pending.add(fixture_id)
+            created_at_value = _parse_iso_utc(created_at_utc)
+            current_fixture_oldest = pending_fixture_times.get(fixture_id)
+            if created_at_value is not None and (
+                current_fixture_oldest is None
+                or created_at_value < current_fixture_oldest
+            ):
+                pending_fixture_times[fixture_id] = created_at_value
+            if created_at_value is not None and (
+                oldest_pending_value is None
+                or created_at_value < oldest_pending_value
+            ):
+                oldest_pending_value = created_at_value
+                oldest_pending_observation = created_at_value.isoformat().replace(
+                    "+00:00", "Z"
+                )
+        if (
+            fixture_id >= 0
+            and status in terminal_statuses
+            and recent_terminal_since is not None
+        ):
+            outcome_created_at = _parse_iso_utc(outcome_entry[2])
+            if (
+                outcome_created_at is not None
+                and outcome_created_at >= recent_terminal_since
+                and (
+                    recent_terminal_until is None
+                    or outcome_created_at <= recent_terminal_until
+                )
+            ):
+                recent_terminal.add(fixture_id)
+        observation_created_at = _parse_iso_utc(created_at_utc)
+        in_second_half_cohort = (
+            status not in terminal_statuses
+            if second_half_cutoff is None
+            else (
+                observation_created_at is not None
+                and observation_created_at >= second_half_cutoff
+            )
+        )
+        if (
+            fixture_id >= 0
+            and stage != "rolling_seed"
+            and status not in {"void", "quarantine"}
+            and in_second_half_cohort
+        ):
+            collectable_2h.add(fixture_id)
+    if pending_oldest_by_fixture is not None:
+        pending_oldest_by_fixture.clear()
+        pending_oldest_by_fixture.update(
+            {
+                fixture_id: timestamp.isoformat().replace("+00:00", "Z")
+                for fixture_id, timestamp in pending_fixture_times.items()
+            }
+        )
+    _research_health_note(
+        "note_pending", len(pending), oldest_pending_observation
+    )
+    return pending, collectable_2h, recent_terminal
+
+
+def _observation_fixture_reconcile_sets(
+    *,
+    recent_terminal_since: Optional[datetime] = None,
+    recent_terminal_until: Optional[datetime] = None,
+    pending_oldest_by_fixture: Optional[Dict[int, str]] = None,
+) -> Tuple[Set[int], Set[int], Set[int]]:
+    """Return reconciliation cohorts from the derived SQLite index.
+
+    The append-only observation journal is large enough that repeatedly
+    parsing every rotated archive can stall the live loop for minutes.  The
+    index is built once, updated under the same lock as every durable append,
+    and stores its pages in a validated SQLite sidecar rather than duplicating
+    the journal in Python heap memory.  The streaming implementation remains
+    the correctness fallback if the derived index cannot be used.
+    """
+
+    path = os.path.abspath(OBSERVATION_HISTORY_FILE)
+    pending: Set[int] = set()
+    collectable_2h: Set[int] = set()
+    recent_terminal: Set[int] = set()
+    pending_times: Dict[int, str] = {}
+    try:
+        with _observation_history_lock, _observation_history_process_lock(path):
+            index = _get_observation_reconcile_index_locked(path)
+            connection = index.get("connection")
+            if index.get("invalid") or not isinstance(
+                connection, sqlite3.Connection
+            ):
+                return _stream_observation_fixture_reconcile_sets(
+                    recent_terminal_since=recent_terminal_since,
+                    recent_terminal_until=recent_terminal_until,
+                    pending_oldest_by_fixture=pending_oldest_by_fixture,
+                )
+
+            pending.update(index.get("pending_fixtures") or set())
+            collectable_2h.update(
+                index.get("collectable_2h_fixtures") or set()
+            )
+            for fixture_id, raw_oldest_ts in dict(
+                index.get("pending_oldest_ts") or {}
+            ).items():
+                pending_times[int(fixture_id)] = datetime.fromtimestamp(
+                    float(raw_oldest_ts), tz=timezone.utc
+                ).isoformat().replace("+00:00", "Z")
+
+            if recent_terminal_since is not None:
+                terminal_since = recent_terminal_since.astimezone(
+                    timezone.utc
+                ).timestamp()
+                terminal_query = """
+                    SELECT DISTINCT fixture_id
+                    FROM observation_records
+                    WHERE has_observation = 1
+                      AND fixture_id >= 0
+                      AND effective_status IN ('resolved', 'void', 'quarantine')
+                      AND outcome_created_ts >= ?
+                """
+                terminal_params: List[Any] = [terminal_since]
+                if recent_terminal_until is not None:
+                    terminal_query += " AND outcome_created_ts <= ?"
+                    terminal_params.append(
+                        recent_terminal_until.astimezone(
+                            timezone.utc
+                        ).timestamp()
+                    )
+                recent_terminal.update(
+                    int(row[0])
+                    for row in connection.execute(
+                        terminal_query, tuple(terminal_params)
+                    ).fetchall()
+                )
+    except Exception:
+        logger.exception(
+            "[OBSERVATION_RECONCILE_INDEX_ERROR] action=query_sets "
+            "file=%s fallback=stream",
+            path,
+        )
+        _invalidate_observation_reconcile_index()
+        with _observation_history_lock, _observation_history_process_lock(path):
+            return _stream_observation_fixture_reconcile_sets(
+                recent_terminal_since=recent_terminal_since,
+                recent_terminal_until=recent_terminal_until,
+                pending_oldest_by_fixture=pending_oldest_by_fixture,
+            )
+
+    if pending_oldest_by_fixture is not None:
+        pending_oldest_by_fixture.clear()
+        pending_oldest_by_fixture.update(pending_times)
+    oldest_pending = min(pending_times.values()) if pending_times else None
+    _research_health_note("note_pending", len(pending), oldest_pending)
+    return pending, collectable_2h, recent_terminal
+
+
+def pending_observation_fixture_ids() -> List[int]:
+    """Return pending fixtures without materializing the observation journal."""
+    pending, _collectable_2h, _recent_terminal = (
+        _observation_fixture_reconcile_sets()
+    )
+    return sorted(pending)
+
+
+def _stream_pending_observations_by_fixture(
+    fixture_ids: Optional[Set[int]] = None,
+    *,
+    include_terminal: bool = False,
+) -> Dict[int, List[Dict[str, Any]]]:
+    selected = (
+        {int(value) for value in fixture_ids}
+        if fixture_ids is not None
+        else set(pending_observation_fixture_ids())
+    )
+    if not selected:
+        return {}
+
+    observations: Dict[str, Tuple[Tuple[int, str], Dict[str, Any]]] = {}
+    outcomes: Dict[str, Tuple[Tuple[int, int, str], Dict[str, Any]]] = {}
+    for record in iter_observation_history_records():
+        if str(record.get("record_type") or "") != "observation":
+            continue
+        fixture_id = _safe_int(record.get("fixture_id"), -1)
+        if fixture_id not in selected:
+            continue
+        observation_id = str(
+            record.get("observation_key") or record.get("observation_id") or ""
+        )
+        if not observation_id:
+            continue
+        rank = (
+            _safe_int(record.get("schema_version"), 1),
+            str(record.get("created_at_utc") or ""),
+        )
+        current = observations.get(observation_id)
+        if current is None or rank >= current[0]:
+            observations[observation_id] = (rank, dict(record))
+
+    # Outcomes are canonically joined by observation ID, not by the fixture
+    # ID redundantly copied onto the outcome row.  A second bounded-memory
+    # pass preserves that rule even for outcome-before-observation journals
+    # and malformed legacy fixture IDs.
+    selected_observation_ids = set(observations)
+    for record in iter_observation_history_records():
+        if str(record.get("record_type") or "") != "observation_outcome":
+            continue
+        observation_id = str(
+            record.get("observation_key") or record.get("observation_id") or ""
+        )
+        if observation_id not in selected_observation_ids:
+            continue
+        rank = outcome_record_rank(record)
+        current = outcomes.get(observation_id)
+        if current is None or rank >= current[0]:
+            outcomes[observation_id] = (rank, dict(record))
+
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    for observation_id, (_rank, source) in observations.items():
+        observation = dict(source)
+        outcome_entry = outcomes.get(observation_id)
+        if outcome_entry is not None:
+            outcome_record = outcome_entry[1]
+            observation["outcome"] = dict(outcome_record.get("outcome") or {})
+            observation["outcome_schema_version"] = _safe_int(
+                outcome_record.get("outcome_schema_version"), 1
+            )
+            revision = get_outcome_revision(outcome_record)
+            if revision > 0:
+                observation["outcome_revision"] = revision
+            observation["outcome_record_created_at_utc"] = outcome_record.get(
+                "created_at_utc"
+            )
+        fixture_id = _safe_int(observation.get("fixture_id"), -1)
+        if fixture_id < 0:
+            continue
+        if (
+            not include_terminal
+            and str((observation.get("outcome") or {}).get("status"))
+            != "pending"
+        ):
+            continue
+        grouped.setdefault(fixture_id, []).append(observation)
+    for fixture_observations in grouped.values():
+        fixture_observations.sort(
+            key=lambda item: (
+                str(item.get("created_at_utc") or ""),
+                str(item.get("observation_id") or ""),
+            )
+        )
+    return grouped
+
+
+def pending_observations_by_fixture(
+    fixture_ids: Optional[Set[int]] = None,
+    *,
+    include_terminal: bool = False,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Load only selected canonical observations from the derived index."""
+
+    selected = (
+        {int(value) for value in fixture_ids}
+        if fixture_ids is not None
+        else set(pending_observation_fixture_ids())
+    )
+    if not selected:
+        return {}
+    path = os.path.abspath(OBSERVATION_HISTORY_FILE)
+    rows: List[Tuple[str, Optional[str]]] = []
+    try:
+        with _observation_history_lock, _observation_history_process_lock(path):
+            index = _get_observation_reconcile_index_locked(path)
+            connection = index.get("connection")
+            if index.get("invalid") or not isinstance(
+                connection, sqlite3.Connection
+            ):
+                return _stream_pending_observations_by_fixture(
+                    selected, include_terminal=include_terminal
+                )
+            ordered_ids = sorted(selected)
+            # Stay below SQLite's conservative host-parameter limit even when
+            # this helper is called directly with a large fixture cohort.
+            for offset in range(0, len(ordered_ids), 500):
+                chunk = ordered_ids[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                status_clause = (
+                    "" if include_terminal else " AND effective_status = 'pending'"
+                )
+                rows.extend(
+                    connection.execute(
+                        "SELECT observation_payload, outcome_payload "
+                        "FROM observation_records "
+                        "WHERE has_observation = 1 "
+                        f"AND fixture_id IN ({placeholders})"
+                        f"{status_clause}",
+                        tuple(chunk),
+                    ).fetchall()
+                )
+    except Exception:
+        logger.exception(
+            "[OBSERVATION_RECONCILE_INDEX_ERROR] action=query_records "
+            "file=%s fallback=stream",
+            path,
+        )
+        _invalidate_observation_reconcile_index()
+        with _observation_history_lock, _observation_history_process_lock(path):
+            return _stream_pending_observations_by_fixture(
+                selected, include_terminal=include_terminal
+            )
+
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    try:
+        for observation_payload, outcome_payload in rows:
+            observation = json.loads(observation_payload or "{}")
+            if not isinstance(observation, dict):
+                raise ValueError("invalid indexed observation projection")
+            if outcome_payload:
+                outcome_record = json.loads(outcome_payload)
+                if not isinstance(outcome_record, dict):
+                    raise ValueError("invalid indexed outcome projection")
+                observation["outcome"] = dict(
+                    outcome_record.get("outcome") or {}
+                )
+                observation["outcome_schema_version"] = _safe_int(
+                    outcome_record.get("outcome_schema_version"), 1
+                )
+                revision = get_outcome_revision(outcome_record)
+                if revision > 0:
+                    observation["outcome_revision"] = revision
+                observation["outcome_record_created_at_utc"] = (
+                    outcome_record.get("created_at_utc")
+                )
+            fixture_id = _safe_int(observation.get("fixture_id"), -1)
+            if fixture_id >= 0:
+                grouped.setdefault(fixture_id, []).append(observation)
+    except Exception:
+        logger.exception(
+            "[OBSERVATION_RECONCILE_INDEX_ERROR] action=decode_records "
+            "file=%s fallback=stream",
+            path,
+        )
+        _invalidate_observation_reconcile_index()
+        with _observation_history_lock, _observation_history_process_lock(path):
+            return _stream_pending_observations_by_fixture(
+                selected, include_terminal=include_terminal
+            )
+
+    for observations in grouped.values():
+        observations.sort(
+            key=lambda item: (
+                str(item.get("created_at_utc") or ""),
+                str(item.get("observation_id") or ""),
+            )
+        )
+    return grouped
+
+
+def resolve_observation_history_outcomes(
+    fixture_id: int,
+    events: List[Dict[str, Any]],
+    fixture_context: Dict[str, Any],
+    normal_time_score: Optional[Tuple[int, int]],
+    resolved_at_utc: str,
+    observations: Optional[List[Dict[str, Any]]] = None,
+    *,
+    terminalized_observation_ids: Optional[Set[str]] = None,
+) -> int:
+    if not ENABLE_OBSERVATION_HISTORY:
+        return 0
+    if observations is None:
+        observations = pending_observations_by_fixture({int(fixture_id)}).get(
+            int(fixture_id), []
+        )
+    written = 0
+    shadow_candidate_outcome_records: List[Dict[str, Any]] = []
+    static_ml_fixture_written = False
+    rolling_ml_fixture_written = False
+    ml_data_revision_written = False
+    for observation in observations:
+        # Rolling seeds are telemetry baselines, not prediction targets.  A
+        # correction sweep loads terminal rows too, so keep their embedded
+        # intentional VOID state from being replaced by a resolved label.
+        if str(observation.get("stage") or "") == "rolling_seed":
+            continue
+        previous_outcome = (
+            observation.get("outcome")
+            if isinstance(observation.get("outcome"), dict)
+            else {}
+        )
+        previous_status = str(previous_outcome.get("status") or "")
+        revises_existing_outcome = previous_status in {
+            "resolved", "void", "quarantine"
+        }
+        minute = _safe_int(observation.get("minute"), 0)
+        match = observation.get("match") if isinstance(observation.get("match"), dict) else {}
+        snapshot_score = (
+            _safe_int(match.get("score_home"), 0),
+            _safe_int(match.get("score_away"), 0),
+        )
+        classified = _classified_goals_after_signal(
+            events, minute, fixture_context, snapshot_score=snapshot_score
+        )
+        normal = classified["normal_time"]
+        extra = classified["extra_time"]
+        shootout = classified["shootout"]
+        clocks = [entry[0].clock_minute for entry in normal if entry[0].clock_minute is not None]
+        first = normal[0][0] if normal else None
+        integrity = _resolve_outcome_integrity(
+            fixture_id=fixture_id,
+            signal_score=snapshot_score,
+            normal_time_score=normal_time_score,
+            normal_time_event_count=len(normal),
+        )
+        has_normal_time_goal = integrity.goal_to90_normal_time is True
+        score_delta = int(integrity.score_delta or 0)
+        score_timeline = get_score_timeline(fixture_id)
+        next_15 = resolve_goal_within_horizon(
+            minute, snapshot_score, 15, clocks, score_timeline,
+            normal_time_score, len(normal),
+        )
+        next_25 = resolve_goal_within_horizon(
+            minute, snapshot_score, 25, clocks, score_timeline,
+            normal_time_score, len(normal),
+        )
+        before_75 = resolve_goal_within_horizon(
+            minute, snapshot_score, max(0, 75 - minute), clocks, score_timeline,
+            normal_time_score, len(normal),
+        )
+        outcome = {
+            "status": integrity.status,
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "goal_within_15": next_15["value"],
+            "goal_within_15_source": next_15["source"],
+            "goal_within_15_quality": next_15["quality"],
+            "goal_within_15_horizon_end_minute": next_15[
+                "horizon_end_minute"
+            ],
+            "goal_within_15_interval_start_minute": next_15[
+                "goal_interval_start_minute"
+            ],
+            "goal_within_15_interval_end_minute": next_15[
+                "goal_interval_end_minute"
+            ],
+            "goal_within_25": next_25["value"],
+            "goal_within_25_source": next_25["source"],
+            "goal_within_25_quality": next_25["quality"],
+            "goal_before_75": before_75["value"],
+            "goal_before_75_source": before_75["source"],
+            "goal_to90": bool(has_normal_time_goal),
+            "goal_to90_normal_time": bool(has_normal_time_goal),
+            "goal_in_extra_time": bool(extra),
+            "goals_after_snapshot": max(len(normal), score_delta),
+            "first_goal_minute_after_snapshot": first.clock_minute if first else None,
+            "first_normal_time_goal_after_snapshot": first.to_dict() if first else None,
+            "normal_time_final_score_home": normal_time_score[0] if normal_time_score else None,
+            "normal_time_final_score_away": normal_time_score[1] if normal_time_score else None,
+            "normal_time_result": integrity.normal_time_result,
+            "goal_result_source": integrity.goal_result_source,
+            "outcome_integrity_conflict": integrity.conflict,
+            "outcome_integrity_conflict_details": integrity.conflict_details,
+            "shootout_event_count_excluded": len(shootout),
+            "resolved_at_utc": resolved_at_utc,
+        }
+        outcome_schema_version = max(
+            int(OBSERVATION_OUTCOME_SCHEMA_VERSION),
+            get_outcome_schema_version(observation),
+        )
+        outcome_revision = next_outcome_revision(
+            observation,
+            outcome,
+            schema_version=outcome_schema_version,
+        )
+        if outcome_revision is None:
+            continue
+        outcome["outcome_revision"] = int(outcome_revision)
+        record = {
+            "record_type": "observation_outcome",
+            "observation_id": observation.get("observation_id"),
+            "observation_key": observation.get("observation_key") or observation.get("observation_id"),
+            "fixture_id": int(fixture_id),
+            "outcome_schema_version": int(outcome_schema_version),
+            "outcome_revision": int(outcome_revision),
+            "created_at_utc": resolved_at_utc,
+            "outcome": outcome,
+        }
+        outcome_written = append_observation_history(record)
+        written += int(outcome_written)
+        if outcome_written:
+            if (
+                terminalized_observation_ids is not None
+                and previous_status not in {"resolved", "void", "quarantine"}
+            ):
+                observation_id = str(
+                    observation.get("observation_key")
+                    or observation.get("observation_id")
+                    or ""
+                )
+                if observation_id:
+                    terminalized_observation_ids.add(observation_id)
+            shadow_candidate_outcome_records.append(record)
+            if (
+                (
+                    str(outcome.get("status") or "") == "resolved"
+                    or str(previous_outcome.get("status") or "") == "resolved"
+                )
+                and _is_shadow_ml_training_observation(observation)
+            ):
+                static_ml_fixture_written = True
+                ml_data_revision_written = (
+                    ml_data_revision_written or revises_existing_outcome
+                )
+                if _is_shadow_rolling_training_observation(observation):
+                    rolling_ml_fixture_written = True
+    if written:
+        logger.info(
+            "[OBSERVATION_OUTCOME] fixture_id=%s records_written=%s",
+            fixture_id,
+            written,
+        )
+        if static_ml_fixture_written or rolling_ml_fixture_written:
+            note_shadow_ml_outcome(
+                fixture_id,
+                data_revision=ml_data_revision_written,
+                static_eligible=static_ml_fixture_written,
+                rolling_eligible=rolling_ml_fixture_written,
+            )
+        append_shadow_candidate_outcomes(shadow_candidate_outcome_records)
+        append_wide_research_outcomes(shadow_candidate_outcome_records)
+        append_market_benchmark_outcomes(shadow_candidate_outcome_records)
+    return written
+
+
+def void_observation_history_outcomes(
+    fixture_id: int,
+    reason: str,
+    resolved_at_utc: str,
+    *,
+    include_terminal_records: bool = False,
+    observations: Optional[List[Dict[str, Any]]] = None,
+    terminalized_observation_ids: Optional[Set[str]] = None,
+) -> int:
+    written = 0
+    shadow_candidate_outcome_records: List[Dict[str, Any]] = []
+    static_ml_revision = False
+    rolling_ml_revision = False
+    if observations is None:
+        observations = pending_observations_by_fixture(
+            {int(fixture_id)},
+            include_terminal=include_terminal_records,
+        ).get(int(fixture_id), [])
+    for observation in observations:
+        # See resolve_observation_history_outcomes: telemetry seeds must never
+        # become labelled examples, including during terminal corrections.
+        if str(observation.get("stage") or "") == "rolling_seed":
+            continue
+        previous_outcome = (
+            observation.get("outcome")
+            if isinstance(observation.get("outcome"), dict)
+            else {}
+        )
+        previous_status = str(previous_outcome.get("status") or "")
+        outcome = {
+            "status": "void",
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "void_reason": str(reason),
+            "resolved_at_utc": resolved_at_utc,
+        }
+        outcome_schema_version = max(
+            int(OBSERVATION_OUTCOME_SCHEMA_VERSION),
+            get_outcome_schema_version(observation),
+        )
+        outcome_revision = next_outcome_revision(
+            observation,
+            outcome,
+            schema_version=outcome_schema_version,
+        )
+        if outcome_revision is None:
+            continue
+        outcome["outcome_revision"] = int(outcome_revision)
+        record = {
+            "record_type": "observation_outcome",
+            "observation_id": observation.get("observation_id"),
+            "observation_key": observation.get("observation_key") or observation.get("observation_id"),
+            "fixture_id": int(fixture_id),
+            "outcome_schema_version": int(outcome_schema_version),
+            "outcome_revision": int(outcome_revision),
+            "created_at_utc": resolved_at_utc,
+            "outcome": outcome,
+        }
+        outcome_written = append_observation_history(record)
+        written += int(outcome_written)
+        if outcome_written:
+            if (
+                terminalized_observation_ids is not None
+                and previous_status not in {"resolved", "void", "quarantine"}
+            ):
+                observation_id = str(
+                    observation.get("observation_key")
+                    or observation.get("observation_id")
+                    or ""
+                )
+                if observation_id:
+                    terminalized_observation_ids.add(observation_id)
+            shadow_candidate_outcome_records.append(record)
+            if (
+                previous_status == "resolved"
+                and _is_shadow_ml_training_observation(observation)
+            ):
+                static_ml_revision = True
+                rolling_ml_revision = (
+                    rolling_ml_revision
+                    or _is_shadow_rolling_training_observation(observation)
+                )
+    if shadow_candidate_outcome_records:
+        if static_ml_revision or rolling_ml_revision:
+            note_shadow_ml_outcome(
+                fixture_id,
+                data_revision=True,
+                static_eligible=static_ml_revision,
+                rolling_eligible=rolling_ml_revision,
+            )
+        append_shadow_candidate_outcomes(shadow_candidate_outcome_records)
+        append_wide_research_outcomes(shadow_candidate_outcome_records)
+        append_market_benchmark_outcomes(shadow_candidate_outcome_records)
+    return written
+
+
+_shadow_ml_model_lock = threading.RLock()
+_shadow_ml_train_lock = threading.Lock()
+_model_worker_slot = threading.Lock()
+_shadow_ml_active_process_lock = threading.RLock()
+_shadow_ml_active_process: Optional[subprocess.Popen[str]] = None
+_shadow_ml_model_cache: Dict[str, Any] = {}
+_shadow_ml_model_cache_path = ""
+_shadow_ml_model_cache_mtime_ns: Optional[int] = None
+_shadow_ml_model_last_checked_ts = 0.0
+_shadow_rolling_model_lock = threading.RLock()
+_shadow_rolling_model_cache: Dict[str, Any] = {}
+_shadow_rolling_model_cache_path = ""
+_shadow_rolling_model_cache_mtime_ns: Optional[int] = None
+_shadow_rolling_model_last_checked_ts = 0.0
+_shadow_ml_retrain_event = threading.Event()
+_shadow_ml_stop = threading.Event()
+_shadow_ml_thread: Optional[threading.Thread] = None
+_shadow_ml_schedule_lock = threading.RLock()
+_shadow_ml_pending_fixture_ids: Set[int] = set()
+_shadow_ml_known_new_fixtures = 0
+_shadow_ml_data_revision_pending = False
+_shadow_ml_contract_mismatch_pending = False
+_shadow_ml_noop_scan_not_before_monotonic = 0.0
+_shadow_rolling_pending_fixture_ids: Set[int] = set()
+_shadow_rolling_known_new_fixtures = 0
+_shadow_rolling_data_revision_pending = False
+_shadow_rolling_contract_mismatch_pending = False
+_shadow_rolling_noop_scan_not_before_monotonic = 0.0
+
+
+def _schedule_shadow_ml_retry(delay_seconds: float = 30.0) -> None:
+    """Wake the trainer soon after another heavy worker occupied its slot."""
+    def wake() -> None:
+        if not _shadow_ml_stop.wait(max(1.0, float(delay_seconds))):
+            _shadow_ml_retrain_event.set()
+
+    threading.Thread(
+        target=wake,
+        name="shadow-ml-retry",
+        daemon=True,
+    ).start()
+
+
+def _terminate_subprocess(
+    process: Optional[subprocess.Popen[str]],
+    *,
+    timeout: float = 5.0,
+) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=max(0.1, float(timeout)))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=max(0.1, float(timeout)))
+    except (OSError, ProcessLookupError):
+        pass
+
+
+@contextmanager
+def _model_candidate_path(target_path: str, *, prefix: str):
+    """Create a same-filesystem staging path for atomic model promotion."""
+    target = os.path.abspath(target_path)
+    parent = os.path.dirname(target) or os.curdir
+    os.makedirs(parent, exist_ok=True)
+    descriptor, candidate = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".json",
+        dir=parent,
+    )
+    os.close(descriptor)
+    try:
+        yield candidate
+    finally:
+        try:
+            os.remove(candidate)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning(
+                "[MODEL_CANDIDATE_CLEANUP] file=%s action=failed",
+                candidate,
+            )
+
+
+def _is_shadow_ml_training_observation(
+    observation: Mapping[str, Any],
+) -> bool:
+    """Return whether a resolved row can structurally enter static ML."""
+    if not isinstance(observation, Mapping):
+        return False
+    if str(observation.get("stage") or "") != "decision_pipeline":
+        return False
+    if _safe_int(observation.get("fixture_id"), 0) <= 0:
+        return False
+    minute = _safe_int(observation.get("minute"), -1)
+    return 46 <= minute <= 60
+
+
+def _is_shadow_rolling_training_observation(
+    observation: Mapping[str, Any],
+) -> bool:
+    """Return whether a resolved row can structurally enter rolling ML."""
+    if not _is_shadow_ml_training_observation(observation):
+        return False
+    rolling = observation.get("rolling_dynamics")
+    return bool(
+        isinstance(rolling, Mapping)
+        and _safe_int(rolling.get("schema_version"), 0)
+        == int(ROLLING_DYNAMICS_SCHEMA_VERSION)
+        and rolling.get("production_applied") is False
+        and str(rolling.get("mode") or "") == "shadow_collection"
+        and isinstance(rolling.get("windows"), Mapping)
+    )
+
+
+def note_shadow_ml_outcome(
+    fixture_id: int,
+    *,
+    data_revision: bool = False,
+    static_eligible: bool = True,
+    rolling_eligible: bool = True,
+) -> None:
+    """Record a cheap retrain hint without reading the history journal."""
+    global _shadow_ml_data_revision_pending
+    global _shadow_rolling_data_revision_pending
+    fixture_value = _safe_int(fixture_id, 0)
+    if fixture_value <= 0:
+        return
+    noted = False
+    with _shadow_ml_schedule_lock:
+        if ENABLE_SHADOW_ML and static_eligible:
+            _shadow_ml_pending_fixture_ids.add(fixture_value)
+            noted = True
+            if data_revision:
+                _shadow_ml_data_revision_pending = True
+        if ENABLE_SHADOW_ML_ROLLING_CHALLENGER and rolling_eligible:
+            _shadow_rolling_pending_fixture_ids.add(fixture_value)
+            noted = True
+            if data_revision:
+                _shadow_rolling_data_revision_pending = True
+    if noted:
+        _shadow_ml_retrain_event.set()
+
+
+def note_shadow_ml_contract_mismatch() -> None:
+    """Remember that the live feature contract differs from the artifact."""
+    global _shadow_ml_contract_mismatch_pending
+    with _shadow_ml_schedule_lock:
+        first_notice = not _shadow_ml_contract_mismatch_pending
+        _shadow_ml_contract_mismatch_pending = True
+    if first_notice:
+        logger.warning(
+            "[SHADOW_ML_CONTRACT_MISMATCH] action=wait_for_resolved_fixture "
+            "production_unchanged=true"
+        )
+
+
+def note_shadow_rolling_contract_mismatch() -> None:
+    """Remember a challenger/live rolling-contract mismatch independently."""
+    global _shadow_rolling_contract_mismatch_pending
+    with _shadow_ml_schedule_lock:
+        first_notice = not _shadow_rolling_contract_mismatch_pending
+        _shadow_rolling_contract_mismatch_pending = True
+    if first_notice:
+        logger.warning(
+            "[SHADOW_ML_ROLLING_CONTRACT_MISMATCH] "
+            "action=wait_for_resolved_fixture production_unchanged=true"
+        )
+
+
+def _shadow_ml_scan_due(
+    artifact: Mapping[str, Any],
+    *,
+    pending_fixtures: int,
+    data_revision: bool,
+    contract_mismatch: bool,
+    scan_not_before_monotonic: float = 0.0,
+    now_monotonic: Optional[float] = None,
+) -> bool:
+    """Decide whether a full journal scan is worth its cost."""
+    pending = max(0, int(pending_fixtures))
+    if not artifact:
+        return True
+    if pending > 0 and (data_revision or contract_mismatch):
+        return True
+    current_monotonic = (
+        time.monotonic() if now_monotonic is None else float(now_monotonic)
+    )
+    if current_monotonic < float(scan_not_before_monotonic):
+        return False
+    age_seconds = _shadow_ml_model_age_seconds(artifact)
+    if (
+        pending >= int(SHADOW_ML_MIN_NEW_FIXTURES)
+        and age_seconds >= float(SHADOW_ML_RETRAIN_CHECK_SECONDS)
+    ):
+        return True
+    return bool(
+        pending >= int(SHADOW_ML_WEEKLY_MIN_NEW_FIXTURES)
+        and age_seconds >= float(SHADOW_ML_WEEKLY_RETRAIN_SECONDS)
+    )
+
+
+def _update_shadow_ml_schedule_after_scan(
+    result: Mapping[str, Any],
+    *,
+    consumed_fixture_ids: Optional[Set[int]] = None,
+    consumed_data_revision: bool = False,
+    consumed_contract_mismatch: bool = False,
+) -> None:
+    global _shadow_ml_known_new_fixtures
+    global _shadow_ml_data_revision_pending
+    global _shadow_ml_contract_mismatch_pending
+    global _shadow_ml_noop_scan_not_before_monotonic
+    consumed = set(consumed_fixture_ids or set())
+    status = str(result.get("status") or "")
+    reason = str(result.get("reason") or "")
+    with _shadow_ml_schedule_lock:
+        completed_noop_scan = (
+            status == "skipped" and reason == "no_retrain_threshold"
+        )
+        if status != "trained" and not completed_noop_scan:
+            _shadow_ml_pending_fixture_ids.update(consumed)
+            _shadow_ml_data_revision_pending = (
+                _shadow_ml_data_revision_pending
+                or consumed_data_revision
+            )
+            _shadow_ml_contract_mismatch_pending = (
+                _shadow_ml_contract_mismatch_pending
+                or consumed_contract_mismatch
+            )
+            return
+        if status == "trained":
+            _shadow_ml_known_new_fixtures = 0
+            _shadow_ml_noop_scan_not_before_monotonic = 0.0
+        else:
+            _shadow_ml_known_new_fixtures = max(
+                0, _safe_int(result.get("new_fixtures"), 0)
+            )
+            _shadow_ml_noop_scan_not_before_monotonic = max(
+                _shadow_ml_noop_scan_not_before_monotonic,
+                time.monotonic()
+                + float(SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS),
+            )
+            logger.info(
+                "[SHADOW_ML_SCAN_COOLDOWN] variant=static "
+                "reason=no_retrain_threshold new_fixtures=%s seconds=%s",
+                _shadow_ml_known_new_fixtures,
+                SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS,
+            )
+
+
+def process_shadow_ml_retrain_wakeup(
+    *,
+    trigger: str,
+) -> Dict[str, Any]:
+    """Debounce outcome events before the expensive full-history load."""
+    global _shadow_ml_data_revision_pending
+    global _shadow_ml_contract_mismatch_pending
+    global _shadow_ml_noop_scan_not_before_monotonic
+    with _shadow_ml_schedule_lock:
+        pending_count = (
+            int(_shadow_ml_known_new_fixtures)
+            + len(_shadow_ml_pending_fixture_ids)
+        )
+        data_revision = bool(_shadow_ml_data_revision_pending)
+        contract_mismatch = bool(_shadow_ml_contract_mismatch_pending)
+        scan_not_before = float(
+            _shadow_ml_noop_scan_not_before_monotonic
+        )
+    artifact = load_shadow_ml_model_cached()
+    if not _shadow_ml_scan_due(
+        artifact,
+        pending_fixtures=pending_count,
+        data_revision=data_revision,
+        contract_mismatch=contract_mismatch,
+        scan_not_before_monotonic=scan_not_before,
+    ):
+        now_monotonic = time.monotonic()
+        cooldown_remaining = max(0.0, scan_not_before - now_monotonic)
+        if scan_not_before > 0.0 and cooldown_remaining == 0.0:
+            with _shadow_ml_schedule_lock:
+                if (
+                    _shadow_ml_noop_scan_not_before_monotonic
+                    == scan_not_before
+                ):
+                    _shadow_ml_noop_scan_not_before_monotonic = 0.0
+        return {
+            "status": "skipped",
+            "trigger": str(trigger),
+            "reason": (
+                "noop_scan_cooldown"
+                if cooldown_remaining > 0.0
+                else "debounced_before_history_scan"
+            ),
+            "pending_fixtures": pending_count,
+            "cooldown_remaining_seconds": round(cooldown_remaining, 3),
+        }
+
+    with _shadow_ml_schedule_lock:
+        consumed_fixture_ids = set(_shadow_ml_pending_fixture_ids)
+        _shadow_ml_pending_fixture_ids.clear()
+        consumed_data_revision = bool(_shadow_ml_data_revision_pending)
+        consumed_contract_mismatch = bool(
+            _shadow_ml_contract_mismatch_pending
+        )
+        _shadow_ml_data_revision_pending = False
+        _shadow_ml_contract_mismatch_pending = False
+    result = train_shadow_ml_once(
+        force=False,
+        trigger=trigger,
+        data_revision_hint=consumed_data_revision,
+    )
+    if (
+        str(result.get("status") or "") == "skipped"
+        and str(result.get("reason") or "") == "training_already_running"
+    ):
+        _schedule_shadow_ml_retry()
+    _update_shadow_ml_schedule_after_scan(
+        result,
+        consumed_fixture_ids=consumed_fixture_ids,
+        consumed_data_revision=consumed_data_revision,
+        consumed_contract_mismatch=consumed_contract_mismatch,
+    )
+    return result
+
+
+def _update_shadow_rolling_schedule_after_scan(
+    result: Mapping[str, Any],
+    *,
+    consumed_fixture_ids: Optional[Set[int]] = None,
+    consumed_data_revision: bool = False,
+    consumed_contract_mismatch: bool = False,
+) -> None:
+    global _shadow_rolling_known_new_fixtures
+    global _shadow_rolling_data_revision_pending
+    global _shadow_rolling_contract_mismatch_pending
+    global _shadow_rolling_noop_scan_not_before_monotonic
+    consumed = set(consumed_fixture_ids or set())
+    status = str(result.get("status") or "")
+    reason = str(result.get("reason") or "")
+    with _shadow_ml_schedule_lock:
+        completed_noop_scan = (
+            status == "skipped" and reason == "no_retrain_threshold"
+        )
+        if status != "trained" and not completed_noop_scan:
+            _shadow_rolling_pending_fixture_ids.update(consumed)
+            _shadow_rolling_data_revision_pending = (
+                _shadow_rolling_data_revision_pending
+                or consumed_data_revision
+            )
+            _shadow_rolling_contract_mismatch_pending = (
+                _shadow_rolling_contract_mismatch_pending
+                or consumed_contract_mismatch
+            )
+            return
+        if status == "trained":
+            _shadow_rolling_known_new_fixtures = 0
+            _shadow_rolling_noop_scan_not_before_monotonic = 0.0
+        else:
+            _shadow_rolling_known_new_fixtures = max(
+                0, _safe_int(result.get("new_fixtures"), 0)
+            )
+            _shadow_rolling_noop_scan_not_before_monotonic = max(
+                _shadow_rolling_noop_scan_not_before_monotonic,
+                time.monotonic()
+                + float(SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS),
+            )
+            logger.info(
+                "[SHADOW_ML_SCAN_COOLDOWN] variant=rolling "
+                "reason=no_retrain_threshold new_fixtures=%s seconds=%s",
+                _shadow_rolling_known_new_fixtures,
+                SHADOW_ML_NOOP_SCAN_COOLDOWN_SECONDS,
+            )
+
+
+def process_shadow_rolling_retrain_wakeup(
+    *,
+    trigger: str,
+) -> Dict[str, Any]:
+    """Debounce and train the rolling challenger from its own pending state."""
+    global _shadow_rolling_data_revision_pending
+    global _shadow_rolling_contract_mismatch_pending
+    global _shadow_rolling_noop_scan_not_before_monotonic
+    if not (
+        ENABLE_SHADOW_ML_ROLLING_CHALLENGER
+        and SHADOW_ML_ROLLING_AUTO_RETRAIN
+    ):
+        return {
+            "status": "skipped",
+            "trigger": str(trigger),
+            "reason": "disabled",
+        }
+    with _shadow_ml_schedule_lock:
+        pending_count = (
+            int(_shadow_rolling_known_new_fixtures)
+            + len(_shadow_rolling_pending_fixture_ids)
+        )
+        data_revision = bool(_shadow_rolling_data_revision_pending)
+        contract_mismatch = bool(_shadow_rolling_contract_mismatch_pending)
+        scan_not_before = float(
+            _shadow_rolling_noop_scan_not_before_monotonic
+        )
+    artifact = load_shadow_rolling_model_cached()
+    if not _shadow_ml_scan_due(
+        artifact,
+        pending_fixtures=pending_count,
+        data_revision=data_revision,
+        contract_mismatch=contract_mismatch,
+        scan_not_before_monotonic=scan_not_before,
+    ):
+        now_monotonic = time.monotonic()
+        cooldown_remaining = max(0.0, scan_not_before - now_monotonic)
+        if scan_not_before > 0.0 and cooldown_remaining == 0.0:
+            with _shadow_ml_schedule_lock:
+                if (
+                    _shadow_rolling_noop_scan_not_before_monotonic
+                    == scan_not_before
+                ):
+                    _shadow_rolling_noop_scan_not_before_monotonic = 0.0
+        return {
+            "status": "skipped",
+            "trigger": str(trigger),
+            "reason": (
+                "noop_scan_cooldown"
+                if cooldown_remaining > 0.0
+                else "debounced_before_history_scan"
+            ),
+            "pending_fixtures": pending_count,
+            "cooldown_remaining_seconds": round(cooldown_remaining, 3),
+        }
+
+    with _shadow_ml_schedule_lock:
+        consumed_fixture_ids = set(_shadow_rolling_pending_fixture_ids)
+        _shadow_rolling_pending_fixture_ids.clear()
+        consumed_data_revision = bool(_shadow_rolling_data_revision_pending)
+        consumed_contract_mismatch = bool(
+            _shadow_rolling_contract_mismatch_pending
+        )
+        _shadow_rolling_data_revision_pending = False
+        _shadow_rolling_contract_mismatch_pending = False
+    result = train_shadow_rolling_ml_once(
+        force=False,
+        trigger=trigger,
+        data_revision_hint=consumed_data_revision,
+    )
+    if (
+        str(result.get("status") or "") == "skipped"
+        and str(result.get("reason") or "") == "training_already_running"
+    ):
+        _schedule_shadow_ml_retry()
+    _update_shadow_rolling_schedule_after_scan(
+        result,
+        consumed_fixture_ids=consumed_fixture_ids,
+        consumed_data_revision=consumed_data_revision,
+        consumed_contract_mismatch=consumed_contract_mismatch,
+    )
+    return result
+
+
+def _shadow_ml_config() -> ShadowMLConfig:
+    return ShadowMLConfig(
+        candidate_min_fixtures=int(SHADOW_ML_CANDIDATE_MIN_FIXTURES),
+        offline_ready_min_fixtures=int(
+            SHADOW_ML_OFFLINE_READY_MIN_FIXTURES
+        ),
+        offline_ready_min_span_days=float(
+            SHADOW_ML_OFFLINE_READY_MIN_HISTORY_DAYS
+        ),
+        offline_ready_min_calibration_fixtures=int(
+            SHADOW_ML_OFFLINE_READY_MIN_SPLIT_FIXTURES
+        ),
+        offline_ready_min_holdout_fixtures=int(
+            SHADOW_ML_OFFLINE_READY_MIN_SPLIT_FIXTURES
+        ),
+        offline_ready_min_rows=int(SHADOW_ML_OFFLINE_READY_MIN_ROWS),
+        offline_ready_min_class_fixtures=int(
+            SHADOW_ML_OFFLINE_READY_MIN_CLASS_FIXTURES
+        ),
+        offline_ready_max_next15_unknown_fraction=float(
+            SHADOW_ML_OFFLINE_READY_MAX_NEXT15_UNKNOWN_FRACTION
+        ),
+        offline_ready_min_core_availability=float(
+            SHADOW_ML_OFFLINE_READY_MIN_CORE_AVAILABILITY
+        ),
+        readiness_min_logloss_improvement=float(
+            SHADOW_ML_READINESS_MIN_LOGLOSS_IMPROVEMENT
+        ),
+        readiness_min_brier_improvement=float(
+            SHADOW_ML_READINESS_MIN_BRIER_IMPROVEMENT
+        ),
+    )
+
+
+def _shadow_ml_artifact_is_safe(artifact: Mapping[str, Any]) -> bool:
+    if (
+        not isinstance(artifact, Mapping)
+        or artifact.get("artifact_type") != "shadow_ml_model"
+        or bool(artifact.get("production_applied", False))
+    ):
+        return False
+    probe = predict_shadow(artifact, {})
+    return str(probe.get("status") or "") != "invalid_artifact"
+
+
+def _shadow_rolling_artifact_is_safe(artifact: Mapping[str, Any]) -> bool:
+    if (
+        not isinstance(artifact, Mapping)
+        or artifact.get("artifact_type") != ROLLING_ARTIFACT_TYPE
+        or artifact.get("artifact_role") != ROLLING_ARTIFACT_ROLE
+        or artifact.get("feature_profile") != ROLLING_FEATURE_PROFILE
+        or bool(artifact.get("production_applied", False))
+    ):
+        return False
+    probe = predict_shadow_rolling(artifact, {})
+    return str(probe.get("status") or "") != "invalid_artifact"
+
+
+def _set_shadow_ml_model_cache(
+    artifact: Mapping[str, Any],
+    *,
+    path: Optional[str] = None,
+) -> None:
+    global _shadow_ml_model_cache
+    global _shadow_ml_model_cache_path
+    global _shadow_ml_model_cache_mtime_ns
+    global _shadow_ml_model_last_checked_ts
+    active = os.path.abspath(path or SHADOW_ML_MODEL_FILE)
+    try:
+        mtime_ns = os.stat(active).st_mtime_ns
+    except OSError:
+        mtime_ns = None
+    with _shadow_ml_model_lock:
+        _shadow_ml_model_cache = copy.deepcopy(dict(artifact))
+        _shadow_ml_model_cache_path = active
+        _shadow_ml_model_cache_mtime_ns = mtime_ns
+        _shadow_ml_model_last_checked_ts = time.monotonic()
+
+
+def invalidate_shadow_ml_model_cache() -> None:
+    global _shadow_ml_model_cache
+    global _shadow_ml_model_cache_path
+    global _shadow_ml_model_cache_mtime_ns
+    global _shadow_ml_model_last_checked_ts
+    with _shadow_ml_model_lock:
+        _shadow_ml_model_cache = {}
+        _shadow_ml_model_cache_path = ""
+        _shadow_ml_model_cache_mtime_ns = None
+        _shadow_ml_model_last_checked_ts = 0.0
+
+
+def load_shadow_ml_model_cached(
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Load a validated immutable shadow artifact without touching live math."""
+    global _shadow_ml_model_cache
+    global _shadow_ml_model_cache_path
+    global _shadow_ml_model_cache_mtime_ns
+    global _shadow_ml_model_last_checked_ts
+    if not ENABLE_SHADOW_ML:
+        return {}
+    active = os.path.abspath(SHADOW_ML_MODEL_FILE)
+    now_monotonic = time.monotonic()
+    with _shadow_ml_model_lock:
+        same_path = _shadow_ml_model_cache_path == active
+        cache_fresh = (
+            same_path
+            and not force
+            and now_monotonic - _shadow_ml_model_last_checked_ts
+            < float(SHADOW_ML_MODEL_REFRESH_SECONDS)
+        )
+        if cache_fresh:
+            return _shadow_ml_model_cache
+        try:
+            current_mtime_ns = os.stat(active).st_mtime_ns
+        except OSError:
+            current_mtime_ns = None
+        if (
+            same_path
+            and not force
+            and _shadow_ml_model_cache
+            and current_mtime_ns == _shadow_ml_model_cache_mtime_ns
+        ):
+            _shadow_ml_model_last_checked_ts = now_monotonic
+            return _shadow_ml_model_cache
+
+    artifact = load_shadow_ml_model_file(active)
+    if artifact and not _shadow_ml_artifact_is_safe(artifact):
+        logger.error(
+            "[SHADOW_ML_MODEL_INVALID] file=%s action=ignore production_unchanged=true",
+            active,
+        )
+        artifact = {}
+    _set_shadow_ml_model_cache(artifact, path=active)
+    return _shadow_ml_model_cache
+
+
+def _set_shadow_rolling_model_cache(
+    artifact: Mapping[str, Any],
+    *,
+    path: Optional[str] = None,
+) -> None:
+    global _shadow_rolling_model_cache
+    global _shadow_rolling_model_cache_path
+    global _shadow_rolling_model_cache_mtime_ns
+    global _shadow_rolling_model_last_checked_ts
+    active = os.path.abspath(path or SHADOW_ML_ROLLING_MODEL_FILE)
+    try:
+        mtime_ns = os.stat(active).st_mtime_ns
+    except OSError:
+        mtime_ns = None
+    with _shadow_rolling_model_lock:
+        _shadow_rolling_model_cache = copy.deepcopy(dict(artifact))
+        _shadow_rolling_model_cache_path = active
+        _shadow_rolling_model_cache_mtime_ns = mtime_ns
+        _shadow_rolling_model_last_checked_ts = time.monotonic()
+
+
+def invalidate_shadow_rolling_model_cache() -> None:
+    global _shadow_rolling_model_cache
+    global _shadow_rolling_model_cache_path
+    global _shadow_rolling_model_cache_mtime_ns
+    global _shadow_rolling_model_last_checked_ts
+    with _shadow_rolling_model_lock:
+        _shadow_rolling_model_cache = {}
+        _shadow_rolling_model_cache_path = ""
+        _shadow_rolling_model_cache_mtime_ns = None
+        _shadow_rolling_model_last_checked_ts = 0.0
+
+
+def load_shadow_rolling_model_cached(
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Load only the rolling challenger artifact into its isolated cache."""
+    global _shadow_rolling_model_cache
+    global _shadow_rolling_model_cache_path
+    global _shadow_rolling_model_cache_mtime_ns
+    global _shadow_rolling_model_last_checked_ts
+    if not ENABLE_SHADOW_ML_ROLLING_CHALLENGER:
+        return {}
+    active = os.path.abspath(SHADOW_ML_ROLLING_MODEL_FILE)
+    now_monotonic = time.monotonic()
+    with _shadow_rolling_model_lock:
+        same_path = _shadow_rolling_model_cache_path == active
+        cache_fresh = (
+            same_path
+            and not force
+            and now_monotonic - _shadow_rolling_model_last_checked_ts
+            < float(SHADOW_ML_MODEL_REFRESH_SECONDS)
+        )
+        if cache_fresh:
+            return _shadow_rolling_model_cache
+        try:
+            current_mtime_ns = os.stat(active).st_mtime_ns
+        except OSError:
+            current_mtime_ns = None
+        if (
+            same_path
+            and not force
+            and _shadow_rolling_model_cache
+            and current_mtime_ns == _shadow_rolling_model_cache_mtime_ns
+        ):
+            _shadow_rolling_model_last_checked_ts = now_monotonic
+            return _shadow_rolling_model_cache
+
+    artifact = load_shadow_ml_model_file(active)
+    if artifact and not _shadow_rolling_artifact_is_safe(artifact):
+        logger.error(
+            "[SHADOW_ML_ROLLING_MODEL_INVALID] file=%s "
+            "action=ignore production_unchanged=true",
+            active,
+        )
+        artifact = {}
+    _set_shadow_rolling_model_cache(artifact, path=active)
+    return _shadow_rolling_model_cache
+
+
+def _shadow_ml_model_age_seconds(
+    artifact: Mapping[str, Any],
+    *,
+    now_utc: Optional[datetime] = None,
+) -> float:
+    created = _parse_iso_utc(artifact.get("created_at_utc"))
+    if created is None:
+        return float("inf")
+    current = now_utc or datetime.now(timezone.utc)
+    return max(0.0, (current - created).total_seconds())
+
+
+def _train_shadow_ml_once_local(
+    *,
+    force: bool = False,
+    trigger: str = "manual",
+    data_revision_hint: bool = False,
+    history_path: Optional[str] = None,
+    output_path: Optional[str] = None,
+    variant: str = "static",
+) -> Dict[str, Any]:
+    """In-process trainer used by the isolated worker and focused tests."""
+    is_rolling = str(variant) == "rolling"
+    if str(variant) not in {"static", "rolling"}:
+        raise ValueError("unknown shadow ML variant")
+    enabled = (
+        ENABLE_SHADOW_ML_ROLLING_CHALLENGER if is_rolling else ENABLE_SHADOW_ML
+    )
+    summarize_training = (
+        summarize_shadow_rolling_training_data
+        if is_rolling
+        else summarize_shadow_ml_training_data
+    )
+    load_current_model = (
+        load_shadow_rolling_model_cached
+        if is_rolling
+        else load_shadow_ml_model_cached
+    )
+    train_model = train_shadow_rolling_model if is_rolling else train_shadow_model
+    validate_artifact = (
+        _shadow_rolling_artifact_is_safe
+        if is_rolling
+        else _shadow_ml_artifact_is_safe
+    )
+    canonical_model_file = (
+        SHADOW_ML_ROLLING_MODEL_FILE if is_rolling else SHADOW_ML_MODEL_FILE
+    )
+    result = {
+        "status": "skipped",
+        "trigger": str(trigger),
+        "records": 0,
+        "fixtures": 0,
+        "new_fixtures": 0,
+        "model_id": None,
+    }
+    if not enabled:
+        result["reason"] = "disabled"
+        return result
+    if not _shadow_ml_train_lock.acquire(blocking=False):
+        result["reason"] = "training_already_running"
+        return result
+    try:
+        history_spool_stats: Optional[Dict[str, int]] = None
+        if history_path is not None:
+            records, history_spool_stats = load_shadow_ml_training_history(
+                history_path
+            )
+            logger.info(
+                "[SHADOW_ML_HISTORY_SPOOL] variant=%s scanned=%s observations=%s "
+                "outcomes=%s candidate_payloads=%s materialized_rows=%s",
+                variant,
+                history_spool_stats.get("records_scanned"),
+                history_spool_stats.get("observation_records"),
+                history_spool_stats.get("outcome_records"),
+                history_spool_stats.get("candidate_payloads_seen"),
+                history_spool_stats.get("joined_training_rows"),
+            )
+            result["history_spool"] = dict(history_spool_stats)
+        else:
+            records = load_joined_observation_history(include_pending=False)
+        summary = summarize_training(records)
+        current_fixtures = _safe_int(summary.get("unique_fixtures"), 0)
+        result["records"] = _safe_int(summary.get("eligible_records"), 0)
+        result["fixtures"] = current_fixtures
+
+        current_artifact = load_current_model(force=True)
+        previous_summary = (
+            current_artifact.get("training_summary")
+            if isinstance(current_artifact.get("training_summary"), dict)
+            else {}
+        )
+        previous_fixtures = _safe_int(
+            previous_summary.get("unique_fixtures"), 0
+        )
+        new_fixtures = max(0, current_fixtures - previous_fixtures)
+        result["new_fixtures"] = new_fixtures
+        current_contract = (
+            summary.get("training_contract")
+            if isinstance(summary.get("training_contract"), dict)
+            else {}
+        )
+        previous_contract = (
+            current_artifact.get("training_contract")
+            if isinstance(current_artifact.get("training_contract"), dict)
+            else {}
+        )
+        current_contract_key = str(current_contract.get("key") or "")
+        previous_contract_key = str(previous_contract.get("key") or "")
+        contract_changed = bool(
+            current_contract_key
+            and current_contract_key != previous_contract_key
+        )
+        result["feature_contract_changed"] = contract_changed
+        current_data_hash = str(
+            summary.get("training_data_hash") or ""
+        )
+        previous_data_hash = str(
+            current_artifact.get("training_data_hash") or ""
+        )
+        data_hash_changed = bool(
+            current_data_hash
+            and current_data_hash != previous_data_hash
+        )
+        data_revision_changed = bool(
+            data_hash_changed
+            and (
+                bool(data_revision_hint)
+                or current_fixtures <= previous_fixtures
+            )
+        )
+        result["training_data_hash_changed"] = data_hash_changed
+        result["data_revision_changed"] = data_revision_changed
+        model_age_seconds = _shadow_ml_model_age_seconds(current_artifact)
+
+        if (
+            not force
+            and current_artifact
+            and not contract_changed
+            and not data_revision_changed
+        ):
+            enough_regular_growth = (
+                new_fixtures >= int(SHADOW_ML_MIN_NEW_FIXTURES)
+                and model_age_seconds
+                >= float(SHADOW_ML_RETRAIN_CHECK_SECONDS)
+            )
+            enough_weekly_growth = (
+                new_fixtures >= int(SHADOW_ML_WEEKLY_MIN_NEW_FIXTURES)
+                and model_age_seconds
+                >= float(SHADOW_ML_WEEKLY_RETRAIN_SECONDS)
+            )
+            if not enough_regular_growth and not enough_weekly_growth:
+                result["reason"] = "no_retrain_threshold"
+                return result
+
+        artifact = train_model(
+            records,
+            config=_shadow_ml_config(),
+            now=datetime.now(timezone.utc),
+        )
+        if not validate_artifact(artifact):
+            raise ValueError("trainer returned an invalid shadow artifact")
+        destination = output_path or canonical_model_file
+        save_shadow_ml_model_file(destination, artifact)
+        if output_path is None:
+            if is_rolling:
+                _set_shadow_rolling_model_cache(artifact)
+            else:
+                _set_shadow_ml_model_cache(artifact)
+        else:
+            if is_rolling:
+                _set_shadow_rolling_model_cache(artifact, path=destination)
+            else:
+                _set_shadow_ml_model_cache(artifact, path=destination)
+        result.update(
+            {
+                "status": "trained",
+                "model_id": artifact.get("model_id"),
+                "model_status": artifact.get("status"),
+                "reason": None,
+            }
+        )
+        logger.info(
+            "[%s] trigger=%s model_id=%s status=%s records=%s fixtures=%s new_fixtures=%s feature_contract_changed=%s data_revision_changed=%s span_days=%s production_apply=false",
+            "SHADOW_ML_ROLLING_TRAIN" if is_rolling else "SHADOW_ML_TRAIN",
+            trigger,
+            artifact.get("model_id"),
+            artifact.get("status"),
+            result["records"],
+            current_fixtures,
+            new_fixtures,
+            contract_changed,
+            data_revision_changed,
+            summary.get("span_days"),
+        )
+        return result
+    except MemoryError:
+        result["status"] = "error"
+        result["reason"] = "memory_limit_exceeded"
+        logger.error(
+            "[%s] trigger=%s reason=memory_limit_exceeded "
+            "production_unchanged=true",
+            (
+                "SHADOW_ML_ROLLING_TRAIN_ERROR"
+                if is_rolling
+                else "SHADOW_ML_TRAIN_ERROR"
+            ),
+            trigger,
+        )
+        return result
+    except Exception:
+        result["status"] = "error"
+        result["reason"] = "exception"
+        logger.exception(
+            "[%s] trigger=%s production_unchanged=true",
+            (
+                "SHADOW_ML_ROLLING_TRAIN_ERROR"
+                if is_rolling
+                else "SHADOW_ML_TRAIN_ERROR"
+            ),
+            trigger,
+        )
+        return result
+    finally:
+        _shadow_ml_train_lock.release()
+
+
+@contextmanager
+def _shadow_ml_history_snapshot():
+    """Expose a stable point-in-time journal tree to an exec worker."""
+    active = os.path.abspath(OBSERVATION_HISTORY_FILE)
+    with tempfile.TemporaryDirectory(prefix="goalbot-shadow-ml-") as temporary:
+        snapshot_active = os.path.join(temporary, os.path.basename(active))
+        with _observation_history_lock, _observation_history_process_lock(active):
+            for source in _observation_history_paths(active):
+                destination = os.path.join(temporary, os.path.basename(source))
+                # A hard link is not an isolated snapshot: creating/removing it
+                # changes the source inode ctime.  That metadata churn used to
+                # invalidate a perfectly current 2 GB reconcile index and
+                # trigger a full live rebuild.  Copy every source while both
+                # in-process and inter-process journal locks are held.
+                shutil.copy2(source, destination)
+        yield snapshot_active
+
+
+def _shadow_ml_worker_command(
+    *,
+    history_path: str,
+    output_path: str,
+    current_model_path: str,
+    force: bool,
+    trigger: str,
+    data_revision_hint: bool,
+    variant: str = "static",
+) -> List[str]:
+    command = [
+        sys.executable,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "train_shadow_ml.py"),
+        "--input",
+        str(history_path),
+        "--output",
+        os.path.abspath(output_path),
+        "--current-model",
+        os.path.abspath(current_model_path),
+        "--managed-worker",
+        "--trigger",
+        str(trigger),
+    ]
+    if force:
+        command.append("--force")
+    if data_revision_hint:
+        command.append("--data-revision-hint")
+    if str(variant) == "rolling":
+        command.extend(("--variant", "rolling"))
+    return command
+
+
+def _train_shadow_ml_once_isolated(
+    *,
+    force: bool = False,
+    trigger: str = "manual",
+    data_revision_hint: bool = False,
+    variant: str = "static",
+) -> Dict[str, Any]:
+    """Run history materialization and model fitting outside the bot process."""
+    global _shadow_ml_active_process
+    is_rolling = str(variant) == "rolling"
+    if str(variant) not in {"static", "rolling"}:
+        raise ValueError("unknown shadow ML variant")
+    enabled = (
+        ENABLE_SHADOW_ML_ROLLING_CHALLENGER if is_rolling else ENABLE_SHADOW_ML
+    )
+    canonical_model_file = (
+        SHADOW_ML_ROLLING_MODEL_FILE if is_rolling else SHADOW_ML_MODEL_FILE
+    )
+    candidate_prefix = (
+        ".shadow-ml-rolling-candidate-"
+        if is_rolling
+        else ".shadow-ml-candidate-"
+    )
+    validate_artifact = (
+        _shadow_rolling_artifact_is_safe
+        if is_rolling
+        else _shadow_ml_artifact_is_safe
+    )
+    result: Dict[str, Any] = {
+        "status": "skipped",
+        "trigger": str(trigger),
+        "records": 0,
+        "fixtures": 0,
+        "new_fixtures": 0,
+        "model_id": None,
+        "isolated_process": True,
+    }
+    if not enabled:
+        result["reason"] = "disabled"
+        return result
+    if not _shadow_ml_train_lock.acquire(blocking=False):
+        result["reason"] = "training_already_running"
+        return result
+    process: Optional[subprocess.Popen[str]] = None
+    worker_slot_acquired = False
+    try:
+        # Startup ML scans can take slightly longer than one minute.  Keep the
+        # single shared heavy-worker slot, but wait long enough to hand it over
+        # directly instead of unnecessarily deferring discovery by 15 minutes.
+        for _attempt in range(120):
+            worker_slot_acquired = _model_worker_slot.acquire(timeout=1.0)
+            if worker_slot_acquired or _shadow_ml_stop.is_set():
+                break
+        if not worker_slot_acquired:
+            reason = (
+                "worker_stopping"
+                if _shadow_ml_stop.is_set()
+                else "heavy_worker_busy"
+            )
+            result.update(
+                {
+                    "status": "error",
+                    "reason": reason,
+                }
+            )
+            if reason == "heavy_worker_busy":
+                _schedule_shadow_ml_retry()
+            return result
+        canonical_model = os.path.abspath(canonical_model_file)
+        with _model_candidate_path(
+            canonical_model,
+            prefix=candidate_prefix,
+        ) as candidate_model:
+            with _shadow_ml_history_snapshot() as snapshot_path:
+                worker_environment = os.environ.copy()
+                worker_environment["GOALBOT_LIBRARY_MODE"] = "1"
+                worker_environment[
+                    "GOALBOT_SHADOW_ML_WORKER_MEMORY_LIMIT_MB"
+                ] = str(SHADOW_ML_WORKER_MEMORY_LIMIT_MB)
+                with _shadow_ml_active_process_lock:
+                    if _shadow_ml_stop.is_set():
+                        result.update(
+                            {"status": "error", "reason": "worker_stopping"}
+                        )
+                        return result
+                    process = subprocess.Popen(
+                        _shadow_ml_worker_command(
+                            history_path=snapshot_path,
+                            output_path=candidate_model,
+                            current_model_path=canonical_model,
+                            force=force,
+                            trigger=trigger,
+                            data_revision_hint=data_revision_hint,
+                            variant=variant,
+                        ),
+                        cwd=os.path.dirname(os.path.abspath(__file__)),
+                        env=worker_environment,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    _shadow_ml_active_process = process
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=float(SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS)
+                    )
+                except subprocess.TimeoutExpired:
+                    _terminate_subprocess(process)
+                    result.update({"status": "error", "reason": "worker_timeout"})
+                    logger.error(
+                        "[%s] trigger=%s reason=timeout timeout_seconds=%s production_unchanged=true",
+                        (
+                            "SHADOW_ML_ROLLING_WORKER_ERROR"
+                            if is_rolling
+                            else "SHADOW_ML_WORKER_ERROR"
+                        ),
+                        trigger,
+                        SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS,
+                    )
+                    return result
+            if process.returncode != 0:
+                result.update(
+                    {
+                        "status": "error",
+                        "reason": "worker_exit",
+                        "worker_returncode": int(process.returncode),
+                    }
+                )
+                logger.error(
+                    "[%s] trigger=%s reason=exit returncode=%s stderr=%s production_unchanged=true",
+                    (
+                        "SHADOW_ML_ROLLING_WORKER_ERROR"
+                        if is_rolling
+                        else "SHADOW_ML_WORKER_ERROR"
+                    ),
+                    trigger,
+                    process.returncode,
+                    (stderr or "")[-2000:],
+                )
+                return result
+            try:
+                worker_result = json.loads(stdout)
+            except (TypeError, ValueError):
+                result.update({"status": "error", "reason": "worker_invalid_json"})
+                logger.error(
+                    "[%s] trigger=%s reason=invalid_json stdout_tail=%s production_unchanged=true",
+                    (
+                        "SHADOW_ML_ROLLING_WORKER_ERROR"
+                        if is_rolling
+                        else "SHADOW_ML_WORKER_ERROR"
+                    ),
+                    trigger,
+                    (stdout or "")[-2000:],
+                )
+                return result
+            if not isinstance(worker_result, dict):
+                result.update({"status": "error", "reason": "worker_invalid_payload"})
+                return result
+            result.update(worker_result)
+            result["isolated_process"] = True
+            if result.get("status") == "error":
+                logger.error(
+                    "[%s] trigger=%s reason=%s stderr=%s "
+                    "production_unchanged=true",
+                    (
+                        "SHADOW_ML_ROLLING_WORKER_ERROR"
+                        if is_rolling
+                        else "SHADOW_ML_WORKER_ERROR"
+                    ),
+                    trigger,
+                    result.get("reason") or "worker_reported_error",
+                    (stderr or "")[-2000:],
+                )
+                return result
+            if result.get("status") == "trained":
+                artifact = load_shadow_ml_model_file(candidate_model)
+                if (
+                    not validate_artifact(artifact)
+                    or str(artifact.get("model_id") or "")
+                    != str(result.get("model_id") or "")
+                ):
+                    result.update({"status": "error", "reason": "worker_artifact_mismatch"})
+                    logger.error(
+                        "[%s] trigger=%s reason=artifact_mismatch old_model_preserved=true production_unchanged=true",
+                        (
+                            "SHADOW_ML_ROLLING_WORKER_ERROR"
+                            if is_rolling
+                            else "SHADOW_ML_WORKER_ERROR"
+                        ),
+                        trigger,
+                    )
+                    return result
+                if _shadow_ml_stop.is_set():
+                    result.update(
+                        {"status": "error", "reason": "worker_stopping"}
+                    )
+                    return result
+                os.replace(candidate_model, canonical_model)
+                if is_rolling:
+                    _set_shadow_rolling_model_cache(
+                        artifact, path=canonical_model
+                    )
+                else:
+                    _set_shadow_ml_model_cache(artifact, path=canonical_model)
+        logger.info(
+            "[%s] trigger=%s status=%s records=%s fixtures=%s "
+            "new_fixtures=%s feature_contract_changed=%s "
+            "training_data_hash_changed=%s data_revision_changed=%s "
+            "reason=%s model_id=%s isolated_process=true",
+            "SHADOW_ML_ROLLING_WORKER" if is_rolling else "SHADOW_ML_WORKER",
+            trigger,
+            result.get("status"),
+            result.get("records"),
+            result.get("fixtures"),
+            result.get("new_fixtures"),
+            result.get("feature_contract_changed"),
+            result.get("training_data_hash_changed"),
+            result.get("data_revision_changed"),
+            result.get("reason"),
+            result.get("model_id"),
+        )
+        return result
+    except Exception:
+        result.update({"status": "error", "reason": "worker_exception"})
+        logger.exception(
+            "[%s] trigger=%s reason=exception production_unchanged=true",
+            (
+                "SHADOW_ML_ROLLING_WORKER_ERROR"
+                if is_rolling
+                else "SHADOW_ML_WORKER_ERROR"
+            ),
+            trigger,
+        )
+        return result
+    finally:
+        _terminate_subprocess(process)
+        with _shadow_ml_active_process_lock:
+            if _shadow_ml_active_process is process:
+                _shadow_ml_active_process = None
+        if worker_slot_acquired:
+            _model_worker_slot.release()
+        _shadow_ml_train_lock.release()
+        gc.collect()
+
+
+def train_shadow_ml_once(
+    *,
+    force: bool = False,
+    trigger: str = "manual",
+    data_revision_hint: bool = False,
+) -> Dict[str, Any]:
+    """Best-effort shadow training with production-safe process isolation."""
+    if SHADOW_ML_ISOLATED_TRAINING_ENABLED:
+        return _train_shadow_ml_once_isolated(
+            force=force,
+            trigger=trigger,
+            data_revision_hint=data_revision_hint,
+        )
+    return _train_shadow_ml_once_local(
+        force=force,
+        trigger=trigger,
+        data_revision_hint=data_revision_hint,
+    )
+
+
+def train_shadow_rolling_ml_once(
+    *,
+    force: bool = False,
+    trigger: str = "manual",
+    data_revision_hint: bool = False,
+) -> Dict[str, Any]:
+    """Train only the isolated rolling challenger artifact."""
+    if SHADOW_ML_ISOLATED_TRAINING_ENABLED:
+        return _train_shadow_ml_once_isolated(
+            force=force,
+            trigger=trigger,
+            data_revision_hint=data_revision_hint,
+            variant="rolling",
+        )
+    return _train_shadow_ml_once_local(
+        force=force,
+        trigger=trigger,
+        data_revision_hint=data_revision_hint,
+        variant="rolling",
+    )
+
+
+_market_prediction_handoff_lock = threading.RLock()
+_market_prediction_handoff: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_market_prediction_handoff_order: deque[str] = deque()
+_MARKET_PREDICTION_HANDOFF_MAX = 512
+
+
+def _market_prediction_input_fingerprint(
+    observation: Mapping[str, Any], *, rolling: bool
+) -> Optional[str]:
+    """Best-effort provenance hash; it must never affect native ML work."""
+
+    if not ENABLE_MARKET_BENCHMARK:
+        return None
+    try:
+        return (
+            rolling_prediction_input_fingerprint(observation)
+            if rolling
+            else prediction_input_fingerprint(observation)
+        )
+    except Exception:
+        logger.exception(
+            "[MARKET_BENCHMARK_FINGERPRINT_ERROR] fixture_id=%s minute=%s "
+            "source=%s action=continue_unavailable production_unchanged=true",
+            observation.get("fixture_id") if isinstance(observation, Mapping) else None,
+            observation.get("minute") if isinstance(observation, Mapping) else None,
+            "rolling" if rolling else "static",
+        )
+        return None
+
+
+def _remember_market_prediction_handoff(
+    record: Mapping[str, Any], *, rolling: bool
+) -> None:
+    """Keep the exact just-computed prediction for the async market record."""
+
+    try:
+        if not ENABLE_MARKET_BENCHMARK or not isinstance(record, Mapping):
+            return
+        observation_id = str(record.get("observation_id") or "").strip()
+        if not observation_id:
+            return
+        source = "rolling_ml" if rolling else "static_ml"
+        with _market_prediction_handoff_lock:
+            if observation_id not in _market_prediction_handoff:
+                _market_prediction_handoff_order.append(observation_id)
+            bucket = _market_prediction_handoff.setdefault(observation_id, {})
+            bucket[source] = copy.deepcopy(dict(record))
+            while len(_market_prediction_handoff_order) > _MARKET_PREDICTION_HANDOFF_MAX:
+                expired = _market_prediction_handoff_order.popleft()
+                _market_prediction_handoff.pop(expired, None)
+    except Exception:
+        logger.exception(
+            "[MARKET_BENCHMARK_HANDOFF_ERROR] source=%s "
+            "action=continue_native_ml production_unchanged=true",
+            "rolling" if rolling else "static",
+        )
+
+
+def _take_market_prediction_handoff(
+    observation_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    with _market_prediction_handoff_lock:
+        payload = _market_prediction_handoff.pop(str(observation_id), {})
+        try:
+            _market_prediction_handoff_order.remove(str(observation_id))
+        except ValueError:
+            pass
+    return copy.deepcopy(payload)
+
+
+def predict_and_append_shadow_ml(
+    observation: Mapping[str, Any],
+) -> bool:
+    """Persist an immutable prospective prediction after production decided."""
+    if (
+        not ENABLE_SHADOW_ML
+        or not isinstance(observation, Mapping)
+        or str(observation.get("record_type") or "") != "observation"
+        or str(observation.get("stage") or "") != "decision_pipeline"
+    ):
+        return False
+    observation_id = str(
+        observation.get("observation_key")
+        or observation.get("observation_id")
+        or ""
+    )
+    if not observation_id:
+        return False
+    try:
+        artifact = load_shadow_ml_model_cached()
+        if not artifact:
+            return False
+        prediction = predict_shadow(artifact, observation)
+        if (
+            str(prediction.get("status") or "") == "invalid_observation"
+            and str(prediction.get("reason") or "")
+            == "feature_contract_mismatch"
+        ):
+            note_shadow_ml_contract_mismatch()
+            return False
+        targets = (
+            prediction.get("targets")
+            if isinstance(prediction.get("targets"), dict)
+            else {}
+        )
+        if not any(
+            str((payload or {}).get("status") or "") == "ok"
+            for payload in targets.values()
+            if isinstance(payload, dict)
+        ):
+            return False
+        model_id = str(prediction.get("model_id") or artifact.get("model_id") or "")
+        if not model_id:
+            return False
+        created_at_utc = _utc_now_iso()
+        record = {
+            "record_type": "shadow_ml_prediction",
+            "prediction_key": f"prediction:{observation_id}:{model_id}",
+            "observation_id": observation_id,
+            "fixture_id": _safe_int(observation.get("fixture_id"), 0),
+            "observation_created_at_utc": observation.get("created_at_utc"),
+            "created_at_utc": created_at_utc,
+            "minute": _safe_int(observation.get("minute"), 0),
+            "stage": observation.get("stage"),
+            "model_id": model_id,
+            "algorithm_version": prediction.get("algorithm_version")
+            or artifact.get("algorithm_version"),
+            "feature_schema_version": artifact.get("feature_schema_version"),
+            "model_created_at_utc": artifact.get("created_at_utc"),
+            "model_data_cutoff_utc": artifact.get("data_cutoff_utc"),
+            "model_status": artifact.get("status"),
+            "shadow_only": True,
+            "production_applied": False,
+            "prediction_status": prediction.get("status"),
+            "prediction_input_fingerprint": (
+                _market_prediction_input_fingerprint(
+                    observation, rolling=False
+                )
+            ),
+            "predictions": copy.deepcopy(targets),
+        }
+        _remember_market_prediction_handoff(record, rolling=False)
+        appended = append_shadow_ml_prediction_record(
+            SHADOW_ML_PREDICTIONS_FILE,
+            record,
+            rotate_max_bytes=SHADOW_ML_PREDICTION_ROTATE_MAX_BYTES,
+        )
+        if appended:
+            next15 = targets.get("next15") if isinstance(targets.get("next15"), dict) else {}
+            to90 = targets.get("to90") if isinstance(targets.get("to90"), dict) else {}
+            logger.info(
+                "[SHADOW_ML_PREDICTION] observation_id=%s fixture_id=%s minute=%s model_id=%s model_status=%s next15=%s to90=%s production_apply=false",
+                observation_id,
+                record["fixture_id"],
+                record["minute"],
+                model_id,
+                artifact.get("status"),
+                next15.get("calibrated_probability_pct"),
+                to90.get("calibrated_probability_pct"),
+            )
+        return bool(appended)
+    except Exception:
+        logger.exception(
+            "[SHADOW_ML_PREDICTION_ERROR] observation_id=%s production_unchanged=true",
+            observation_id,
+        )
+        return False
+
+
+def predict_and_append_shadow_rolling_ml(
+    observation: Mapping[str, Any],
+) -> bool:
+    """Persist a prospective challenger prediction in its own journal."""
+    if (
+        not ENABLE_SHADOW_ML_ROLLING_CHALLENGER
+        or not isinstance(observation, Mapping)
+        or str(observation.get("record_type") or "") != "observation"
+        or str(observation.get("stage") or "") != "decision_pipeline"
+    ):
+        return False
+    observation_id = str(
+        observation.get("observation_key")
+        or observation.get("observation_id")
+        or ""
+    )
+    if not observation_id:
+        return False
+    try:
+        artifact = load_shadow_rolling_model_cached()
+        if not artifact:
+            return False
+        prediction = predict_shadow_rolling(artifact, observation)
+        if (
+            str(prediction.get("status") or "") == "invalid_observation"
+            and str(prediction.get("reason") or "")
+            == "feature_contract_mismatch"
+        ):
+            note_shadow_rolling_contract_mismatch()
+            return False
+        targets = (
+            prediction.get("targets")
+            if isinstance(prediction.get("targets"), dict)
+            else {}
+        )
+        if not any(
+            str((payload or {}).get("status") or "") == "ok"
+            for payload in targets.values()
+            if isinstance(payload, dict)
+        ):
+            return False
+        model_id = str(
+            prediction.get("model_id") or artifact.get("model_id") or ""
+        )
+        if not model_id:
+            return False
+        record = {
+            "record_type": "shadow_ml_rolling_prediction",
+            "artifact_role": ROLLING_ARTIFACT_ROLE,
+            "feature_profile": ROLLING_FEATURE_PROFILE,
+            "prediction_key": (
+                f"rolling_prediction:{observation_id}:{model_id}"
+            ),
+            "observation_id": observation_id,
+            "fixture_id": _safe_int(observation.get("fixture_id"), 0),
+            "observation_created_at_utc": observation.get("created_at_utc"),
+            "created_at_utc": _utc_now_iso(),
+            "minute": _safe_int(observation.get("minute"), 0),
+            "stage": observation.get("stage"),
+            "model_id": model_id,
+            "algorithm_version": prediction.get("algorithm_version")
+            or artifact.get("algorithm_version"),
+            "feature_schema_version": artifact.get("feature_schema_version"),
+            "model_created_at_utc": artifact.get("created_at_utc"),
+            "model_data_cutoff_utc": artifact.get("data_cutoff_utc"),
+            "model_status": artifact.get("status"),
+            "shadow_only": True,
+            "production_applied": False,
+            "prediction_status": prediction.get("status"),
+            "prediction_input_fingerprint": (
+                _market_prediction_input_fingerprint(
+                    observation, rolling=True
+                )
+            ),
+            "predictions": copy.deepcopy(targets),
+        }
+        _remember_market_prediction_handoff(record, rolling=True)
+        appended = append_shadow_ml_prediction_record(
+            SHADOW_ML_ROLLING_PREDICTIONS_FILE,
+            record,
+            rotate_max_bytes=(
+                SHADOW_ML_ROLLING_PREDICTION_ROTATE_MAX_BYTES
+            ),
+        )
+        if appended:
+            next15 = (
+                targets.get("next15")
+                if isinstance(targets.get("next15"), dict)
+                else {}
+            )
+            to90 = (
+                targets.get("to90")
+                if isinstance(targets.get("to90"), dict)
+                else {}
+            )
+            logger.info(
+                "[SHADOW_ML_ROLLING_PREDICTION] observation_id=%s fixture_id=%s minute=%s model_id=%s model_status=%s next15=%s to90=%s production_apply=false",
+                observation_id,
+                record["fixture_id"],
+                record["minute"],
+                model_id,
+                artifact.get("status"),
+                next15.get("calibrated_probability_pct"),
+                to90.get("calibrated_probability_pct"),
+            )
+        return bool(appended)
+    except Exception:
+        logger.exception(
+            "[SHADOW_ML_ROLLING_PREDICTION_ERROR] "
+            "observation_id=%s production_unchanged=true",
+            observation_id,
+        )
+        return False
+
+
+_shadow_candidate_layer_lock = threading.RLock()
+_shadow_candidate_layer: Optional[CandidateLayer] = None
+_shadow_candidate_layer_signature: Tuple[Any, ...] = ()
+
+
+def _assert_shadow_candidate_runtime_paths() -> None:
+    """Fail closed before candidate output can overlap any live source file."""
+
+    normalize = lambda value: os.path.normcase(  # noqa: E731
+        os.path.realpath(os.path.abspath(os.fspath(value)))
+    )
+    candidate_outputs = {
+        normalize(SHADOW_CANDIDATE_JOURNAL_FILE),
+        normalize(SHADOW_CANDIDATE_INDEX_FILE),
+        normalize(SHADOW_CANDIDATE_JOURNAL_FILE + ".lock"),
+    }
+    protected: set[str] = set()
+    for name in (
+        "OBSERVATION_HISTORY_FILE",
+        "DECISION_SNAPSHOTS_FILE",
+        "SHADOW_ML_PREDICTIONS_FILE",
+        "SHADOW_ML_ROLLING_PREDICTIONS_FILE",
+        "SHADOW_ML_MODEL_FILE",
+        "SHADOW_ML_ROLLING_MODEL_FILE",
+        "MARKET_BENCHMARK_JOURNAL_FILE",
+        "MARKET_BENCHMARK_INDEX_FILE",
+        "SIGNAL_REPUTATION_SHADOW_FILE",
+        "SIGNAL_REPUTATION_MODEL_FILE",
+        "SECOND_HALF_HISTORY_PATH",
+        "MATCH_SNAPSHOTS_JSONL_PATH",
+        "MATCH_OUTCOMES_JSONL_PATH",
+        "CORE_PATH",
+        "MATCHES_PATH",
+        "STATE_FILE",
+        "GOAL_LOG_FILE",
+    ):
+        value = globals().get(name)
+        if not value:
+            continue
+        protected.add(normalize(value))
+        if str(value).endswith(".jsonl"):
+            protected.update(
+                normalize(path)
+                for path in shadow_candidate_jsonl_paths(str(value))
+            )
+    collision = sorted(candidate_outputs & protected)
+    if collision:
+        raise ValueError(
+            "shadow candidate journal/index/lock overlaps live source: "
+            + collision[0]
+        )
+
+
+def _get_shadow_candidate_layer() -> CandidateLayer:
+    """Build the isolated disk-backed candidate layer lazily."""
+    global _shadow_candidate_layer
+    global _shadow_candidate_layer_signature
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(SHADOW_CANDIDATE_JOURNAL_FILE),
+        os.path.abspath(SHADOW_CANDIDATE_INDEX_FILE),
+        int(SHADOW_CANDIDATE_ROTATE_MAX_BYTES),
+        str(SHADOW_CANDIDATE_PROSPECTIVE_START_UTC),
+        float(SHADOW_CANDIDATE_SETTLE_SECONDS),
+        float(SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS),
+        str(DEFAULT_SHADOW_CANDIDATE_RULESET.version),
+    )
+    with _shadow_candidate_layer_lock:
+        if (
+            _shadow_candidate_layer is None
+            or _shadow_candidate_layer_signature != signature
+        ):
+            _assert_shadow_candidate_runtime_paths()
+            journal = AppendOnlyCandidateJournal(
+                SHADOW_CANDIDATE_JOURNAL_FILE,
+                rotate_max_bytes=SHADOW_CANDIDATE_ROTATE_MAX_BYTES,
+                index_path=SHADOW_CANDIDATE_INDEX_FILE,
+            )
+            _shadow_candidate_layer = CandidateLayer(
+                journal,
+                prospective_start_utc=(
+                    SHADOW_CANDIDATE_PROSPECTIVE_START_UTC
+                ),
+                ruleset=DEFAULT_SHADOW_CANDIDATE_RULESET,
+                settle_seconds=SHADOW_CANDIDATE_SETTLE_SECONDS,
+                max_live_prediction_lag_seconds=(
+                    SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+                ),
+            )
+            _shadow_candidate_layer_signature = signature
+        return _shadow_candidate_layer
+
+
+def _build_shadow_candidate_prediction_record(
+    observation: Mapping[str, Any],
+    *,
+    rolling: bool,
+) -> Optional[Dict[str, Any]]:
+    """Infer once more only for a control candidate; never persist or apply."""
+    if not isinstance(observation, Mapping):
+        return None
+    artifact = (
+        load_shadow_rolling_model_cached()
+        if rolling
+        else load_shadow_ml_model_cached()
+    )
+    if not artifact:
+        return None
+    prediction = (
+        predict_shadow_rolling(artifact, observation)
+        if rolling
+        else predict_shadow(artifact, observation)
+    )
+    targets = (
+        prediction.get("targets")
+        if isinstance(prediction.get("targets"), dict)
+        else {}
+    )
+    if not any(
+        str((payload or {}).get("status") or "") == "ok"
+        for payload in targets.values()
+        if isinstance(payload, dict)
+    ):
+        return None
+    observation_id = str(
+        observation.get("observation_key")
+        or observation.get("observation_id")
+        or ""
+    )
+    model_id = str(
+        prediction.get("model_id") or artifact.get("model_id") or ""
+    )
+    if not observation_id or not model_id:
+        return None
+    record_type = (
+        "shadow_ml_rolling_prediction"
+        if rolling
+        else "shadow_ml_prediction"
+    )
+    prefix = "rolling_prediction" if rolling else "prediction"
+    record: Dict[str, Any] = {
+        "record_type": record_type,
+        "prediction_key": f"{prefix}:{observation_id}:{model_id}",
+        "observation_id": observation_id,
+        "fixture_id": _safe_int(observation.get("fixture_id"), 0),
+        "observation_created_at_utc": observation.get("created_at_utc"),
+        "created_at_utc": _utc_now_iso(),
+        "minute": _safe_int(observation.get("minute"), 0),
+        "stage": observation.get("stage"),
+        "model_id": model_id,
+        "algorithm_version": prediction.get("algorithm_version")
+        or artifact.get("algorithm_version"),
+        "feature_schema_version": artifact.get("feature_schema_version"),
+        "model_created_at_utc": artifact.get("created_at_utc"),
+        "model_data_cutoff_utc": artifact.get("data_cutoff_utc"),
+        "model_status": artifact.get("status"),
+        "shadow_only": True,
+        "production_applied": False,
+        "prediction_status": prediction.get("status"),
+        "prediction_input_fingerprint": (
+            _market_prediction_input_fingerprint(
+                observation,
+                rolling=rolling,
+            )
+        ),
+        "predictions": copy.deepcopy(targets),
+    }
+    if rolling:
+        record.update(
+            {
+                "artifact_role": ROLLING_ARTIFACT_ROLE,
+                "feature_profile": ROLLING_FEATURE_PROFILE,
+            }
+        )
+    return record
+
+
+# ---------------------------------------------------------------------------
+# Prospective live-market benchmark (strictly shadow-only)
+# ---------------------------------------------------------------------------
+_market_benchmark_lock = threading.RLock()
+_market_benchmark_stop = threading.Event()
+_market_benchmark_wakeup = threading.Event()
+_market_benchmark_thread: Optional[threading.Thread] = None
+_market_benchmark_poll_thread: Optional[threading.Thread] = None
+_market_benchmark_journal: Optional[AppendOnlyMarketJournal] = None
+_market_benchmark_journal_signature: Tuple[Any, ...] = ()
+_market_benchmark_started = False
+_market_benchmark_queue: deque[Dict[str, Any]] = deque()
+_market_benchmark_poll_buffer: deque[Tuple[Dict[str, Any], str]] = deque()
+_market_benchmark_quote_cache: Dict[int, List[Dict[str, Any]]] = {}
+_market_research_quote_cache = CausalQuoteCache()
+_market_benchmark_dropped_records = 0
+_market_benchmark_dropped_by_reason: Counter[str] = Counter()
+_market_benchmark_dropped_polls = 0
+
+
+def _market_finite_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _assert_market_benchmark_runtime_paths() -> None:
+    """Keep the derived market journal physically separate from live state."""
+
+    normalize = lambda value: os.path.normcase(  # noqa: E731
+        os.path.realpath(os.path.abspath(os.fspath(value)))
+    )
+    outputs = {
+        normalize(MARKET_BENCHMARK_JOURNAL_FILE),
+        normalize(MARKET_BENCHMARK_INDEX_FILE),
+        normalize(MARKET_BENCHMARK_JOURNAL_FILE + ".lock"),
+    }
+    if len(outputs) != 3:
+        raise ValueError("market benchmark journal/index/lock paths overlap")
+    if MARKET_BENCHMARK_MIN_MINUTE > MARKET_BENCHMARK_MAX_MINUTE:
+        raise ValueError("market benchmark minute range is empty")
+    protected: set[str] = set()
+    for name in (
+        "OBSERVATION_HISTORY_FILE",
+        "DECISION_SNAPSHOTS_FILE",
+        "SHADOW_ML_PREDICTIONS_FILE",
+        "SHADOW_ML_ROLLING_PREDICTIONS_FILE",
+        "SHADOW_ML_MODEL_FILE",
+        "SHADOW_ML_ROLLING_MODEL_FILE",
+        "SHADOW_CANDIDATE_JOURNAL_FILE",
+        "SHADOW_CANDIDATE_INDEX_FILE",
+        "SIGNAL_REPUTATION_SHADOW_FILE",
+        "SIGNAL_REPUTATION_MODEL_FILE",
+        "SECOND_HALF_HISTORY_PATH",
+        "MATCH_SNAPSHOTS_JSONL_PATH",
+        "MATCH_OUTCOMES_JSONL_PATH",
+        "WIDE_RESEARCH_DB_FILE",
+        "WIDE_RESEARCH_FOUR_FACTOR_DB_FILE",
+        "WIDE_RESEARCH_PRECISION_DB_FILE",
+        "CORE_PATH",
+        "MATCHES_PATH",
+        "STATE_FILE",
+        "GOAL_LOG_FILE",
+    ):
+        value = globals().get(name)
+        if not value:
+            continue
+        protected.add(normalize(value))
+        if str(value).endswith(".jsonl"):
+            protected.update(
+                normalize(path)
+                for path in shadow_candidate_jsonl_paths(str(value))
+            )
+    collision = sorted(outputs & protected)
+    if collision:
+        raise ValueError(
+            "market benchmark output overlaps a live source: " + collision[0]
+        )
+
+
+def _get_market_benchmark_journal() -> AppendOnlyMarketJournal:
+    global _market_benchmark_journal
+    global _market_benchmark_journal_signature
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(MARKET_BENCHMARK_JOURNAL_FILE),
+        os.path.abspath(MARKET_BENCHMARK_INDEX_FILE),
+        int(MARKET_BENCHMARK_ROTATE_MAX_BYTES),
+    )
+    with _market_benchmark_lock:
+        if (
+            _market_benchmark_journal is None
+            or _market_benchmark_journal_signature != signature
+        ):
+            _assert_market_benchmark_runtime_paths()
+            _market_benchmark_journal = AppendOnlyMarketJournal(
+                MARKET_BENCHMARK_JOURNAL_FILE,
+                rotate_max_bytes=MARKET_BENCHMARK_ROTATE_MAX_BYTES,
+                index_path=MARKET_BENCHMARK_INDEX_FILE,
+            )
+            _market_benchmark_journal_signature = signature
+        return _market_benchmark_journal
+
+
+def _market_cache_update(
+    records: List[Dict[str, Any]], *, captured_at_utc: str
+) -> None:
+    captured = _parse_iso_utc(captured_at_utc) or datetime.now(timezone.utc)
+    cutoff = captured - timedelta(
+        seconds=max(
+            MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS,
+            MARKET_BENCHMARK_POLL_SECONDS * 2.0,
+        )
+    )
+    with _market_benchmark_lock:
+        fixture_ids = set(_market_benchmark_quote_cache)
+        fixture_ids.update(
+            _safe_int(record.get("fixture_id"), -1)
+            for record in records
+        )
+        for fixture_id in fixture_ids:
+            if fixture_id < 1:
+                continue
+            merged = list(_market_benchmark_quote_cache.get(fixture_id) or [])
+            merged.extend(
+                copy.deepcopy(record)
+                for record in records
+                if _safe_int(record.get("fixture_id"), -1) == fixture_id
+            )
+            unique: Dict[str, Dict[str, Any]] = {}
+            for record in merged:
+                record_key = str(record.get("record_key") or "")
+                captured_time = _parse_iso_utc(record.get("captured_at_utc"))
+                if not record_key or captured_time is None or captured_time < cutoff:
+                    continue
+                # A stable provider quote keeps the time it was first seen.
+                # Replacing it with a later poll time would weaken causality.
+                unique.setdefault(record_key, record)
+            recent = sorted(
+                unique.values(),
+                key=lambda record: (
+                    str(record.get("captured_at_utc") or ""),
+                    str(record.get("record_key") or ""),
+                ),
+            )[-MARKET_BENCHMARK_CACHE_QUOTES_PER_FIXTURE:]
+            if recent:
+                _market_benchmark_quote_cache[fixture_id] = recent
+            else:
+                _market_benchmark_quote_cache.pop(fixture_id, None)
+
+
+def _market_quote_validation_reason(
+    quote: Mapping[str, Any], observation: Mapping[str, Any]
+) -> Optional[str]:
+    observation_time = _parse_iso_utc(observation.get("created_at_utc"))
+    captured_time = _parse_iso_utc(quote.get("captured_at_utc"))
+    provider_time = _parse_iso_utc(
+        quote.get("provider_update_utc")
+        or (quote.get("market") or {}).get("api_updated_at_utc")
+    )
+    if observation_time is None:
+        return "observation_timestamp_missing"
+    if captured_time is None:
+        return "quote_timestamp_missing"
+    if captured_time > observation_time:
+        return "quote_captured_after_observation"
+    if (
+        observation_time - captured_time
+    ).total_seconds() > MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS:
+        return "quote_too_old"
+    if provider_time is None:
+        return "provider_update_timestamp_missing"
+    if provider_time > observation_time:
+        return "provider_update_after_observation"
+    if (provider_time - captured_time).total_seconds() > 5.0:
+        return "provider_update_after_capture"
+    if (
+        observation_time - provider_time
+    ).total_seconds() > MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS:
+        return "provider_quote_too_old"
+    match = (
+        observation.get("match")
+        if isinstance(observation.get("match"), Mapping)
+        else {}
+    )
+    score_home = _safe_int(match.get("score_home"), -1)
+    score_away = _safe_int(match.get("score_away"), -1)
+    if score_home < 0 or score_away < 0:
+        return "observation_score_missing"
+    if (
+        _safe_int(quote.get("score_home"), -2) != score_home
+        or _safe_int(quote.get("score_away"), -2) != score_away
+    ):
+        return "quote_score_mismatch"
+    current_goals = score_home + score_away
+    if _safe_int(quote.get("current_goals"), -1) != current_goals:
+        return "quote_total_mismatch"
+    line = _market_finite_float(quote.get("line"))
+    if line is None or not math.isclose(
+        line, current_goals + 0.5, abs_tol=1e-9
+    ):
+        return "quote_line_mismatch"
+    probability = _market_finite_float(
+        (quote.get("market") or {}).get("fair_probability_goal_to90")
+    )
+    if probability is None or not 0.0 <= probability <= 1.0:
+        return "market_probability_invalid"
+    if quote.get("shadow_only") is not True:
+        return "quote_not_shadow_only"
+    if quote.get("production_applied") is not False:
+        return "quote_production_flag_invalid"
+    return None
+
+
+def _latest_market_quote_for_observation(
+    observation: Mapping[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    fixture_id = _safe_int(observation.get("fixture_id"), -1)
+    with _market_benchmark_lock:
+        history = copy.deepcopy(
+            _market_benchmark_quote_cache.get(fixture_id) or []
+        )
+    if not history:
+        return None, "no_recent_quote"
+    reasons: List[str] = []
+    for quote in reversed(history):
+        reason = _market_quote_validation_reason(quote, observation)
+        if reason is None:
+            return quote, "available"
+        reasons.append(reason)
+    return None, reasons[0] if reasons else "no_recent_quote"
+
+
+def _market_model_probability_payload(
+    prediction: Optional[Mapping[str, Any]],
+    *,
+    observation: Mapping[str, Any],
+    rolling: bool,
+) -> Dict[str, Any]:
+    target = (
+        prediction.get("predictions", {}).get("to90", {})
+        if isinstance(prediction, Mapping)
+        and isinstance(prediction.get("predictions"), Mapping)
+        else {}
+    )
+    probability = _market_finite_float(
+        target.get("calibrated_probability_pct")
+        if isinstance(target, Mapping)
+        else None
+    )
+    probability_available = bool(
+        isinstance(prediction, Mapping)
+        and isinstance(target, Mapping)
+        and str(target.get("status") or "") == "ok"
+        and probability is not None
+        and 0.0 <= probability <= 100.0
+    )
+    expected_fingerprint = _market_prediction_input_fingerprint(
+        observation,
+        rolling=rolling,
+    )
+    actual_fingerprint = str(
+        prediction.get("prediction_input_fingerprint") or ""
+    ) if isinstance(prediction, Mapping) else ""
+    expected_fixture_id = _safe_int(observation.get("fixture_id"), -1)
+    prediction_fixture_id = (
+        _safe_int(prediction.get("fixture_id"), -2)
+        if isinstance(prediction, Mapping)
+        else -2
+    )
+    expected_minute = _safe_int(observation.get("minute"), -1)
+    prediction_minute = (
+        _safe_int(prediction.get("minute"), -2)
+        if isinstance(prediction, Mapping)
+        else -2
+    )
+    provenance_reason: Optional[str] = None
+    if not probability_available:
+        provenance_reason = "compatible_prediction_missing"
+    elif prediction_fixture_id != expected_fixture_id:
+        provenance_reason = "prediction_fixture_mismatch"
+    elif prediction_minute != expected_minute:
+        provenance_reason = "prediction_minute_mismatch"
+    elif not expected_fingerprint or not actual_fingerprint:
+        provenance_reason = "prediction_input_fingerprint_missing"
+    elif actual_fingerprint != expected_fingerprint:
+        provenance_reason = "prediction_input_fingerprint_mismatch"
+    available = provenance_reason is None
+    return {
+        "status": "available" if available else "unavailable",
+        "reason": provenance_reason,
+        "probability_pct": probability if available else None,
+        "model_id": prediction.get("model_id") if prediction else None,
+        "model_status": prediction.get("model_status") if prediction else None,
+        "model_created_at_utc": (
+            prediction.get("model_created_at_utc") if prediction else None
+        ),
+        "model_data_cutoff_utc": (
+            prediction.get("model_data_cutoff_utc") if prediction else None
+        ),
+        "prediction_created_at_utc": (
+            prediction.get("created_at_utc") if prediction else None
+        ),
+        "prediction_input_observation_id": (
+            prediction.get("observation_id") if prediction else None
+        ),
+        "prediction_input_fixture_id": (
+            prediction_fixture_id if prediction_fixture_id > 0 else None
+        ),
+        "prediction_input_minute": (
+            prediction_minute if prediction_minute >= 0 else None
+        ),
+        "prediction_input_fingerprint": (
+            actual_fingerprint or None
+        ),
+        "expected_input_fingerprint": expected_fingerprint,
+        "input_identity_method": "predictive_input_fingerprint_v1",
+        "prediction_status": (
+            prediction.get("prediction_status") if prediction else None
+        ),
+        "shadow_only": True,
+        "production_applied": False,
+    }
+
+
+def _enqueue_market_benchmark_record(record: Dict[str, Any]) -> bool:
+    global _market_benchmark_dropped_records
+    record_type = str(record.get("record_type") or "unknown")
+    is_outcome = record_type == "market_benchmark_outcome"
+    with _market_benchmark_lock:
+        if not _market_benchmark_started:
+            return False
+        queue_max = max(1, int(MARKET_BENCHMARK_QUEUE_MAX))
+        reserve = max(
+            0,
+            min(
+                int(MARKET_BENCHMARK_OUTCOME_QUEUE_RESERVE),
+                queue_max - 1,
+            ),
+        )
+        soft_limit = max(1, queue_max - reserve)
+        drop_reason: Optional[str] = None
+        evicted_type: Optional[str] = None
+        if not is_outcome and len(_market_benchmark_queue) >= soft_limit:
+            drop_reason = "outcome_reserve"
+        elif is_outcome and len(_market_benchmark_queue) >= queue_max:
+            evict_index = next(
+                (
+                    index
+                    for index, pending in enumerate(_market_benchmark_queue)
+                    if str(pending.get("record_type") or "")
+                    != "market_benchmark_outcome"
+                ),
+                None,
+            )
+            if evict_index is None:
+                drop_reason = "hard_full_outcomes_only"
+            else:
+                evicted = _market_benchmark_queue[evict_index]
+                evicted_type = str(evicted.get("record_type") or "unknown")
+                del _market_benchmark_queue[evict_index]
+                _market_benchmark_dropped_records += 1
+                _market_benchmark_dropped_by_reason[
+                    "evicted_for_outcome"
+                ] += 1
+        elif len(_market_benchmark_queue) >= queue_max:
+            drop_reason = "hard_full"
+        if drop_reason is not None:
+            _market_benchmark_dropped_records += 1
+            _market_benchmark_dropped_by_reason[drop_reason] += 1
+            logger.warning(
+                "[MARKET_BENCHMARK_QUEUE_FULL] record_type=%s fixture_id=%s "
+                "queue=%s reserve=%s reason=%s dropped_total=%s "
+                "production_unchanged=true",
+                record_type,
+                record.get("fixture_id"),
+                len(_market_benchmark_queue),
+                reserve,
+                drop_reason,
+                _market_benchmark_dropped_records,
+            )
+            return False
+        _market_benchmark_queue.append(record)
+        if evicted_type is not None:
+            logger.warning(
+                "[MARKET_BENCHMARK_QUEUE_EVICT] evicted_type=%s "
+                "incoming_type=%s fixture_id=%s queue=%s "
+                "dropped_total=%s production_unchanged=true",
+                evicted_type,
+                record_type,
+                record.get("fixture_id"),
+                len(_market_benchmark_queue),
+                _market_benchmark_dropped_records,
+            )
+    _market_benchmark_wakeup.set()
+    return True
+
+
+def _drain_market_benchmark_queue(
+    journal: AppendOnlyMarketJournal,
+) -> int:
+    global _market_benchmark_dropped_records
+    with _market_benchmark_lock:
+        pending = list(_market_benchmark_queue)
+        ordered = [
+            record
+            for record in pending
+            if str(record.get("record_type") or "")
+            == "market_benchmark_outcome"
+        ]
+        ordered.extend(
+            record
+            for record in pending
+            if str(record.get("record_type") or "")
+            != "market_benchmark_outcome"
+        )
+        batch_size = min(len(ordered), MARKET_BENCHMARK_WRITE_BATCH)
+        batch = ordered[:batch_size]
+        _market_benchmark_queue.clear()
+        _market_benchmark_queue.extend(ordered[batch_size:])
+    if not batch:
+        return 0
+    try:
+        journal.append_many(batch)
+        return len(batch)
+    except Exception:
+        dropped_on_requeue = 0
+        with _market_benchmark_lock:
+            combined = [*batch, *_market_benchmark_queue]
+            queue_max = max(1, int(MARKET_BENCHMARK_QUEUE_MAX))
+            if len(combined) > queue_max:
+                outcome_indexes = [
+                    index
+                    for index, record in enumerate(combined)
+                    if str(record.get("record_type") or "")
+                    == "market_benchmark_outcome"
+                ]
+                keep_indexes = set(outcome_indexes[-queue_max:])
+                remaining = queue_max - len(keep_indexes)
+                if remaining > 0:
+                    for index, record in enumerate(combined):
+                        if index in keep_indexes:
+                            continue
+                        keep_indexes.add(index)
+                        remaining -= 1
+                        if remaining <= 0:
+                            break
+                kept = [
+                    record
+                    for index, record in enumerate(combined)
+                    if index in keep_indexes
+                ]
+                dropped_on_requeue = len(combined) - len(kept)
+            else:
+                kept = combined
+            kept = [
+                record
+                for record in kept
+                if str(record.get("record_type") or "")
+                == "market_benchmark_outcome"
+            ] + [
+                record
+                for record in kept
+                if str(record.get("record_type") or "")
+                != "market_benchmark_outcome"
+            ]
+            _market_benchmark_queue.clear()
+            _market_benchmark_queue.extend(kept)
+            if dropped_on_requeue:
+                _market_benchmark_dropped_records += dropped_on_requeue
+                _market_benchmark_dropped_by_reason[
+                    "write_failure_requeue_overflow"
+                ] += dropped_on_requeue
+        logger.exception(
+            "[MARKET_BENCHMARK_WRITE_ERROR] batch=%s requeue_dropped=%s "
+            "production_unchanged=true",
+            len(batch),
+            dropped_on_requeue,
+        )
+        return 0
+
+
+def _persist_market_benchmark_payload(
+    payload: Mapping[str, Any],
+    *,
+    journal: AppendOnlyMarketJournal,
+    captured_at_utc: str,
+) -> Dict[str, Any]:
+    """Normalize and persist one already-received live-odds response."""
+
+    target_journal = journal
+    captured = str(captured_at_utc)
+    normalized = normalize_live_goal_markets(
+        payload,
+        captured_at_utc=captured,
+    )
+    rejection_counts = Counter(
+        str(record.get("reason") or "unknown")
+        for record in normalized.rejections
+    )
+    accepted: List[Dict[str, Any]] = []
+    captured_time = _parse_iso_utc(captured)
+    for raw_record in normalized.records:
+        record = dict(raw_record)
+        minute = _safe_int(record.get("minute"), -1)
+        if minute < MARKET_BENCHMARK_MIN_MINUTE:
+            rejection_counts["minute_before_collection_window"] += 1
+            continue
+        if minute > MARKET_BENCHMARK_MAX_MINUTE:
+            rejection_counts["minute_after_collection_window"] += 1
+            continue
+        provider_time = _parse_iso_utc(record.get("provider_update_utc"))
+        if captured_time is None or provider_time is None:
+            rejection_counts["timestamp_missing_or_invalid"] += 1
+            continue
+        if (provider_time - captured_time).total_seconds() > 5.0:
+            rejection_counts["provider_update_after_capture"] += 1
+            continue
+        if (
+            captured_time - provider_time
+        ).total_seconds() > MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS:
+            rejection_counts["provider_quote_too_old"] += 1
+            continue
+        accepted.append(record)
+
+    response = payload.get("response") if isinstance(payload, Mapping) else None
+    errors = payload.get("errors") if isinstance(payload, Mapping) else None
+    response_valid = isinstance(response, list) and not bool(errors)
+    poll_record: Dict[str, Any] = {
+        "schema_version": 1,
+        "record_type": "market_benchmark_poll",
+        "record_key": f"market-benchmark-poll:v1:{captured}",
+        "created_at_utc": captured,
+        "captured_at_utc": captured,
+        "fixture_id": None,
+        "provider": "api_football",
+        "source_endpoint": "/odds/live",
+        "raw_live_entries": len(response) if isinstance(response, list) else 0,
+        "accepted_quotes": len(accepted),
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+        "request_valid": response_valid,
+        "api_errors_present": not response_valid,
+        "shadow_only": True,
+        "production_applied": False,
+    }
+    results = target_journal.append_many([*accepted, poll_record])
+    _market_cache_update(accepted, captured_at_utc=captured)
+    if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+        _market_research_quote_cache.update(accepted, captured)
+    written_quotes = sum(bool(value) for value in results[: len(accepted)])
+    result = {
+        "status": "ok" if response_valid else "degraded",
+        "captured_at_utc": captured,
+        "raw_live_entries": poll_record["raw_live_entries"],
+        "accepted_quotes": len(accepted),
+        "written_quotes": written_quotes,
+        "rejection_counts": poll_record["rejection_counts"],
+        "cache_fixtures": len(_market_benchmark_quote_cache),
+    }
+    logger.info(
+        "[MARKET_BENCHMARK_POLL] raw=%s accepted=%s written=%s "
+        "cache_fixtures=%s rejected=%s shadow_only=true "
+        "production_apply=false",
+        result["raw_live_entries"],
+        result["accepted_quotes"],
+        result["written_quotes"],
+        result["cache_fixtures"],
+        result["rejection_counts"],
+    )
+    return result
+
+
+def collect_market_benchmark_once(
+    client: APISportsMetricsClient,
+    *,
+    journal: Optional[AppendOnlyMarketJournal] = None,
+    captured_at_utc: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fetch and synchronously persist one market poll (manual/test helper)."""
+
+    target_journal = journal or _get_market_benchmark_journal()
+    payload = client.fetch_live_odds_payload()
+    # Capture time means "response fully received", never request-start time.
+    captured = str(captured_at_utc or _utc_now_iso())
+    return _persist_market_benchmark_payload(
+        payload if isinstance(payload, Mapping) else {},
+        journal=target_journal,
+        captured_at_utc=captured,
+    )
+
+
+def capture_market_benchmark_decision(
+    observation: Mapping[str, Any],
+    *,
+    prepared_evidence: Optional[Mapping[str, Any]] = None,
+    durable: bool = False,
+) -> bool:
+    """Freeze bot, both ML probabilities, and a strictly prior market quote."""
+
+    if (
+        not ENABLE_MARKET_BENCHMARK
+        or not _market_benchmark_started
+        or not isinstance(observation, Mapping)
+        or str(observation.get("record_type") or "") != "observation"
+        or str(observation.get("stage") or "") != "decision_pipeline"
+    ):
+        return False
+    minute = _safe_int(observation.get("minute"), -1)
+    if minute < REGULAR_SIGNAL_MIN_MINUTE or minute > REGULAR_SIGNAL_MAX_MINUTE:
+        return False
+    observation_id = str(
+        observation.get("observation_key")
+        or observation.get("observation_id")
+        or ""
+    )
+    fixture_id = _safe_int(observation.get("fixture_id"), -1)
+    observation_time = _parse_iso_utc(observation.get("created_at_utc"))
+    if not observation_id or fixture_id < 1 or observation_time is None:
+        return False
+    try:
+        evidence = (
+            prepared_evidence
+            if isinstance(prepared_evidence, Mapping)
+            else {}
+        )
+        if (
+            not durable
+            and str(evidence.get("pre_send_record_key") or "").strip()
+        ):
+            _take_market_prediction_handoff(observation_id)
+            return True
+        handoff = _take_market_prediction_handoff(observation_id)
+        if evidence.get("quote_frozen") is True:
+            raw_quote = evidence.get("quote")
+            quote = (
+                copy.deepcopy(dict(raw_quote))
+                if isinstance(raw_quote, Mapping)
+                else None
+            )
+            quote_status = str(
+                evidence.get("quote_status") or "no_recent_quote"
+            )
+            if quote is not None:
+                quote_problem = _market_quote_validation_reason(
+                    quote, observation
+                )
+                if quote_problem is not None:
+                    quote = None
+                    quote_status = quote_problem
+        else:
+            quote, quote_status = _latest_market_quote_for_observation(
+                observation
+            )
+        static_prediction = (
+            evidence.get("static_prediction")
+            if "static_prediction" in evidence
+            else handoff.get("static_ml")
+        )
+        rolling_prediction = (
+            evidence.get("rolling_prediction")
+            if "rolling_prediction" in evidence
+            else handoff.get("rolling_ml")
+        )
+        probability_block = (
+            observation.get("probabilities")
+            if isinstance(observation.get("probabilities"), Mapping)
+            else {}
+        )
+        bot_probability = _market_finite_float(
+            probability_block.get("prob_to90")
+        )
+        bot_available = bool(
+            bot_probability is not None and 0.0 <= bot_probability <= 100.0
+        )
+        decision_created_at = str(
+            evidence.get("decision_created_at_utc")
+            or observation.get("decision_created_at_utc")
+            or observation.get("created_at_utc")
+            or ""
+        )
+        parsed_decision_time = _parse_iso_utc(decision_created_at)
+        if (
+            parsed_decision_time is None
+            or parsed_decision_time < observation_time
+        ):
+            logger.warning(
+                "[MARKET_BENCHMARK_DECISION_SKIP] observation_id=%s "
+                "reason=invalid_decision_timestamp production_unchanged=true",
+                observation_id,
+            )
+            return False
+        created_at = _utc_now_iso()
+        market_payload: Dict[str, Any]
+        if quote is None:
+            market_payload = {
+                "status": quote_status,
+                "reason": quote_status,
+                "quote_record_key": None,
+            }
+        else:
+            quote_market = (
+                quote.get("market")
+                if isinstance(quote.get("market"), Mapping)
+                else {}
+            )
+            market_payload = {
+                **copy.deepcopy(dict(quote_market)),
+                "status": "available",
+                "reason": None,
+                "quote_record_key": quote.get("record_key"),
+                "captured_at_utc": quote.get("captured_at_utc"),
+                "api_updated_at_utc": quote.get("provider_update_utc"),
+                "age_seconds": round(
+                    (
+                        observation_time
+                        - (_parse_iso_utc(quote.get("captured_at_utc")) or observation_time)
+                    ).total_seconds(),
+                    6,
+                ),
+            }
+        match = (
+            observation.get("match")
+            if isinstance(observation.get("match"), Mapping)
+            else {}
+        )
+        telegram = (
+            observation.get("telegram")
+            if isinstance(observation.get("telegram"), Mapping)
+            else {}
+        )
+        observation_decision = (
+            observation.get("decision")
+            if isinstance(observation.get("decision"), Mapping)
+            else {}
+        )
+        publication_policy = (
+            observation.get("publication_policy")
+            if isinstance(observation.get("publication_policy"), Mapping)
+            else {}
+        )
+        record: Dict[str, Any] = {
+            "schema_version": 2,
+            "record_type": "market_benchmark_decision",
+            "record_key": f"market-benchmark-decision:v2:{observation_id}",
+            "decision_key": f"market-benchmark:{observation_id}",
+            "observation_id": observation_id,
+            "fixture_id": fixture_id,
+            "stage": "decision_pipeline",
+            "minute": minute,
+            "observation_created_at_utc": observation.get("created_at_utc"),
+            "decision_created_at_utc": decision_created_at,
+            "created_at_utc": created_at,
+            "captured_at_utc": created_at,
+            "match": {
+                "home_team_name": match.get("home_team_name"),
+                "away_team_name": match.get("away_team_name"),
+                "league_name": match.get("league_name"),
+                "score_home": match.get("score_home"),
+                "score_away": match.get("score_away"),
+            },
+            "decision": {
+                "final_decision": observation_decision.get(
+                    "final_decision"
+                ),
+                "block_reason": observation_decision.get("block_reason"),
+                "active_publication_allow": observation_decision.get(
+                    "active_publication_allow"
+                ),
+                "signal_route": observation_decision.get("signal_route"),
+            },
+            "publication_policy": {
+                "publication_allow": publication_policy.get(
+                    "publication_allow"
+                ),
+                "name": publication_policy.get("name"),
+            },
+            "telegram": {
+                "send_attempted": telegram.get("send_attempted"),
+                "send_ok": telegram.get("send_ok"),
+                "message_id": telegram.get("message_id"),
+                "send_started_at_utc": telegram.get(
+                    "send_started_at_utc"
+                ),
+                "send_finished_at_utc": telegram.get(
+                    "send_finished_at_utc"
+                ),
+            },
+            "prediction_input_fingerprints": {
+                "static_ml": _market_prediction_input_fingerprint(
+                    observation,
+                    rolling=False,
+                ),
+                "rolling_ml": _market_prediction_input_fingerprint(
+                    observation,
+                    rolling=True,
+                ),
+            },
+            "probabilities": {
+                "bot": {
+                    "status": "available" if bot_available else "unavailable",
+                    "reason": None if bot_available else "probability_missing",
+                    "probability_pct": (
+                        bot_probability if bot_available else None
+                    ),
+                    "prediction_created_at_utc": observation.get(
+                        "created_at_utc"
+                    ),
+                    "source": "frozen_observation.probabilities.prob_to90",
+                },
+                "static_ml": _market_model_probability_payload(
+                    static_prediction,
+                    observation=observation,
+                    rolling=False,
+                ),
+                "rolling_ml": _market_model_probability_payload(
+                    rolling_prediction,
+                    observation=observation,
+                    rolling=True,
+                ),
+            },
+            "market": market_payload,
+            "provider": "api_football",
+            "source_endpoint": "/odds/live",
+            "shadow_only": True,
+            "production_applied": False,
+        }
+        written_or_queued = (
+            _get_market_benchmark_journal().append(record)
+            if durable
+            else _enqueue_market_benchmark_record(record)
+        )
+        if written_or_queued:
+            logger.info(
+                "[MARKET_BENCHMARK_DECISION] observation_id=%s "
+                "fixture_id=%s minute=%s market_status=%s bot=%s "
+                "static_ml=%s rolling_ml=%s shadow_only=true "
+                "production_apply=false durable=%s",
+                observation_id,
+                fixture_id,
+                minute,
+                market_payload.get("status"),
+                bot_probability,
+                record["probabilities"]["static_ml"].get("probability_pct"),
+                record["probabilities"]["rolling_ml"].get("probability_pct"),
+                durable,
+            )
+        return bool(written_or_queued)
+    except Exception:
+        logger.exception(
+            "[MARKET_BENCHMARK_DECISION_ERROR] observation_id=%s "
+            "production_unchanged=true",
+            observation_id,
+        )
+        return False
+
+
+def append_market_benchmark_delivery(
+    observation: Mapping[str, Any],
+    telegram_result: Mapping[str, Any],
+    *,
+    durable: bool = True,
+) -> bool:
+    """Append the Telegram result separately from the pre-send decision.
+
+    The pre-send record remains the immutable denominator.  A missing delivery
+    row therefore means "unknown after the side effect", never that the
+    decision itself disappears from evaluation.
+    """
+
+    try:
+        if (
+            not ENABLE_MARKET_BENCHMARK
+            or not _market_benchmark_started
+            or not isinstance(observation, Mapping)
+            or not isinstance(telegram_result, Mapping)
+        ):
+            return False
+        observation_id = str(
+            observation.get("observation_key")
+            or observation.get("observation_id")
+            or ""
+        ).strip()
+        fixture_id = _safe_int(observation.get("fixture_id"), -1)
+        if not observation_id or fixture_id < 1:
+            return False
+        created_at = _utc_now_iso()
+        record = {
+            "schema_version": 1,
+            "record_type": "market_benchmark_delivery",
+            "record_key": f"market-benchmark-delivery:v1:{observation_id}",
+            "observation_id": observation_id,
+            "fixture_id": fixture_id,
+            "created_at_utc": created_at,
+            "captured_at_utc": created_at,
+            "telegram": {
+                "send_attempted": telegram_result.get("send_attempted"),
+                "send_ok": telegram_result.get("send_ok"),
+                "message_id": telegram_result.get("message_id"),
+                "send_error_code": telegram_result.get("send_error_code"),
+                "send_error_description": telegram_result.get(
+                    "send_error_description"
+                ),
+                "send_started_at_utc": telegram_result.get(
+                    "send_started_at_utc"
+                ),
+                "send_finished_at_utc": telegram_result.get(
+                    "send_finished_at_utc"
+                ),
+            },
+            "shadow_only": True,
+            "production_applied": False,
+        }
+        result = (
+            _get_market_benchmark_journal().append(record)
+            if durable
+            else _enqueue_market_benchmark_record(record)
+        )
+        if result:
+            logger.info(
+                "[MARKET_BENCHMARK_DELIVERY] observation_id=%s fixture_id=%s "
+                "send_ok=%s durable=%s shadow_only=true production_apply=false",
+                observation_id,
+                fixture_id,
+                telegram_result.get("send_ok"),
+                durable,
+            )
+        return bool(result)
+    except Exception:
+        logger.exception(
+            "[MARKET_BENCHMARK_DELIVERY_ERROR] action=continue "
+            "production_unchanged=true"
+        )
+        return False
+
+
+def append_market_benchmark_outcomes(
+    outcomes: List[Dict[str, Any]],
+) -> int:
+    """Queue canonical terminal labels; revisions remain append-only."""
+
+    if not ENABLE_MARKET_BENCHMARK or not _market_benchmark_started or not outcomes:
+        return 0
+    queued = 0
+    for source in outcomes:
+        try:
+            if not isinstance(source, Mapping):
+                continue
+            observation_id = str(
+                source.get("observation_key")
+                or source.get("observation_id")
+                or ""
+            )
+            if not observation_id:
+                continue
+            outcome = (
+                source.get("outcome")
+                if isinstance(source.get("outcome"), Mapping)
+                else {}
+            )
+            created_at = str(source.get("created_at_utc") or _utc_now_iso())
+            identity = json.dumps(
+                {
+                    "observation_id": observation_id,
+                    "outcome_schema_version": source.get(
+                        "outcome_schema_version"
+                    ),
+                    "outcome_revision": get_outcome_revision(source),
+                    "created_at_utc": created_at,
+                    "status": outcome.get("status"),
+                    "goal_to90_normal_time": outcome.get(
+                        "goal_to90_normal_time"
+                    ),
+                },
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            record: Dict[str, Any] = {
+                "schema_version": 1,
+                "record_type": "market_benchmark_outcome",
+                "record_key": f"market-benchmark-outcome:v1:{digest}",
+                "observation_id": observation_id,
+                "fixture_id": source.get("fixture_id"),
+                "outcome_schema_version": source.get("outcome_schema_version"),
+                "outcome_revision": get_outcome_revision(source),
+                "created_at_utc": created_at,
+                "captured_at_utc": created_at,
+                "outcome": copy.deepcopy(dict(outcome)),
+                "shadow_only": True,
+                "production_applied": False,
+            }
+            queued += int(_enqueue_market_benchmark_record(record))
+        except Exception:
+            logger.exception(
+                "[MARKET_BENCHMARK_OUTCOME_ERROR] action=skip_record "
+                "production_unchanged=true"
+            )
+    if queued:
+        logger.info(
+            "[MARKET_BENCHMARK_OUTCOME] records_queued=%s "
+            "shadow_only=true production_apply=false",
+            queued,
+        )
+    return queued
+
+
+def _enqueue_market_benchmark_poll(
+    payload: Mapping[str, Any], captured_at_utc: str
+) -> bool:
+    global _market_benchmark_dropped_polls
+    # The poller owns this response and never mutates it after hand-off.  A
+    # shallow top-level copy avoids temporarily doubling a potentially large
+    # live-odds payload in RAM.
+    frozen_payload = dict(payload)
+    with _market_benchmark_lock:
+        if not _market_benchmark_started or _market_benchmark_stop.is_set():
+            return False
+        while (
+            len(_market_benchmark_poll_buffer)
+            >= max(1, int(MARKET_BENCHMARK_POLL_BUFFER_MAX))
+        ):
+            _market_benchmark_poll_buffer.popleft()
+            _market_benchmark_dropped_polls += 1
+        _market_benchmark_poll_buffer.append(
+            (frozen_payload, str(captured_at_utc))
+        )
+    _market_benchmark_wakeup.set()
+    return True
+
+
+def market_benchmark_poll_daemon(client: APISportsMetricsClient) -> None:
+    """Perform only network I/O; the writer remains free for outcomes."""
+
+    logger.info(
+        "[MARKET_BENCHMARK_POLLER] started poll_seconds=%.1f",
+        MARKET_BENCHMARK_POLL_SECONDS,
+    )
+    try:
+        while not _market_benchmark_stop.is_set():
+            try:
+                payload = client.fetch_live_odds_payload()
+                captured = _utc_now_iso()
+                _enqueue_market_benchmark_poll(
+                    payload if isinstance(payload, Mapping) else {},
+                    captured,
+                )
+            except Exception:
+                logger.exception(
+                    "[MARKET_BENCHMARK_POLL_ERROR] "
+                    "production_unchanged=true"
+                )
+            if _market_benchmark_stop.wait(MARKET_BENCHMARK_POLL_SECONDS):
+                break
+    finally:
+        logger.info("[MARKET_BENCHMARK_POLLER] stopped")
+
+
+def market_benchmark_daemon() -> None:
+    """Durable writer, intentionally independent from live-odds HTTP."""
+
+    global _market_benchmark_started
+    global _market_benchmark_dropped_polls
+    retry_delay = 1.0
+    try:
+        journal = _get_market_benchmark_journal()
+        logger.info(
+            "[MARKET_BENCHMARK_DAEMON] started role=writer "
+            "shadow_only=true production_apply=false"
+        )
+        while True:
+            with _market_benchmark_lock:
+                queue_pending = bool(_market_benchmark_queue)
+                poll_pending = bool(_market_benchmark_poll_buffer)
+            if queue_pending:
+                written = _drain_market_benchmark_queue(journal)
+                if written > 0:
+                    retry_delay = 1.0
+                    continue
+                if _market_benchmark_stop.is_set():
+                    logger.error(
+                        "[MARKET_BENCHMARK_STOP_UNFLUSHED] records=%s "
+                        "canonical_outcomes_recoverable=true",
+                        len(_market_benchmark_queue),
+                    )
+                    break
+                _market_benchmark_wakeup.wait(retry_delay)
+                _market_benchmark_wakeup.clear()
+                retry_delay = min(30.0, retry_delay * 2.0)
+                continue
+            pending_poll: Optional[Tuple[Dict[str, Any], str]] = None
+            if poll_pending:
+                with _market_benchmark_lock:
+                    if _market_benchmark_poll_buffer:
+                        pending_poll = _market_benchmark_poll_buffer.popleft()
+            if pending_poll is not None:
+                payload, captured = pending_poll
+                try:
+                    _persist_market_benchmark_payload(
+                        payload,
+                        journal=journal,
+                        captured_at_utc=captured,
+                    )
+                    retry_delay = 1.0
+                except Exception:
+                    with _market_benchmark_lock:
+                        if _market_benchmark_stop.is_set():
+                            _market_benchmark_dropped_polls += 1
+                        else:
+                            _market_benchmark_poll_buffer.appendleft(
+                                pending_poll
+                            )
+                            while (
+                                len(_market_benchmark_poll_buffer)
+                                > max(
+                                    1,
+                                    int(MARKET_BENCHMARK_POLL_BUFFER_MAX),
+                                )
+                            ):
+                                _market_benchmark_poll_buffer.pop()
+                    logger.exception(
+                        "[MARKET_BENCHMARK_PERSIST_POLL_ERROR] "
+                        "retry_seconds=%.1f production_unchanged=true",
+                        retry_delay,
+                    )
+                    if not _market_benchmark_stop.is_set():
+                        _market_benchmark_wakeup.wait(retry_delay)
+                        _market_benchmark_wakeup.clear()
+                        retry_delay = min(30.0, retry_delay * 2.0)
+                continue
+            if _market_benchmark_stop.is_set():
+                break
+            _market_benchmark_wakeup.wait(1.0)
+            _market_benchmark_wakeup.clear()
+    except Exception:
+        logger.exception(
+            "[MARKET_BENCHMARK_WRITER_FATAL] production_unchanged=true"
+        )
+    finally:
+        with _market_benchmark_lock:
+            _market_benchmark_started = False
+        _market_benchmark_stop.set()
+        logger.info("[MARKET_BENCHMARK_DAEMON] stopped role=writer")
+
+
+def start_market_benchmark_daemon(client: APISportsMetricsClient) -> None:
+    global _market_benchmark_started
+    global _market_benchmark_thread
+    global _market_benchmark_poll_thread
+    if not ENABLE_MARKET_BENCHMARK:
+        logger.info("[MARKET_BENCHMARK_DAEMON] disabled")
+        return
+    with _market_benchmark_lock:
+        if _market_benchmark_thread and _market_benchmark_thread.is_alive():
+            return
+    try:
+        _get_market_benchmark_journal()
+    except Exception:
+        logger.exception(
+            "[MARKET_BENCHMARK_START_ERROR] production_unchanged=true"
+        )
+        return
+    _market_benchmark_stop.clear()
+    _market_benchmark_wakeup.clear()
+    with _market_benchmark_lock:
+        _market_benchmark_started = True
+        _market_benchmark_thread = threading.Thread(
+            target=market_benchmark_daemon,
+            name="market-benchmark-writer",
+            daemon=True,
+        )
+        _market_benchmark_poll_thread = threading.Thread(
+            target=market_benchmark_poll_daemon,
+            args=(client,),
+            name="market-benchmark-poller",
+            daemon=True,
+        )
+        thread = _market_benchmark_thread
+        poll_thread = _market_benchmark_poll_thread
+    try:
+        thread.start()
+        poll_thread.start()
+    except Exception:
+        with _market_benchmark_lock:
+            _market_benchmark_started = False
+        _market_benchmark_stop.set()
+        _market_benchmark_wakeup.set()
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        logger.exception(
+            "[MARKET_BENCHMARK_START_ERROR] stage=thread_start "
+            "production_unchanged=true"
+        )
+
+
+def stop_market_benchmark_daemon(timeout: float = 10.0) -> None:
+    global _market_benchmark_started
+    with _market_benchmark_lock:
+        _market_benchmark_started = False
+        thread = _market_benchmark_thread
+        poll_thread = _market_benchmark_poll_thread
+    _market_benchmark_stop.set()
+    _market_benchmark_wakeup.set()
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    if poll_thread and poll_thread.is_alive():
+        poll_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if thread and thread.is_alive():
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if (poll_thread and poll_thread.is_alive()) or (
+        thread and thread.is_alive()
+    ):
+        logger.warning(
+            "[MARKET_BENCHMARK_STOP_TIMEOUT] writer_alive=%s "
+            "poller_alive=%s pending_records=%s pending_polls=%s",
+            bool(thread and thread.is_alive()),
+            bool(poll_thread and poll_thread.is_alive()),
+            len(_market_benchmark_queue),
+            len(_market_benchmark_poll_buffer),
+        )
+
+
+def evaluate_and_append_shadow_candidates(
+    observation: Mapping[str, Any],
+) -> bool:
+    """Best-effort live audit, structurally downstream of production."""
+    if (
+        not ENABLE_SHADOW_CANDIDATE_LAYER
+        or not isinstance(observation, Mapping)
+        or str(observation.get("record_type") or "") != "observation"
+        or str(observation.get("stage") or "") != "decision_pipeline"
+    ):
+        return False
+    observation_id = str(
+        observation.get("observation_key")
+        or observation.get("observation_id")
+        or ""
+    )
+    try:
+        decision = (
+            observation.get("decision")
+            if isinstance(observation.get("decision"), dict)
+            else {}
+        )
+        control_candidate = bool(
+            decision.get("active_publication_allow") is True
+        )
+        static_prediction = None
+        rolling_prediction = None
+        if control_candidate:
+            try:
+                static_prediction = _build_shadow_candidate_prediction_record(
+                    observation,
+                    rolling=False,
+                )
+            except Exception:
+                logger.exception(
+                    "[SHADOW_CANDIDATE_PREDICTION_ERROR] "
+                    "observation_id=%s source=static action=mark_unavailable",
+                    observation_id,
+                )
+            try:
+                rolling_prediction = _build_shadow_candidate_prediction_record(
+                    observation,
+                    rolling=True,
+                )
+            except Exception:
+                logger.exception(
+                    "[SHADOW_CANDIDATE_PREDICTION_ERROR] "
+                    "observation_id=%s source=rolling action=mark_unavailable",
+                    observation_id,
+                )
+        written = _get_shadow_candidate_layer().process_snapshot(
+            observation,
+            static_prediction=static_prediction,
+            rolling_prediction=rolling_prediction,
+        )
+        if written:
+            arms = (
+                written.get("arms")
+                if isinstance(written.get("arms"), dict)
+                else {}
+            )
+            logger.info(
+                "[SHADOW_CANDIDATE] observation_id=%s fixture_id=%s "
+                "minute=%s ruleset=%s cohort_claimed=%s decisions=%s "
+                "shadow_only=true production_apply=false",
+                observation_id,
+                written.get("fixture_id"),
+                written.get("minute"),
+                written.get("ruleset_version"),
+                (written.get("cohort") or {}).get("cohort_claimed"),
+                {
+                    arm_id: (payload or {}).get("candidate_decision")
+                    for arm_id, payload in arms.items()
+                    if isinstance(payload, dict)
+                },
+            )
+        return bool(written)
+    except Exception:
+        logger.exception(
+            "[SHADOW_CANDIDATE_ERROR] observation_id=%s "
+            "production_unchanged=true",
+            observation_id,
+        )
+        return False
+
+
+def append_shadow_candidate_outcomes(
+    outcomes: List[Dict[str, Any]],
+) -> int:
+    """Link terminal labels in one bounded, best-effort batch."""
+    if not ENABLE_SHADOW_CANDIDATE_LAYER or not outcomes:
+        return 0
+    try:
+        written = _get_shadow_candidate_layer().process_outcomes(outcomes)
+        if written:
+            logger.info(
+                "[SHADOW_CANDIDATE_OUTCOME] records_written=%s "
+                "shadow_only=true production_apply=false",
+                len(written),
+            )
+        return len(written)
+    except Exception:
+        logger.exception(
+            "[SHADOW_CANDIDATE_OUTCOME_ERROR] records=%s "
+            "production_unchanged=true",
+            len(outcomes),
+        )
+        return 0
+
+
+_wide_research_lock = threading.RLock()
+_wide_research_store: Optional[WideResearchStore] = None
+_wide_research_layer: Optional[WideShadowLayer] = None
+_wide_research_controller: Optional[WideResearchController] = None
+_wide_research_router: Optional[ActiveRuleRouter] = None
+_wide_research_signature: Tuple[Any, ...] = ()
+_wide_research_4f_store: Optional[WideResearchStore] = None
+_wide_research_4f_layer: Optional[WideShadowLayer] = None
+_wide_research_4f_controller: Optional[WideResearchController] = None
+_wide_research_4f_signature: Tuple[Any, ...] = ()
+_wide_research_precision_store: Optional[WideResearchStore] = None
+_wide_research_precision_layer: Optional[WideShadowLayer] = None
+_wide_research_precision_controller: Optional[WideResearchController] = None
+_wide_research_precision_signature: Tuple[Any, ...] = ()
+_wide_research_rare_precision_store: Optional[WideResearchStore] = None
+_wide_research_rare_precision_layer: Optional[WideShadowLayer] = None
+_wide_research_rare_precision_controller: Optional[WideResearchController] = None
+_wide_research_rare_precision_signature: Tuple[Any, ...] = ()
+_wide_research_stop = threading.Event()
+_wide_research_wakeup = threading.Event()
+_wide_research_thread: Optional[threading.Thread] = None
+_wide_research_active_process_lock = threading.RLock()
+_wide_research_active_process: Optional[subprocess.Popen[str]] = None
+_research_health_monitor_lock = threading.RLock()
+_research_health_monitor: Optional[ResearchHealthMonitor] = None
+
+
+def _research_health_note(method: str, *args: Any, **kwargs: Any) -> None:
+    """Best-effort heartbeat: diagnostics must never alter bot decisions."""
+
+    monitor = _research_health_monitor
+    if monitor is None:
+        return
+    try:
+        callback = getattr(monitor, method)
+        callback(*args, **kwargs)
+    except Exception:
+        logger.exception(
+            "[RESEARCH_HEALTH_ERROR] heartbeat=%s production_unchanged=true",
+            method,
+        )
+
+
+def _research_health_project_path(value: Any) -> str:
+    """Resolve health paths against this module, independently of process cwd."""
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    raw = os.fsdecode(os.fspath(value))
+    if not raw:
+        raise ValueError("research health path must be non-empty")
+    if not os.path.isabs(raw):
+        raw = os.path.join(project_root, raw)
+    return os.path.normcase(os.path.realpath(os.path.abspath(raw)))
+
+
+def _research_health_profiles(
+    discovery_state: Mapping[str, Mapping[str, Any]],
+    monitoring_since: str,
+) -> List[ProfileSnapshotSpec]:
+    specifications = [
+        ("primary", "primary", ENABLE_WIDE_RESEARCH, WIDE_RESEARCH_AUTO_DISCOVERY, WIDE_RESEARCH_DB_FILE, WIDE_RESEARCH_DISCOVERY_FILE, WIDE_RESEARCH_MAX_SHADOW_RULES, WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS),
+        ("exact_four_shadow", "four_factor", ENABLE_WIDE_RESEARCH_FOUR_FACTOR, WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY, WIDE_RESEARCH_FOUR_FACTOR_DB_FILE, WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_FILE, WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES, WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS),
+        ("precision_shadow", "precision", ENABLE_WIDE_RESEARCH_PRECISION, WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY, WIDE_RESEARCH_PRECISION_DB_FILE, WIDE_RESEARCH_PRECISION_DISCOVERY_FILE, WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES, WIDE_RESEARCH_PRECISION_DISCOVERY_INTERVAL_SECONDS),
+        ("rare_precision_shadow", "rare_precision", ENABLE_WIDE_RESEARCH_RARE_PRECISION, WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY, WIDE_RESEARCH_RARE_PRECISION_DB_FILE, WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE, WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES, WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_INTERVAL_SECONDS),
+    ]
+    return [
+        ProfileSnapshotSpec(
+            profile_id=profile_id,
+            database_path=_research_health_project_path(database),
+            summary_path=_research_health_project_path(summary),
+            capacity=capacity, interval_seconds=interval, enabled=auto,
+            monitoring_since=monitoring_since,
+            running_since=discovery_state.get(key, {}).get("running_since"),
+            failures=discovery_state.get(key, {}).get("failures", 0),
+        )
+        for profile_id, key, enabled, auto, database, summary, capacity, interval in specifications if enabled
+    ]
+
+
+def _research_health_eligible_fixture_count(fixtures: Any) -> int:
+    """Count eligible live fixtures without letting malformed API rows break a loop.
+
+    This heartbeat is diagnostic only.  Requiring a real fixture id keeps an
+    incomplete API object from making the monitor expect an observation that
+    the decision pipeline cannot persist or reconcile.
+    """
+
+    if isinstance(fixtures, (str, bytes, bytearray, Mapping)):
+        return 0
+    try:
+        iterator = iter(fixtures)
+    except TypeError:
+        return 0
+
+    eligible = 0
+    for fixture in iterator:
+        try:
+            fixture_id = get_fixture_id(fixture)
+            if fixture_id is None:
+                continue
+            fixture_id = int(fixture_id)
+            if not 46 <= _fixture_minute_from_raw(fixture) <= 60:
+                continue
+            if not _is_live_fixture_active(fixture):
+                continue
+            if is_no_stats_blocked(str(fixture_id)):
+                continue
+            if is_no_stats_fixture(fixture_id):
+                continue
+            eligible += 1
+        except Exception:
+            # One malformed provider row must not suppress processing and
+            # health heartbeats for every other live fixture in this cycle.
+            continue
+    return eligible
+
+
+def _research_health_retry_timestamp(value: Any) -> Tuple[datetime, str]:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("retry timestamp must include a timezone")
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed, parsed.isoformat().replace("+00:00", "Z")
+
+
+def _research_retry_tick() -> Dict[str, Any]:
+    result = {"pending": 0, "failed": 0, "oldest_pending_at": None}
+    oldest_pending: Optional[datetime] = None
+    for enabled, getter in (
+        (ENABLE_WIDE_RESEARCH, _get_wide_research_layer),
+        (ENABLE_WIDE_RESEARCH_FOUR_FACTOR, _get_wide_research_four_factor_layer),
+        (ENABLE_WIDE_RESEARCH_PRECISION, _get_wide_research_precision_layer),
+        (ENABLE_WIDE_RESEARCH_RARE_PRECISION, _get_wide_research_rare_precision_layer),
+    ):
+        if not enabled:
+            continue
+        try:
+            layer = getter()
+            replay = layer.replay_pending(limit=32)
+            if not isinstance(replay, Mapping):
+                raise TypeError("replay_pending must return a mapping")
+            if int(replay.get("updated_triggers") or 0) > 0:
+                _wide_research_wakeup.set()
+            status = layer.pending_retry_status()
+            if not isinstance(status, Mapping):
+                raise TypeError("pending_retry_status must return a mapping")
+            inbox = status.get("inbox") or {}
+            if not isinstance(inbox, Mapping):
+                raise TypeError("retry inbox status must be a mapping")
+            layer_pending = max(0, int(status.get("pending") or 0))
+            layer_failed = max(0, int(inbox.get("max_attempts") or 0))
+            layer_failed += int(status.get("status") == "UNAVAILABLE")
+            layer_failed += int(replay.get("status") == "UNAVAILABLE")
+            oldest = status.get("oldest_at_utc")
+            oldest_value: Optional[datetime] = None
+            oldest_text: Optional[str] = None
+            if oldest:
+                oldest_value, oldest_text = _research_health_retry_timestamp(oldest)
+            result["pending"] += layer_pending
+            result["failed"] += layer_failed
+            if oldest_value is not None and (
+                oldest_pending is None or oldest_value < oldest_pending
+            ):
+                oldest_pending = oldest_value
+                result["oldest_pending_at"] = oldest_text
+        except Exception:
+            result["failed"] += 1
+            logger.exception("[RESEARCH_RETRY_ERROR] layer=%s", getter.__name__)
+    return result
+
+
+def start_research_health_monitor() -> bool:
+    global _research_health_monitor
+    if not ENABLE_RESEARCH_HEALTH_MONITOR:
+        return False
+    with _research_health_monitor_lock:
+        if _research_health_monitor is not None:
+            return _research_health_monitor.start()
+        root = _research_health_project_path(
+            os.path.dirname(os.path.abspath(__file__))
+        )
+        # Reports are separate from every configured source/output, including
+        # ML artifacts.  Resolve every relative value using the same root.
+        outputs = {
+            _research_health_project_path(RESEARCH_HEALTH_REPORT_FILE),
+            _research_health_project_path(RESEARCH_HEALTH_ALERT_STATE_FILE),
+        }
+        protected = set()
+        for name, value in globals().items():
+            if (
+                name.endswith(("_FILE", "_PATH"))
+                and not name.startswith("RESEARCH_HEALTH_")
+                and value
+            ):
+                try:
+                    protected.add(_research_health_project_path(value))
+                except (TypeError, ValueError):
+                    continue
+        try:
+            inside_project = all(
+                os.path.commonpath((root, path)) == root for path in outputs
+            )
+        except ValueError:
+            inside_project = False
+        if len(outputs) != 2 or outputs & protected or not inside_project:
+            raise ValueError(
+                "research health outputs overlap protected files or leave project"
+            )
+        monitor = ResearchHealthMonitor(
+            profiles=_research_health_profiles,
+            retry=_research_retry_tick,
+            observation_path=_research_health_project_path(
+                OBSERVATION_HISTORY_FILE
+            ),
+            report_path=_research_health_project_path(
+                RESEARCH_HEALTH_REPORT_FILE
+            ),
+            state_path=_research_health_project_path(
+                RESEARCH_HEALTH_ALERT_STATE_FILE
+            ),
+            disk_path=root,
+            interval_seconds=RESEARCH_HEALTH_INTERVAL_SECONDS,
+            logger=logger,
+        )
+        started = monitor.start()
+        _research_health_monitor = monitor
+        return started
+
+
+def stop_research_health_monitor(timeout: float = 5.0) -> bool:
+    global _research_health_monitor
+    with _research_health_monitor_lock:
+        monitor = _research_health_monitor
+        if monitor is None:
+            return True
+        stopped = monitor.stop(timeout=timeout)
+        if stopped and _research_health_monitor is monitor:
+            _research_health_monitor = None
+        elif not stopped:
+            logger.error(
+                "[RESEARCH_HEALTH_ERROR] shutdown_timeout thread_alive=true"
+            )
+        return stopped
+
+
+def _assert_wide_research_runtime_paths() -> None:
+    """Prevent the SQLite/manifest outputs from overlapping live journals."""
+
+    normalize = lambda value: os.path.normcase(  # noqa: E731
+        os.path.realpath(os.path.abspath(os.fspath(value)))
+    )
+    primary_output_files = [
+        normalize(WIDE_RESEARCH_DB_FILE),
+        normalize(WIDE_RESEARCH_DB_FILE + "-wal"),
+        normalize(WIDE_RESEARCH_DB_FILE + "-shm"),
+        normalize(WIDE_RESEARCH_ACTIVE_MANIFEST_FILE),
+        normalize(WIDE_RESEARCH_DISCOVERY_FILE),
+    ]
+    experimental_output_files = [
+        normalize(WIDE_RESEARCH_FOUR_FACTOR_DB_FILE),
+        normalize(WIDE_RESEARCH_FOUR_FACTOR_DB_FILE + "-wal"),
+        normalize(WIDE_RESEARCH_FOUR_FACTOR_DB_FILE + "-shm"),
+        normalize(WIDE_RESEARCH_FOUR_FACTOR_ACTIVE_MANIFEST_FILE),
+        normalize(WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_FILE),
+    ]
+    precision_output_files = [
+        normalize(WIDE_RESEARCH_PRECISION_DB_FILE),
+        normalize(WIDE_RESEARCH_PRECISION_DB_FILE + "-wal"),
+        normalize(WIDE_RESEARCH_PRECISION_DB_FILE + "-shm"),
+        normalize(WIDE_RESEARCH_PRECISION_ACTIVE_MANIFEST_FILE),
+        normalize(WIDE_RESEARCH_PRECISION_DISCOVERY_FILE),
+    ]
+    rare_precision_output_files = [
+        normalize(WIDE_RESEARCH_RARE_PRECISION_DB_FILE),
+        normalize(WIDE_RESEARCH_RARE_PRECISION_DB_FILE + "-wal"),
+        normalize(WIDE_RESEARCH_RARE_PRECISION_DB_FILE + "-shm"),
+        normalize(WIDE_RESEARCH_RARE_PRECISION_ACTIVE_MANIFEST_FILE),
+        normalize(WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE),
+    ]
+    primary_outputs = set(primary_output_files)
+    experimental_outputs = set(experimental_output_files)
+    precision_outputs = set(precision_output_files)
+    rare_precision_outputs = set(rare_precision_output_files)
+    primary_output_dir = normalize(WIDE_RESEARCH_OUTPUT_DIR)
+    experimental_output_dir = normalize(WIDE_RESEARCH_FOUR_FACTOR_OUTPUT_DIR)
+    precision_output_dir = normalize(WIDE_RESEARCH_PRECISION_OUTPUT_DIR)
+    rare_precision_output_dir = normalize(
+        WIDE_RESEARCH_RARE_PRECISION_OUTPUT_DIR
+    )
+    if len(primary_output_files) != len(primary_outputs):
+        raise ValueError("primary wide research outputs overlap each other")
+    if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+        if len(experimental_output_files) != len(experimental_outputs):
+            raise ValueError(
+                "four-factor research outputs overlap each other"
+            )
+        overlap = sorted(primary_outputs & experimental_outputs)
+        if overlap:
+            raise ValueError(
+                "four-factor research output overlaps primary output: "
+                + overlap[0]
+            )
+        try:
+            common_output_dir = os.path.commonpath(
+                (primary_output_dir, experimental_output_dir)
+            )
+        except ValueError:
+            common_output_dir = ""
+        if common_output_dir in {
+            primary_output_dir,
+            experimental_output_dir,
+        }:
+            raise ValueError(
+                "four-factor and primary artifact directories overlap"
+            )
+        for path in primary_outputs:
+            if os.path.commonpath((path, experimental_output_dir)) == (
+                experimental_output_dir
+            ):
+                raise ValueError(
+                    "primary output is inside four-factor artifact directory"
+                )
+        for path in experimental_outputs:
+            if os.path.commonpath((path, primary_output_dir)) == (
+                primary_output_dir
+            ):
+                raise ValueError(
+                    "four-factor output is inside primary artifact directory"
+                )
+    if ENABLE_WIDE_RESEARCH_PRECISION:
+        if len(precision_output_files) != len(precision_outputs):
+            raise ValueError("precision research outputs overlap each other")
+        other_outputs = primary_outputs | (
+            experimental_outputs if ENABLE_WIDE_RESEARCH_FOUR_FACTOR else set()
+        )
+        overlap = sorted(other_outputs & precision_outputs)
+        if overlap:
+            raise ValueError(
+                "precision research output overlaps another profile: "
+                + overlap[0]
+            )
+        other_dirs = [primary_output_dir]
+        if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+            other_dirs.append(experimental_output_dir)
+        for other_dir in other_dirs:
+            try:
+                common_output_dir = os.path.commonpath(
+                    (other_dir, precision_output_dir)
+                )
+            except ValueError:
+                common_output_dir = ""
+            if common_output_dir in {other_dir, precision_output_dir}:
+                raise ValueError(
+                    "precision and existing artifact directories overlap"
+                )
+            for path in precision_outputs:
+                if os.path.commonpath((path, other_dir)) == other_dir:
+                    raise ValueError(
+                        "precision output is inside another artifact directory"
+                    )
+            for path in other_outputs:
+                if os.path.commonpath((path, precision_output_dir)) == (
+                    precision_output_dir
+                ):
+                    raise ValueError(
+                        "existing output is inside precision artifact directory"
+                    )
+    if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+        if len(rare_precision_output_files) != len(rare_precision_outputs):
+            raise ValueError(
+                "rare precision research outputs overlap each other"
+            )
+        other_profiles = [(primary_outputs, primary_output_dir)]
+        if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+            other_profiles.append(
+                (experimental_outputs, experimental_output_dir)
+            )
+        if ENABLE_WIDE_RESEARCH_PRECISION:
+            other_profiles.append((precision_outputs, precision_output_dir))
+        other_outputs = set().union(
+            *(profile_outputs for profile_outputs, _ in other_profiles)
+        )
+        overlap = sorted(other_outputs & rare_precision_outputs)
+        if overlap:
+            raise ValueError(
+                "rare precision research output overlaps another profile: "
+                + overlap[0]
+            )
+        for profile_outputs, profile_output_dir in other_profiles:
+            try:
+                common_output_dir = os.path.commonpath(
+                    (profile_output_dir, rare_precision_output_dir)
+                )
+            except ValueError:
+                common_output_dir = ""
+            if common_output_dir in {
+                profile_output_dir,
+                rare_precision_output_dir,
+            }:
+                raise ValueError(
+                    "rare precision and existing artifact directories overlap"
+                )
+            for path in rare_precision_outputs:
+                if os.path.commonpath((path, profile_output_dir)) == (
+                    profile_output_dir
+                ):
+                    raise ValueError(
+                        "rare precision output is inside another artifact directory"
+                    )
+            for path in profile_outputs:
+                if os.path.commonpath(
+                    (path, rare_precision_output_dir)
+                ) == rare_precision_output_dir:
+                    raise ValueError(
+                        "existing output is inside rare precision artifact directory"
+                    )
+    outputs = set(primary_outputs)
+    if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+        outputs.update(experimental_outputs)
+    if ENABLE_WIDE_RESEARCH_PRECISION:
+        outputs.update(precision_outputs)
+    if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+        outputs.update(rare_precision_outputs)
+    protected: set[str] = set()
+    for name in (
+        "OBSERVATION_HISTORY_FILE",
+        "DECISION_SNAPSHOTS_FILE",
+        "SHADOW_ML_PREDICTIONS_FILE",
+        "SHADOW_ML_ROLLING_PREDICTIONS_FILE",
+        "SHADOW_ML_MODEL_FILE",
+        "SHADOW_ML_ROLLING_MODEL_FILE",
+        "SHADOW_CANDIDATE_JOURNAL_FILE",
+        "SHADOW_CANDIDATE_INDEX_FILE",
+        "MARKET_BENCHMARK_JOURNAL_FILE",
+        "MARKET_BENCHMARK_INDEX_FILE",
+        "SIGNAL_REPUTATION_SHADOW_FILE",
+        "SIGNAL_REPUTATION_MODEL_FILE",
+        "SECOND_HALF_HISTORY_PATH",
+        "MATCH_SNAPSHOTS_JSONL_PATH",
+        "MATCH_OUTCOMES_JSONL_PATH",
+        "CORE_PATH",
+        "MATCHES_PATH",
+        "STATE_FILE",
+        "GOAL_LOG_FILE",
+    ):
+        value = globals().get(name)
+        if value:
+            protected.add(normalize(value))
+    collision = sorted(outputs & protected)
+    if collision:
+        raise ValueError(
+            "wide research output overlaps a live source: " + collision[0]
+        )
+
+
+def _get_wide_research_components() -> Tuple[
+    WideResearchStore,
+    WideShadowLayer,
+    WideResearchController,
+    ActiveRuleRouter,
+]:
+    global _wide_research_store
+    global _wide_research_layer
+    global _wide_research_controller
+    global _wide_research_router
+    global _wide_research_signature
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(WIDE_RESEARCH_DB_FILE),
+        os.path.abspath(WIDE_RESEARCH_ACTIVE_MANIFEST_FILE),
+        str(WIDE_RESEARCH_PROSPECTIVE_START_UTC),
+        bool(WIDE_RESEARCH_PRODUCTION_APPLY),
+        int(WIDE_RESEARCH_MAX_SHADOW_RULES),
+        int(WIDE_RESEARCH_MAX_DB_BYTES),
+        int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
+    )
+    with _wide_research_lock:
+        if (
+            _wide_research_store is None
+            or _wide_research_layer is None
+            or _wide_research_controller is None
+            or _wide_research_router is None
+            or _wide_research_signature != signature
+        ):
+            _assert_wide_research_runtime_paths()
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            store = WideResearchStore(
+                WIDE_RESEARCH_DB_FILE,
+                allowed_root=project_root,
+                max_db_bytes=WIDE_RESEARCH_MAX_DB_BYTES,
+            )
+            store.bind_profile("primary")
+            _wide_research_store = store
+            _wide_research_layer = WideShadowLayer(
+                store,
+                # The controller may preserve one pre-purge cohort while the
+                # first leakage-safe cohort starts.  Keep the live evaluator's
+                # bounded capacity in lockstep with that migration reserve.
+                max_active_rules=min(
+                    64, 2 * WIDE_RESEARCH_MAX_SHADOW_RULES
+                ),
+                refresh_seconds=WIDE_RESEARCH_PHASE_REFRESH_SECONDS,
+                max_prediction_lag_seconds=(
+                    SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+                ),
+            )
+            _wide_research_controller = WideResearchController(
+                store,
+                active_manifest_path=WIDE_RESEARCH_ACTIVE_MANIFEST_FILE,
+                prospective_start_utc=WIDE_RESEARCH_PROSPECTIVE_START_UTC,
+                production_enabled=WIDE_RESEARCH_PRODUCTION_APPLY,
+                max_shadow_rules=WIDE_RESEARCH_MAX_SHADOW_RULES,
+            )
+            _wide_research_router = ActiveRuleRouter(
+                WIDE_RESEARCH_ACTIVE_MANIFEST_FILE
+            )
+            _wide_research_signature = signature
+        return (
+            _wide_research_store,
+            _wide_research_layer,
+            _wide_research_controller,
+            _wide_research_router,
+        )
+
+
+def _get_wide_research_layer() -> WideShadowLayer:
+    return _get_wide_research_components()[1]
+
+
+def _get_wide_research_four_factor_components() -> Tuple[
+    WideResearchStore,
+    WideShadowLayer,
+    WideResearchController,
+]:
+    """Return the isolated exact-4 research stack.
+
+    Production is deliberately hard-disabled here rather than controlled by
+    an environment flag.  The experimental stack has no ActiveRuleRouter.
+    """
+
+    global _wide_research_4f_store
+    global _wide_research_4f_layer
+    global _wide_research_4f_controller
+    global _wide_research_4f_signature
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(WIDE_RESEARCH_FOUR_FACTOR_DB_FILE),
+        os.path.abspath(WIDE_RESEARCH_FOUR_FACTOR_ACTIVE_MANIFEST_FILE),
+        str(WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC),
+        int(WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES),
+        int(WIDE_RESEARCH_FOUR_FACTOR_MAX_DB_BYTES),
+        int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
+    )
+    with _wide_research_lock:
+        if (
+            _wide_research_4f_store is None
+            or _wide_research_4f_layer is None
+            or _wide_research_4f_controller is None
+            or _wide_research_4f_signature != signature
+        ):
+            _assert_wide_research_runtime_paths()
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            store = WideResearchStore(
+                WIDE_RESEARCH_FOUR_FACTOR_DB_FILE,
+                allowed_root=project_root,
+                max_db_bytes=WIDE_RESEARCH_FOUR_FACTOR_MAX_DB_BYTES,
+            )
+            store.bind_profile("exact_four_shadow")
+            _wide_research_4f_store = store
+            _wide_research_4f_layer = WideShadowLayer(
+                store,
+                max_active_rules=min(
+                    64, 2 * WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES
+                ),
+                refresh_seconds=WIDE_RESEARCH_PHASE_REFRESH_SECONDS,
+                max_prediction_lag_seconds=(
+                    SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+                ),
+            )
+            _wide_research_4f_controller = WideResearchController(
+                store,
+                active_manifest_path=(
+                    WIDE_RESEARCH_FOUR_FACTOR_ACTIVE_MANIFEST_FILE
+                ),
+                prospective_start_utc=(
+                    WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC
+                ),
+                production_enabled=False,
+                max_shadow_rules=WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES,
+            )
+            _wide_research_4f_signature = signature
+        return (
+            _wide_research_4f_store,
+            _wide_research_4f_layer,
+            _wide_research_4f_controller,
+        )
+
+
+def _get_wide_research_four_factor_layer() -> WideShadowLayer:
+    return _get_wide_research_four_factor_components()[1]
+
+
+def _get_wide_research_precision_components() -> Tuple[
+    WideResearchStore,
+    WideShadowLayer,
+    WideResearchController,
+]:
+    """Return the isolated precision-first stack with no production router."""
+
+    global _wide_research_precision_store
+    global _wide_research_precision_layer
+    global _wide_research_precision_controller
+    global _wide_research_precision_signature
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(WIDE_RESEARCH_PRECISION_DB_FILE),
+        os.path.abspath(WIDE_RESEARCH_PRECISION_ACTIVE_MANIFEST_FILE),
+        str(WIDE_RESEARCH_PRECISION_PROSPECTIVE_START_UTC),
+        int(WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES),
+        int(WIDE_RESEARCH_PRECISION_MAX_DB_BYTES),
+        int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
+    )
+    with _wide_research_lock:
+        if (
+            _wide_research_precision_store is None
+            or _wide_research_precision_layer is None
+            or _wide_research_precision_controller is None
+            or _wide_research_precision_signature != signature
+        ):
+            _assert_wide_research_runtime_paths()
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            store = WideResearchStore(
+                WIDE_RESEARCH_PRECISION_DB_FILE,
+                allowed_root=project_root,
+                max_db_bytes=WIDE_RESEARCH_PRECISION_MAX_DB_BYTES,
+            )
+            store.bind_profile("precision_shadow")
+            _wide_research_precision_store = store
+            _wide_research_precision_layer = WideShadowLayer(
+                store,
+                max_active_rules=min(
+                    64, 2 * WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES
+                ),
+                refresh_seconds=WIDE_RESEARCH_PHASE_REFRESH_SECONDS,
+                max_prediction_lag_seconds=(
+                    SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+                ),
+            )
+            _wide_research_precision_controller = WideResearchController(
+                store,
+                active_manifest_path=(
+                    WIDE_RESEARCH_PRECISION_ACTIVE_MANIFEST_FILE
+                ),
+                prospective_start_utc=(
+                    WIDE_RESEARCH_PRECISION_PROSPECTIVE_START_UTC
+                ),
+                production_enabled=False,
+                max_shadow_rules=WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES,
+            )
+            _wide_research_precision_signature = signature
+        return (
+            _wide_research_precision_store,
+            _wide_research_precision_layer,
+            _wide_research_precision_controller,
+        )
+
+
+def _get_wide_research_precision_layer() -> WideShadowLayer:
+    return _get_wide_research_precision_components()[1]
+
+
+def _get_wide_research_rare_precision_components() -> Tuple[
+    WideResearchStore,
+    WideShadowLayer,
+    WideResearchController,
+]:
+    """Return the isolated rare-precision stack with no production router."""
+
+    global _wide_research_rare_precision_store
+    global _wide_research_rare_precision_layer
+    global _wide_research_rare_precision_controller
+    global _wide_research_rare_precision_signature
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(WIDE_RESEARCH_RARE_PRECISION_DB_FILE),
+        os.path.abspath(
+            WIDE_RESEARCH_RARE_PRECISION_ACTIVE_MANIFEST_FILE
+        ),
+        str(WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC),
+        int(WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES),
+        int(WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES),
+        int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
+        tuple(WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.allowed_looks),
+        int(WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.min_resolved),
+    )
+    with _wide_research_lock:
+        if (
+            _wide_research_rare_precision_store is None
+            or _wide_research_rare_precision_layer is None
+            or _wide_research_rare_precision_controller is None
+            or _wide_research_rare_precision_signature != signature
+        ):
+            _assert_wide_research_runtime_paths()
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            store = WideResearchStore(
+                WIDE_RESEARCH_RARE_PRECISION_DB_FILE,
+                allowed_root=project_root,
+                max_db_bytes=WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES,
+            )
+            store.bind_profile("rare_precision_shadow")
+            _wide_research_rare_precision_store = store
+            _wide_research_rare_precision_layer = WideShadowLayer(
+                store,
+                max_active_rules=min(
+                    64, 2 * WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES
+                ),
+                refresh_seconds=WIDE_RESEARCH_PHASE_REFRESH_SECONDS,
+                max_prediction_lag_seconds=(
+                    SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+                ),
+            )
+            _wide_research_rare_precision_controller = (
+                WideResearchController(
+                    store,
+                    active_manifest_path=(
+                        WIDE_RESEARCH_RARE_PRECISION_ACTIVE_MANIFEST_FILE
+                    ),
+                    prospective_start_utc=(
+                        WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC
+                    ),
+                    production_enabled=False,
+                    max_shadow_rules=(
+                        WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES
+                    ),
+                    policy=WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY,
+                    terminal_review_enabled=True,
+                    terminal_review_min_hit_rate=0.90,
+                )
+            )
+            _wide_research_rare_precision_signature = signature
+        return (
+            _wide_research_rare_precision_store,
+            _wide_research_rare_precision_layer,
+            _wide_research_rare_precision_controller,
+        )
+
+
+def _get_wide_research_rare_precision_layer() -> WideShadowLayer:
+    return _get_wide_research_rare_precision_components()[1]
+
+
+def _wide_research_retry_gate(
+    layer: WideShadowLayer,
+    *,
+    log_tag: str,
+) -> bool:
+    """Drain frozen work before changing the phase/lifecycle generation."""
+    replay = layer.replay_pending(limit=256)
+    status = layer.pending_retry_status()
+    if replay.get("status") == "OK" and status.get("status") == "OK":
+        return True
+    logger.warning(
+        "[%s_RETRY_GATE] lifecycle_deferred=true pending=%s "
+        "status=%s error_type=%s",
+        log_tag,
+        status.get("pending"),
+        status.get("status"),
+        status.get("error_type") or replay.get("error_type"),
+    )
+    return False
+
+
+def evaluate_and_store_wide_research(
+    observation: Mapping[str, Any],
+) -> bool:
+    """Best-effort prospective scoring for every eligible persisted snapshot."""
+
+    if (
+        not (
+            ENABLE_WIDE_RESEARCH
+            or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+            or ENABLE_WIDE_RESEARCH_PRECISION
+            or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+        )
+        or not isinstance(observation, Mapping)
+        or str(observation.get("record_type") or "") != "observation"
+        or str(observation.get("stage") or "")
+        not in {"decision_pipeline", "wide_monitor"}
+    ):
+        return False
+    observation_id = str(
+        observation.get("observation_key")
+        or observation.get("observation_id")
+        or ""
+    )
+    try:
+        static_prediction = _build_shadow_candidate_prediction_record(
+            observation,
+            rolling=False,
+        )
+        rolling_prediction = _build_shadow_candidate_prediction_record(
+            observation,
+            rolling=True,
+        )
+    except Exception:
+        logger.exception(
+            "[WIDE_RESEARCH_PREDICTION_ERROR] observation_id=%s "
+            "production_unchanged=true",
+            observation_id,
+        )
+        return False
+
+    primary_pass = False
+    if ENABLE_WIDE_RESEARCH:
+        try:
+            result = _get_wide_research_layer().process_snapshot(
+                observation,
+                static_prediction=static_prediction,
+                rolling_prediction=rolling_prediction,
+            )
+            claimed = result.get("claimed") if isinstance(result, dict) else []
+            if claimed:
+                logger.info(
+                    "[WIDE_RESEARCH_TRIGGER] observation_id=%s fixture_id=%s "
+                    "minute=%s claimed=%s prospective_only=true",
+                    observation_id,
+                    observation.get("fixture_id"),
+                    observation.get("minute"),
+                    [
+                        {
+                            "phase_id": item.get("phase_id"),
+                            "rule_id": item.get("rule_id"),
+                        }
+                        for item in claimed
+                        if isinstance(item, dict)
+                    ],
+                )
+            primary_pass = bool(result.get("status") == "PASS")
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_ERROR] observation_id=%s "
+                "production_unchanged=true",
+                observation_id,
+            )
+
+    if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+        try:
+            result_4f = _get_wide_research_four_factor_layer().process_snapshot(
+                observation,
+                static_prediction=static_prediction,
+                rolling_prediction=rolling_prediction,
+            )
+            claimed_4f = (
+                result_4f.get("claimed")
+                if isinstance(result_4f, dict)
+                else []
+            )
+            if claimed_4f:
+                logger.info(
+                    "[WIDE_RESEARCH_4F_TRIGGER] observation_id=%s "
+                    "fixture_id=%s minute=%s claimed=%s "
+                    "prospective_only=true shadow_only=true "
+                    "production_apply=false",
+                    observation_id,
+                    observation.get("fixture_id"),
+                    observation.get("minute"),
+                    [
+                        {
+                            "phase_id": item.get("phase_id"),
+                            "rule_id": item.get("rule_id"),
+                        }
+                        for item in claimed_4f
+                        if isinstance(item, dict)
+                    ],
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_4F_ERROR] observation_id=%s "
+                "shadow_only=true production_unchanged=true",
+                observation_id,
+            )
+    if ENABLE_WIDE_RESEARCH_PRECISION:
+        try:
+            result_precision = (
+                _get_wide_research_precision_layer().process_snapshot(
+                    observation,
+                    static_prediction=static_prediction,
+                    rolling_prediction=rolling_prediction,
+                )
+            )
+            claimed_precision = (
+                result_precision.get("claimed")
+                if isinstance(result_precision, dict)
+                else []
+            )
+            if claimed_precision:
+                logger.info(
+                    "[WIDE_RESEARCH_PRECISION_TRIGGER] observation_id=%s "
+                    "fixture_id=%s minute=%s claimed=%s "
+                    "prospective_only=true shadow_only=true "
+                    "production_apply=false",
+                    observation_id,
+                    observation.get("fixture_id"),
+                    observation.get("minute"),
+                    [
+                        {
+                            "phase_id": item.get("phase_id"),
+                            "rule_id": item.get("rule_id"),
+                        }
+                        for item in claimed_precision
+                        if isinstance(item, dict)
+                    ],
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_PRECISION_ERROR] observation_id=%s "
+                "shadow_only=true production_unchanged=true",
+                observation_id,
+            )
+    if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+        try:
+            result_rare_precision = (
+                _get_wide_research_rare_precision_layer().process_snapshot(
+                    observation,
+                    static_prediction=static_prediction,
+                    rolling_prediction=rolling_prediction,
+                )
+            )
+            claimed_rare_precision = (
+                result_rare_precision.get("claimed")
+                if isinstance(result_rare_precision, dict)
+                else []
+            )
+            if claimed_rare_precision:
+                logger.info(
+                    "[WIDE_RESEARCH_RARE_PRECISION_TRIGGER] "
+                    "observation_id=%s fixture_id=%s minute=%s claimed=%s "
+                    "prospective_only=true shadow_only=true "
+                    "production_apply=false",
+                    observation_id,
+                    observation.get("fixture_id"),
+                    observation.get("minute"),
+                    [
+                        {
+                            "phase_id": item.get("phase_id"),
+                            "rule_id": item.get("rule_id"),
+                        }
+                        for item in claimed_rare_precision
+                        if isinstance(item, dict)
+                    ],
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_RARE_PRECISION_ERROR] observation_id=%s "
+                "shadow_only=true production_unchanged=true",
+                observation_id,
+            )
+    return primary_pass
+
+
+def append_wide_research_outcomes(
+    outcomes: List[Dict[str, Any]],
+) -> int:
+    if (
+        not (
+            ENABLE_WIDE_RESEARCH
+            or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+            or ENABLE_WIDE_RESEARCH_PRECISION
+            or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+        )
+        or not outcomes
+    ):
+        return 0
+    primary_updated = 0
+    wakeup = False
+    if ENABLE_WIDE_RESEARCH:
+        try:
+            result = _get_wide_research_layer().process_outcomes(outcomes)
+            primary_updated = _safe_int(result.get("updated_triggers"), 0)
+            if primary_updated:
+                logger.info(
+                    "[WIDE_RESEARCH_OUTCOME] inserted=%s "
+                    "updated_triggers=%s ignored_unmatched=%s",
+                    result.get("inserted"),
+                    primary_updated,
+                    result.get("ignored_unmatched"),
+                )
+                wakeup = True
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_OUTCOME_ERROR] records=%s "
+                "production_unchanged=true",
+                len(outcomes),
+            )
+
+    if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+        try:
+            result_4f = (
+                _get_wide_research_four_factor_layer().process_outcomes(
+                    outcomes
+                )
+            )
+            updated_4f = _safe_int(result_4f.get("updated_triggers"), 0)
+            if updated_4f:
+                logger.info(
+                    "[WIDE_RESEARCH_4F_OUTCOME] inserted=%s "
+                    "updated_triggers=%s ignored_unmatched=%s "
+                    "shadow_only=true production_apply=false",
+                    result_4f.get("inserted"),
+                    updated_4f,
+                    result_4f.get("ignored_unmatched"),
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_4F_OUTCOME_ERROR] records=%s "
+                "shadow_only=true production_unchanged=true",
+                len(outcomes),
+            )
+    if ENABLE_WIDE_RESEARCH_PRECISION:
+        try:
+            result_precision = (
+                _get_wide_research_precision_layer().process_outcomes(
+                    outcomes
+                )
+            )
+            updated_precision = _safe_int(
+                result_precision.get("updated_triggers"), 0
+            )
+            if updated_precision:
+                logger.info(
+                    "[WIDE_RESEARCH_PRECISION_OUTCOME] inserted=%s "
+                    "updated_triggers=%s ignored_unmatched=%s "
+                    "shadow_only=true production_apply=false",
+                    result_precision.get("inserted"),
+                    updated_precision,
+                    result_precision.get("ignored_unmatched"),
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_PRECISION_OUTCOME_ERROR] records=%s "
+                "shadow_only=true production_unchanged=true",
+                len(outcomes),
+            )
+    if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+        try:
+            result_rare_precision = (
+                _get_wide_research_rare_precision_layer().process_outcomes(
+                    outcomes
+                )
+            )
+            updated_rare_precision = _safe_int(
+                result_rare_precision.get("updated_triggers"), 0
+            )
+            if updated_rare_precision:
+                wakeup = True
+                logger.info(
+                    "[WIDE_RESEARCH_RARE_PRECISION_OUTCOME] inserted=%s "
+                    "updated_triggers=%s ignored_unmatched=%s "
+                    "shadow_only=true production_apply=false",
+                    result_rare_precision.get("inserted"),
+                    updated_rare_precision,
+                    result_rare_precision.get("ignored_unmatched"),
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_RARE_PRECISION_OUTCOME_ERROR] records=%s "
+                "shadow_only=true production_unchanged=true",
+                len(outcomes),
+            )
+    if wakeup:
+        _wide_research_wakeup.set()
+    return primary_updated
+
+
+def build_wide_router_observation(
+    *,
+    fixture_id: int,
+    minute: int,
+    fixture_metrics: Dict[str, Any],
+    probability_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    preview = build_wide_monitor_observation(
+        fixture_id=fixture_id,
+        minute=minute,
+        fixture_metrics=fixture_metrics,
+        probability_result=probability_result,
+    )
+    preview_id = (
+        f"{int(fixture_id)}:{int(minute)}:WIDE_ROUTER:"
+        f"v{int(OBSERVATION_SCHEMA_VERSION)}"
+    )
+    preview["observation_id"] = preview_id
+    preview["observation_key"] = preview_id
+    preview["stage"] = "decision_pipeline"
+    preview["decision"] = {
+        "final_decision": "NOT_EVALUATED",
+        "block_reason": None,
+        "active_publication_allow": False,
+        "signal_route": "primary",
+    }
+    preview["publication_policy"] = {
+        "publication_context_passed": True,
+        "publication_allow": False,
+        "router_preview": True,
+    }
+    return freeze_observation_rolling_dynamics(preview)
+
+
+def route_publication_with_wide_research(
+    *,
+    fixture_id: int,
+    minute: int,
+    fixture_metrics: Dict[str, Any],
+    probability_result: Dict[str, Any],
+    current_filter_allow: bool,
+    evidence_sink: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    fallback = {
+        "applied": False,
+        "allow": bool(current_filter_allow),
+        "source": "current_filter",
+        "reason": "wide_research_disabled",
+        "rule_id": None,
+        "phase_id": None,
+    }
+    if not ENABLE_WIDE_RESEARCH or not WIDE_RESEARCH_PRODUCTION_APPLY:
+        return fallback
+    try:
+        preview = build_wide_router_observation(
+            fixture_id=fixture_id,
+            minute=minute,
+            fixture_metrics=fixture_metrics,
+            probability_result=probability_result,
+        )
+        static_prediction = None
+        rolling_prediction = None
+        try:
+            static_prediction = _build_shadow_candidate_prediction_record(
+                preview,
+                rolling=False,
+            )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_ROUTER_PREDICTION_ERROR] fixture_id=%s "
+                "minute=%s source=static action=continue_unavailable",
+                fixture_id,
+                minute,
+            )
+        try:
+            rolling_prediction = _build_shadow_candidate_prediction_record(
+                preview,
+                rolling=True,
+            )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_ROUTER_PREDICTION_ERROR] fixture_id=%s "
+                "minute=%s source=rolling action=continue_unavailable",
+                fixture_id,
+                minute,
+            )
+        if isinstance(evidence_sink, dict):
+            evidence_sink.update(
+                {
+                    "observation": copy.deepcopy(preview),
+                    "observation_created_at_utc": preview.get(
+                        "created_at_utc"
+                    ),
+                    "prediction_input_observation_id": preview.get(
+                        "observation_id"
+                    ),
+                    "static_prediction": copy.deepcopy(static_prediction),
+                    "rolling_prediction": copy.deepcopy(rolling_prediction),
+                }
+            )
+        router = _get_wide_research_components()[3]
+        return router.route(
+            preview,
+            current_filter_allow=current_filter_allow,
+            static_prediction=static_prediction,
+            rolling_prediction=rolling_prediction,
+        )
+    except Exception:
+        logger.exception(
+            "[WIDE_RESEARCH_ROUTER_ERROR] fixture_id=%s minute=%s "
+            "action=fallback_current_filter",
+            fixture_id,
+            minute,
+        )
+        fallback["reason"] = "router_error_fallback"
+        return fallback
+
+
+def prepare_market_benchmark_evidence(
+    *,
+    fixture_id: int,
+    minute: int,
+    fixture_metrics: Dict[str, Any],
+    probability_result: Dict[str, Any],
+    existing: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Freeze causal market/model inputs before a publication side effect."""
+
+    try:
+        evidence = copy.deepcopy(dict(existing or {}))
+        if not ENABLE_MARKET_BENCHMARK or not _market_benchmark_started:
+            return evidence
+        preview = (
+            evidence.get("observation")
+            if isinstance(evidence.get("observation"), Mapping)
+            else None
+        )
+        if preview is None:
+            preview = build_wide_router_observation(
+                fixture_id=fixture_id,
+                minute=minute,
+                fixture_metrics=fixture_metrics,
+                probability_result=probability_result,
+            )
+            evidence["observation"] = copy.deepcopy(dict(preview))
+            evidence["observation_created_at_utc"] = preview.get(
+                "created_at_utc"
+            )
+            for source, rolling in (
+                ("static_prediction", False),
+                ("rolling_prediction", True),
+            ):
+                try:
+                    evidence[source] = (
+                        _build_shadow_candidate_prediction_record(
+                            preview,
+                            rolling=rolling,
+                        )
+                    )
+                except Exception:
+                    evidence[source] = None
+                    logger.exception(
+                        "[MARKET_BENCHMARK_PREPARE_ERROR] fixture_id=%s "
+                        "minute=%s source=%s action=continue_unavailable",
+                        fixture_id,
+                        minute,
+                        "rolling" if rolling else "static",
+                    )
+        else:
+            evidence.setdefault(
+                "observation_created_at_utc", preview.get("created_at_utc")
+            )
+        quote, quote_status = _latest_market_quote_for_observation(preview)
+        evidence.update(
+            {
+                "quote_frozen": True,
+                "quote": copy.deepcopy(quote),
+                "quote_status": quote_status,
+                "decision_created_at_utc": _utc_now_iso(),
+            }
+        )
+        return evidence
+    except Exception:
+        logger.exception(
+            "[MARKET_BENCHMARK_PREPARE_ERROR] fixture_id=%s minute=%s "
+            "source=outer action=continue_without_market "
+            "production_unchanged=true",
+            fixture_id,
+            minute,
+        )
+        now_utc = _utc_now_iso()
+        return {
+            "observation_created_at_utc": now_utc,
+            "decision_created_at_utc": now_utc,
+            "quote_frozen": True,
+            "quote": None,
+            "quote_status": "prepare_error",
+            "static_prediction": None,
+            "rolling_prediction": None,
+        }
+
+
+def persist_observation_and_score_shadow(
+    observation: Dict[str, Any],
+    *,
+    market_evidence: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Persist once and retry a missing shadow prediction on later replays."""
+    frozen = freeze_observation_rolling_dynamics(observation)
+    if ENABLE_WIDE_RESEARCH_RARE_PRECISION and "market_research" not in frozen:
+        frozen = {**frozen, "market_research": _market_research_quote_cache.freeze(frozen)}
+    observation_written = append_observation_history(frozen)
+    if (
+        observation_written
+        or observation_history_record_exists(frozen)
+    ):
+        register_observation_rolling_baseline(frozen)
+        predict_and_append_shadow_ml(frozen)
+        predict_and_append_shadow_rolling_ml(frozen)
+        capture_market_benchmark_decision(
+            frozen,
+            prepared_evidence=market_evidence,
+        )
+        evaluate_and_append_shadow_candidates(frozen)
+        if observation_written:
+            evaluate_and_store_wide_research(frozen)
+    return observation_written
+
+
+def persist_wide_monitor_snapshot(
+    *,
+    fixture_id: int,
+    minute: int,
+    fixture_metrics: Dict[str, Any],
+    probability_result: Dict[str, Any],
+) -> bool:
+    """Persist one deduplicated post-send row for the wide research universe."""
+
+    if (
+        not (
+            ENABLE_WIDE_RESEARCH
+            or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+            or ENABLE_WIDE_RESEARCH_PRECISION
+            or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+        )
+        or not ENABLE_OBSERVATION_HISTORY
+        or int(minute) < int(REGULAR_SIGNAL_MIN_MINUTE)
+        or int(minute) > int(REGULAR_SIGNAL_MAX_MINUTE)
+    ):
+        return False
+    try:
+        observation = build_wide_monitor_observation(
+            fixture_id=int(fixture_id),
+            minute=int(minute),
+            fixture_metrics=fixture_metrics,
+            probability_result=probability_result,
+        )
+        written = persist_observation_and_score_shadow(observation)
+        if written:
+            logger.info(
+                "[WIDE_RESEARCH_MONITOR] fixture_id=%s minute=%s "
+                "observation_id=%s shadow_only=true production_apply=%s",
+                fixture_id,
+                minute,
+                observation.get("observation_id"),
+                str(bool(WIDE_RESEARCH_PRODUCTION_APPLY)).lower(),
+            )
+        return bool(written)
+    except Exception:
+        logger.exception(
+            "[WIDE_RESEARCH_MONITOR_ERROR] fixture_id=%s minute=%s "
+            "production_unchanged=true",
+            fixture_id,
+            minute,
+        )
+        return False
+
+
+def _shadow_ml_daemon_wait_seconds(
+    *,
+    now_monotonic: Optional[float] = None,
+) -> float:
+    """Wake at the earliest no-op cooldown deadline without timer threads."""
+    wait_seconds = float(SHADOW_ML_RETRAIN_CHECK_SECONDS)
+    current_monotonic = (
+        time.monotonic() if now_monotonic is None else float(now_monotonic)
+    )
+    with _shadow_ml_schedule_lock:
+        deadlines = []
+        if ENABLE_SHADOW_ML and SHADOW_ML_AUTO_RETRAIN:
+            deadlines.append(
+                float(_shadow_ml_noop_scan_not_before_monotonic)
+            )
+        if (
+            ENABLE_SHADOW_ML_ROLLING_CHALLENGER
+            and SHADOW_ML_ROLLING_AUTO_RETRAIN
+        ):
+            deadlines.append(
+                float(_shadow_rolling_noop_scan_not_before_monotonic)
+            )
+    for deadline in deadlines:
+        if deadline <= 0.0:
+            continue
+        if deadline <= current_monotonic:
+            return 0.05
+        wait_seconds = min(wait_seconds, deadline - current_monotonic)
+    return max(0.05, wait_seconds)
+
+
+def shadow_ml_daemon() -> None:
+    logger.info(
+        "[SHADOW_ML_DAEMON] started auto_retrain=%s rolling_auto_retrain=%s production_apply=false",
+        SHADOW_ML_AUTO_RETRAIN,
+        SHADOW_ML_ROLLING_AUTO_RETRAIN,
+    )
+    if ENABLE_SHADOW_ML:
+        current_model = load_shadow_ml_model_cached(force=True)
+        if SHADOW_ML_AUTO_RETRAIN:
+            startup_result = train_shadow_ml_once(
+                force=not bool(current_model),
+                trigger="startup",
+            )
+            _update_shadow_ml_schedule_after_scan(startup_result)
+    if ENABLE_SHADOW_ML_ROLLING_CHALLENGER:
+        rolling_model = load_shadow_rolling_model_cached(force=True)
+        if SHADOW_ML_ROLLING_AUTO_RETRAIN:
+            rolling_startup_result = train_shadow_rolling_ml_once(
+                force=not bool(rolling_model),
+                trigger="startup",
+            )
+            _update_shadow_rolling_schedule_after_scan(
+                rolling_startup_result
+            )
+    while not _shadow_ml_stop.is_set():
+        signalled = _shadow_ml_retrain_event.wait(
+            _shadow_ml_daemon_wait_seconds()
+        )
+        _shadow_ml_retrain_event.clear()
+        if _shadow_ml_stop.is_set():
+            break
+        trigger = "outcome_event" if signalled else "scheduled"
+        if ENABLE_SHADOW_ML and SHADOW_ML_AUTO_RETRAIN:
+            process_shadow_ml_retrain_wakeup(trigger=trigger)
+        if (
+            ENABLE_SHADOW_ML_ROLLING_CHALLENGER
+            and SHADOW_ML_ROLLING_AUTO_RETRAIN
+        ):
+            process_shadow_rolling_retrain_wakeup(trigger=trigger)
+    logger.info("[SHADOW_ML_DAEMON] stopped")
+
+
+def start_shadow_ml_daemon() -> None:
+    global _shadow_ml_thread
+    if not (ENABLE_SHADOW_ML or ENABLE_SHADOW_ML_ROLLING_CHALLENGER):
+        logger.info("[SHADOW_ML_DAEMON] disabled")
+        return
+    any_auto_retrain = (
+        ENABLE_SHADOW_ML and SHADOW_ML_AUTO_RETRAIN
+    ) or (
+        ENABLE_SHADOW_ML_ROLLING_CHALLENGER
+        and SHADOW_ML_ROLLING_AUTO_RETRAIN
+    )
+    if not any_auto_retrain:
+        if ENABLE_SHADOW_ML:
+            load_shadow_ml_model_cached(force=True)
+        if ENABLE_SHADOW_ML_ROLLING_CHALLENGER:
+            load_shadow_rolling_model_cached(force=True)
+        logger.info(
+            "[SHADOW_ML_DAEMON] auto_retrain=false "
+            "rolling_auto_retrain=false model_load_only=true"
+        )
+        return
+    if _shadow_ml_thread and _shadow_ml_thread.is_alive():
+        return
+    _shadow_ml_stop.clear()
+    _shadow_ml_retrain_event.clear()
+    _shadow_ml_thread = threading.Thread(
+        target=shadow_ml_daemon,
+        name="shadow-ml-trainer",
+        daemon=True,
+    )
+    _shadow_ml_thread.start()
+
+
+def stop_shadow_ml_daemon(timeout: float = 5.0) -> None:
+    _shadow_ml_stop.set()
+    _shadow_ml_retrain_event.set()
+    with _shadow_ml_active_process_lock:
+        active_process = _shadow_ml_active_process
+    _terminate_subprocess(active_process, timeout=min(5.0, max(0.1, timeout)))
+    thread = _shadow_ml_thread
+    if thread and thread.is_alive():
+        thread.join(timeout=max(0.0, float(timeout)))
+
+
+@contextmanager
+def _wide_research_history_snapshot(*, include_market: bool = False):
+    """Create stable, isolated journal trees for the discovery subprocess."""
+
+    with tempfile.TemporaryDirectory(prefix="goalbot-wide-research-") as temporary:
+        result: Dict[str, str] = {}
+
+        def copy_journal(name: str, active_path: str, *, locked: bool) -> None:
+            destination_dir = os.path.join(temporary, name)
+            os.makedirs(destination_dir, mode=0o700, exist_ok=True)
+            destination_active = os.path.join(
+                destination_dir, os.path.basename(active_path)
+            )
+
+            def copy_sources() -> None:
+                for source in shadow_candidate_jsonl_paths(active_path):
+                    destination = os.path.join(
+                        destination_dir, os.path.basename(source)
+                    )
+                    # Keep snapshots independent from source inode metadata.
+                    # Hard links alter ctime when they are created/unlinked and
+                    # therefore invalidate journal-derived persistent indexes.
+                    shutil.copy2(source, destination)
+
+            if locked:
+                with _observation_history_lock, _observation_history_process_lock(
+                    active_path
+                ):
+                    copy_sources()
+            else:
+                copy_sources()
+            if not os.path.exists(destination_active):
+                open(destination_active, "a", encoding="utf-8").close()
+            result[name] = destination_active
+
+        copy_journal(
+            "observations",
+            os.path.abspath(OBSERVATION_HISTORY_FILE),
+            locked=True,
+        )
+        copy_journal(
+            "static",
+            os.path.abspath(SHADOW_ML_PREDICTIONS_FILE),
+            locked=False,
+        )
+        copy_journal(
+            "rolling",
+            os.path.abspath(SHADOW_ML_ROLLING_PREDICTIONS_FILE),
+            locked=False,
+        )
+        if include_market:
+            # Use the writer's own rotation/append lock for a stable journal
+            # copy; never run discovery against a moving live market file.
+            with _get_market_benchmark_journal()._exclusive():
+                copy_journal("market", os.path.abspath(MARKET_BENCHMARK_JOURNAL_FILE), locked=False)
+        yield result
+
+
+def _wide_research_worker_command(
+    snapshot: Mapping[str, str],
+    *,
+    four_factor: bool = False,
+    precision: bool = False,
+    rare_precision: bool = False,
+) -> List[str]:
+    if sum(bool(value) for value in (four_factor, precision, rare_precision)) > 1:
+        raise ValueError("wide research worker profile is ambiguous")
+    if rare_precision:
+        db_file = WIDE_RESEARCH_RARE_PRECISION_DB_FILE
+        active_manifest_file = (
+            WIDE_RESEARCH_RARE_PRECISION_ACTIVE_MANIFEST_FILE
+        )
+        discovery_file = WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE
+        output_dir = WIDE_RESEARCH_RARE_PRECISION_OUTPUT_DIR
+        prospective_start_utc = (
+            WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC
+        )
+        max_shadow_rules = WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES
+        max_db_bytes = WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES
+    elif precision:
+        db_file = WIDE_RESEARCH_PRECISION_DB_FILE
+        active_manifest_file = WIDE_RESEARCH_PRECISION_ACTIVE_MANIFEST_FILE
+        discovery_file = WIDE_RESEARCH_PRECISION_DISCOVERY_FILE
+        output_dir = WIDE_RESEARCH_PRECISION_OUTPUT_DIR
+        prospective_start_utc = WIDE_RESEARCH_PRECISION_PROSPECTIVE_START_UTC
+        max_shadow_rules = WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES
+        max_db_bytes = WIDE_RESEARCH_PRECISION_MAX_DB_BYTES
+    elif four_factor:
+        db_file = WIDE_RESEARCH_FOUR_FACTOR_DB_FILE
+        active_manifest_file = WIDE_RESEARCH_FOUR_FACTOR_ACTIVE_MANIFEST_FILE
+        discovery_file = WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_FILE
+        output_dir = WIDE_RESEARCH_FOUR_FACTOR_OUTPUT_DIR
+        prospective_start_utc = WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC
+        max_shadow_rules = WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES
+        max_db_bytes = WIDE_RESEARCH_FOUR_FACTOR_MAX_DB_BYTES
+    else:
+        db_file = WIDE_RESEARCH_DB_FILE
+        active_manifest_file = WIDE_RESEARCH_ACTIVE_MANIFEST_FILE
+        discovery_file = WIDE_RESEARCH_DISCOVERY_FILE
+        output_dir = WIDE_RESEARCH_OUTPUT_DIR
+        prospective_start_utc = WIDE_RESEARCH_PROSPECTIVE_START_UTC
+        max_shadow_rules = WIDE_RESEARCH_MAX_SHADOW_RULES
+        max_db_bytes = WIDE_RESEARCH_MAX_DB_BYTES
+    command = [
+        sys.executable,
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "scripts",
+            "run_wide_research_cycle.py",
+        ),
+        "--observations",
+        str(snapshot["observations"]),
+        "--static-predictions",
+        str(snapshot["static"]),
+        "--rolling-predictions",
+        str(snapshot["rolling"]),
+        "--db",
+        os.path.abspath(db_file),
+        "--active-manifest",
+        os.path.abspath(active_manifest_file),
+        "--latest-output",
+        os.path.abspath(discovery_file),
+        "--output-dir",
+        os.path.abspath(output_dir),
+        "--prospective-start-utc",
+        str(prospective_start_utc),
+        "--max-shadow-rules",
+        str(max_shadow_rules),
+        "--max-db-bytes",
+        str(max_db_bytes),
+        "--require-memory-limit",
+        "--store-profile",
+        (
+            "rare_precision_shadow"
+            if rare_precision
+            else "precision_shadow" if precision
+            else "exact_four_shadow" if four_factor else "primary"
+        ),
+    ]
+    if WIDE_RESEARCH_TEMPORAL_PURGE:
+        command.extend([
+            "--temporal-purge",
+            "--temporal-embargo-seconds",
+            str(WIDE_RESEARCH_TEMPORAL_EMBARGO_SECONDS),
+        ])
+    if rare_precision:
+        command.extend(
+            [
+                "--extended-features",
+                "--error-refinement",
+                "--shadow-only",
+                "--selection-mode",
+                "rare_precision",
+                "--min-conjunction-size",
+                "2",
+                "--max-conjunction-size",
+                str(WIDE_RESEARCH_RARE_PRECISION_MAX_CONJUNCTION_SIZE),
+                "--beam-width",
+                str(WIDE_RESEARCH_RARE_PRECISION_BEAM_WIDTH),
+                "--evaluation-budget",
+                str(WIDE_RESEARCH_RARE_PRECISION_EVALUATION_BUDGET),
+                "--depth-evaluation-budgets",
+                ",".join(
+                    str(value)
+                    for value in WIDE_RESEARCH_RARE_PRECISION_DEPTH_BUDGETS
+                ),
+                "--top-n",
+                str(WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_TOP_N),
+                "--min-train-support",
+                str(WIDE_RESEARCH_RARE_PRECISION_MIN_TRAIN_SUPPORT),
+                "--min-validation-support",
+                str(WIDE_RESEARCH_RARE_PRECISION_MIN_VALIDATION_SUPPORT),
+                "--min-holdout-support",
+                str(WIDE_RESEARCH_RARE_PRECISION_MIN_HOLDOUT_SUPPORT),
+                "--min-signals-per-week",
+                str(WIDE_RESEARCH_RARE_PRECISION_MIN_SIGNALS_PER_WEEK),
+                "--preferred-signals-per-week",
+                str(WIDE_RESEARCH_RARE_PRECISION_PREFERRED_SIGNALS_PER_WEEK),
+                "--max-signals-per-week",
+                str(WIDE_RESEARCH_RARE_PRECISION_MAX_SIGNALS_PER_WEEK),
+                "--portfolio-max-rules",
+                str(WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_MAX_RULES),
+                "--portfolio-beam-width",
+                str(WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_BEAM_WIDTH),
+                "--allow-feature-ranges",
+                "--validation-window-count",
+                str(WIDE_RESEARCH_RARE_PRECISION_VALIDATION_WINDOW_COUNT),
+            ]
+        )
+        if snapshot.get("market"):
+            command.extend(["--market-quotes", str(snapshot["market"])])
+    elif precision:
+        command.extend(
+            [
+                "--shadow-only",
+                "--selection-mode",
+                "precision_first",
+                "--min-conjunction-size",
+                "2",
+                "--max-conjunction-size",
+                str(WIDE_RESEARCH_PRECISION_MAX_CONJUNCTION_SIZE),
+                "--beam-width",
+                str(WIDE_RESEARCH_PRECISION_BEAM_WIDTH),
+                "--evaluation-budget",
+                str(WIDE_RESEARCH_PRECISION_EVALUATION_BUDGET),
+                "--depth-evaluation-budgets",
+                ",".join(
+                    str(value)
+                    for value in WIDE_RESEARCH_PRECISION_DEPTH_BUDGETS
+                ),
+                "--top-n",
+                str(WIDE_RESEARCH_PRECISION_DISCOVERY_TOP_N),
+                "--min-train-support",
+                str(WIDE_RESEARCH_PRECISION_MIN_TRAIN_SUPPORT),
+                "--min-validation-support",
+                str(WIDE_RESEARCH_PRECISION_MIN_VALIDATION_SUPPORT),
+                "--min-holdout-support",
+                str(WIDE_RESEARCH_PRECISION_MIN_HOLDOUT_SUPPORT),
+                "--min-signals-per-week",
+                str(WIDE_RESEARCH_PRECISION_MIN_SIGNALS_PER_WEEK),
+                "--preferred-signals-per-week",
+                str(WIDE_RESEARCH_PRECISION_PREFERRED_SIGNALS_PER_WEEK),
+                "--max-signals-per-week",
+                str(WIDE_RESEARCH_PRECISION_MAX_SIGNALS_PER_WEEK),
+                "--portfolio-max-rules",
+                str(WIDE_RESEARCH_PRECISION_PORTFOLIO_MAX_RULES),
+                "--portfolio-beam-width",
+                str(WIDE_RESEARCH_PRECISION_PORTFOLIO_BEAM_WIDTH),
+            ]
+        )
+    elif four_factor:
+        command.extend(
+            [
+                "--shadow-only",
+                "--min-conjunction-size",
+                "4",
+                "--max-conjunction-size",
+                "4",
+                "--beam-width",
+                str(WIDE_RESEARCH_FOUR_FACTOR_BEAM_WIDTH),
+                "--evaluation-budget",
+                str(WIDE_RESEARCH_FOUR_FACTOR_EVALUATION_BUDGET),
+                "--top-n",
+                str(WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES),
+                "--min-train-support",
+                str(WIDE_RESEARCH_FOUR_FACTOR_MIN_TRAIN_SUPPORT),
+                "--min-validation-support",
+                str(WIDE_RESEARCH_FOUR_FACTOR_MIN_VALIDATION_SUPPORT),
+                "--min-holdout-support",
+                str(WIDE_RESEARCH_FOUR_FACTOR_MIN_HOLDOUT_SUPPORT),
+            ]
+        )
+    elif WIDE_RESEARCH_PRODUCTION_APPLY:
+        command.append("--production-enabled")
+    return command
+
+
+def _run_wide_research_discovery_profile(
+    *,
+    trigger: str,
+    four_factor: bool,
+    precision: bool = False,
+    rare_precision: bool = False,
+) -> Dict[str, Any]:
+    """Run the memory-heavy search outside the long-lived bot process."""
+
+    global _wide_research_active_process
+    if sum(bool(value) for value in (four_factor, precision, rare_precision)) > 1:
+        raise ValueError("wide research discovery profile is ambiguous")
+    profile = (
+        "rare_precision"
+        if rare_precision
+        else "precision" if precision else "four_factor" if four_factor else "primary"
+    )
+    log_tag = (
+        "WIDE_RESEARCH_RARE_PRECISION"
+        if rare_precision
+        else "WIDE_RESEARCH_PRECISION" if precision
+        else "WIDE_RESEARCH_4F" if four_factor else "WIDE_RESEARCH"
+    )
+    result: Dict[str, Any] = {
+        "status": "skipped",
+        "trigger": str(trigger),
+        "isolated_process": True,
+        "profile": profile,
+    }
+    enabled = bool(
+        ENABLE_WIDE_RESEARCH_RARE_PRECISION
+        and WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY
+        if rare_precision
+        else (
+            ENABLE_WIDE_RESEARCH_PRECISION
+            and WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY
+            if precision
+            else (
+                ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+                and WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY
+                if four_factor
+                else ENABLE_WIDE_RESEARCH and WIDE_RESEARCH_AUTO_DISCOVERY
+            )
+        )
+    )
+    if not enabled:
+        result["reason"] = "disabled"
+        return result
+    try:
+        _assert_wide_research_runtime_paths()
+    except Exception:
+        result.update({"status": "error", "reason": "unsafe_output_paths"})
+        logger.exception(
+            "[%s_WORKER_ERROR] trigger=%s reason=unsafe_output_paths "
+            "worker_started=false production_unchanged=true",
+            log_tag,
+            trigger,
+        )
+        return result
+    try:
+        layer = (
+            _get_wide_research_rare_precision_layer()
+            if rare_precision
+            else _get_wide_research_precision_layer()
+            if precision
+            else _get_wide_research_four_factor_layer()
+            if four_factor
+            else _get_wide_research_layer()
+        )
+        if not _wide_research_retry_gate(layer, log_tag=log_tag):
+            result["reason"] = "durable_retries_pending"
+            return result
+    except Exception:
+        result.update({"status": "error", "reason": "retry_gate_unavailable"})
+        logger.exception(
+            "[%s_RETRY_GATE_ERROR] production_unchanged=true", log_tag
+        )
+        return result
+    process: Optional[subprocess.Popen[str]] = None
+    worker_slot_acquired = False
+    try:
+        # Startup ML scans can run slightly longer than one minute.  Give the
+        _research_health_note("note_discovery", profile)
+        # discovery worker two minutes to inherit the shared heavy-worker slot
+        # instead of deferring an otherwise due run until the next interval.
+        for _attempt in range(120):
+            worker_slot_acquired = _model_worker_slot.acquire(timeout=1.0)
+            if worker_slot_acquired or _wide_research_stop.is_set():
+                break
+        if not worker_slot_acquired:
+            result.update({"status": "error", "reason": "heavy_worker_busy"})
+            return result
+        with _wide_research_history_snapshot(include_market=rare_precision) as snapshot:
+            worker_environment = os.environ.copy()
+            worker_environment["GOALBOT_LIBRARY_MODE"] = "1"
+            worker_environment[
+                "GOALBOT_WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB"
+            ] = str(WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB)
+            with _wide_research_active_process_lock:
+                if _wide_research_stop.is_set():
+                    result.update({"status": "error", "reason": "worker_stopping"})
+                    return result
+                process = subprocess.Popen(
+                    _wide_research_worker_command(
+                        snapshot,
+                        four_factor=four_factor,
+                        precision=precision,
+                        rare_precision=rare_precision,
+                    ),
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    env=worker_environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                _wide_research_active_process = process
+            logger.info(
+                "[%s_WORKER_START] trigger=%s pid=%s memory_limit_mb=%s "
+                "timeout_seconds=%s",
+                log_tag,
+                trigger,
+                process.pid,
+                WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB,
+                WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS,
+            )
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=float(WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS)
+                )
+            except subprocess.TimeoutExpired:
+                _terminate_subprocess(process)
+                result.update({"status": "error", "reason": "worker_timeout"})
+                logger.error(
+                    "[%s_WORKER_ERROR] trigger=%s reason=timeout "
+                    "timeout_seconds=%s production_unchanged=true",
+                    log_tag,
+                    trigger,
+                    WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS,
+                )
+                return result
+        if process.returncode != 0:
+            result.update(
+                {
+                    "status": "error",
+                    "reason": "worker_exit",
+                    "worker_returncode": int(process.returncode),
+                }
+            )
+            logger.error(
+                "[%s_WORKER_ERROR] trigger=%s reason=exit "
+                "returncode=%s stderr=%s production_unchanged=true",
+                log_tag,
+                trigger,
+                process.returncode,
+                (stderr or "")[-2000:],
+            )
+            return result
+        try:
+            payload = json.loads(stdout)
+        except (TypeError, ValueError):
+            result.update({"status": "error", "reason": "worker_invalid_json"})
+            logger.error(
+                "[%s_WORKER_ERROR] trigger=%s reason=invalid_json "
+                "stdout_tail=%s production_unchanged=true",
+                log_tag,
+                trigger,
+                (stdout or "")[-2000:],
+            )
+            return result
+        if not isinstance(payload, dict):
+            result.update({"status": "error", "reason": "worker_invalid_payload"})
+            return result
+        if four_factor and not _wide_research_four_factor_summary_is_current(
+            payload
+        ):
+            result.update(
+                {"status": "error", "reason": "worker_profile_mismatch"}
+            )
+            logger.error(
+                "[%s_WORKER_ERROR] trigger=%s reason=profile_mismatch "
+                "production_unchanged=true",
+                log_tag,
+                trigger,
+            )
+            return result
+        if precision and not _wide_research_precision_summary_is_current(
+            payload
+        ):
+            result.update(
+                {"status": "error", "reason": "worker_profile_mismatch"}
+            )
+            logger.error(
+                "[%s_WORKER_ERROR] trigger=%s reason=profile_mismatch "
+                "production_unchanged=true",
+                log_tag,
+                trigger,
+            )
+            return result
+        if (
+            rare_precision
+            and not _wide_research_rare_precision_summary_is_current(payload)
+        ):
+            result.update(
+                {"status": "error", "reason": "worker_profile_mismatch"}
+            )
+            logger.error(
+                "[%s_WORKER_ERROR] trigger=%s reason=profile_mismatch "
+                "production_unchanged=true",
+                log_tag,
+                trigger,
+            )
+            return result
+        if not any((four_factor, precision, rare_precision)) and not (
+            _wide_research_primary_summary_is_current(payload)
+        ):
+            result.update(
+                {"status": "error", "reason": "worker_profile_mismatch"}
+            )
+            logger.error(
+                "[%s_WORKER_ERROR] trigger=%s reason=profile_mismatch "
+                "production_unchanged=true",
+                log_tag,
+                trigger,
+            )
+            return result
+        result.update(
+            {
+                "status": "completed",
+                "reason": None,
+                "run_id": payload.get("run_id"),
+                "eligible_fixtures": payload.get("eligible_fixtures"),
+                "candidate_count": payload.get("candidate_count"),
+                "registry": payload.get("registry"),
+                "store": payload.get("store"),
+            }
+        )
+        try:
+            if rare_precision:
+                _get_wide_research_rare_precision_layer().invalidate()
+            elif precision:
+                _get_wide_research_precision_layer().invalidate()
+            elif four_factor:
+                _get_wide_research_four_factor_layer().invalidate()
+            else:
+                _get_wide_research_layer().invalidate()
+        except Exception:
+            logger.exception(
+                "[%s_CACHE_ERROR] action=invalidate "
+                "production_unchanged=true",
+                log_tag,
+            )
+        logger.info(
+            "[%s_WORKER] trigger=%s status=completed run_id=%s "
+            "eligible_fixtures=%s candidates=%s isolated_process=true",
+            log_tag,
+            trigger,
+            result.get("run_id"),
+            result.get("eligible_fixtures"),
+            result.get("candidate_count"),
+        )
+        return result
+    except Exception:
+        result.update({"status": "error", "reason": "worker_exception"})
+        logger.exception(
+            "[%s_WORKER_ERROR] trigger=%s reason=exception "
+            "production_unchanged=true",
+            log_tag,
+            trigger,
+        )
+        return result
+    finally:
+        _terminate_subprocess(process)
+        with _wide_research_active_process_lock:
+            if _wide_research_active_process is process:
+                _wide_research_active_process = None
+        if worker_slot_acquired:
+            _model_worker_slot.release()
+        _research_health_note("note_discovery", profile, result)
+        gc.collect()
+
+
+def run_wide_research_discovery_once(
+    *, trigger: str = "scheduled"
+) -> Dict[str, Any]:
+    return _run_wide_research_discovery_profile(
+        trigger=trigger,
+        four_factor=False,
+        precision=False,
+        rare_precision=False,
+    )
+
+
+def run_wide_research_four_factor_discovery_once(
+    *, trigger: str = "scheduled"
+) -> Dict[str, Any]:
+    return _run_wide_research_discovery_profile(
+        trigger=trigger,
+        four_factor=True,
+        precision=False,
+        rare_precision=False,
+    )
+
+
+def run_wide_research_precision_discovery_once(
+    *, trigger: str = "scheduled"
+) -> Dict[str, Any]:
+    return _run_wide_research_discovery_profile(
+        trigger=trigger,
+        four_factor=False,
+        precision=True,
+        rare_precision=False,
+    )
+
+
+def run_wide_research_rare_precision_discovery_once(
+    *, trigger: str = "scheduled"
+) -> Dict[str, Any]:
+    return _run_wide_research_discovery_profile(
+        trigger=trigger,
+        four_factor=False,
+        precision=False,
+        rare_precision=True,
+    )
+
+
+def _wide_research_temporal_summary_is_current(
+    payload: Mapping[str, Any], engine_version: str,
+) -> bool:
+    search_config = payload.get("search_config")
+    if not isinstance(search_config, Mapping):
+        return False
+    if not WIDE_RESEARCH_TEMPORAL_PURGE:
+        return bool(
+            payload.get("discovery_engine_version") == engine_version
+            and search_config.get("temporal_purge") is False
+            and payload.get("split_policy") == "chronological_fixture_group_v1"
+        )
+    try:
+        splits = payload.get("splits")
+        if not isinstance(splits, Mapping):
+            return False
+        split_times: Dict[str, Tuple[datetime, datetime]] = {}
+        split_counts: Dict[str, int] = {}
+        for split_name in ("train", "validation", "holdout"):
+            details = splits.get(split_name)
+            if not isinstance(details, Mapping):
+                return False
+            fixture_count = int(details.get("fixture_count"))
+            observation_count = int(details.get("observation_count"))
+            first = _parse_iso_utc(details.get("first_observation_utc"))
+            last = _parse_iso_utc(details.get("last_observation_utc"))
+            fixture_digest = str(details.get("fixture_ids_sha256") or "")
+            if (
+                fixture_count <= 0
+                or observation_count < fixture_count
+                or first is None
+                or last is None
+                or first > last
+                or len(fixture_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in fixture_digest.lower()
+                )
+            ):
+                return False
+            split_counts[split_name] = fixture_count
+            split_times[split_name] = (first, last)
+        purge = splits.get("temporal_purge")
+        if not isinstance(purge, Mapping):
+            return False
+        boundaries = purge.get("boundaries")
+        if not isinstance(boundaries, Mapping) or set(boundaries) != {
+            "train_to_validation",
+            "validation_to_holdout",
+        }:
+            return False
+        embargo_seconds = float(WIDE_RESEARCH_TEMPORAL_EMBARGO_SECONDS)
+        for boundary_name, earlier, later in (
+            ("train_to_validation", "train", "validation"),
+            ("validation_to_holdout", "validation", "holdout"),
+        ):
+            boundary = boundaries.get(boundary_name)
+            if not isinstance(boundary, Mapping):
+                return False
+            next_observation = _parse_iso_utc(
+                boundary.get("next_split_first_observation_utc")
+            )
+            cutoff = _parse_iso_utc(boundary.get("information_cutoff_utc"))
+            nominal = int(boundary.get("nominal_fixture_count"))
+            retained = int(boundary.get("retained_fixture_count"))
+            purged = int(boundary.get("purged_fixture_count"))
+            reasons = boundary.get("purge_reasons")
+            digest = str(boundary.get("purged_fixture_ids_sha256") or "")
+            if (
+                next_observation is None
+                or cutoff is None
+                or abs(
+                    (next_observation - cutoff).total_seconds()
+                    - embargo_seconds
+                ) > 1e-6
+                or nominal < 0
+                or retained < 0
+                or purged < 0
+                or nominal != retained + purged
+                or retained != split_counts[earlier]
+                or next_observation > split_times[later][0]
+                or split_times[earlier][1] >= cutoff
+                or not isinstance(reasons, Mapping)
+                or any(
+                    not isinstance(key, str)
+                    or type(value) is not int
+                    or value < 0
+                    for key, value in reasons.items()
+                )
+                or sum(reasons.values()) != purged
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest.lower()
+                )
+            ):
+                return False
+        return bool(
+            payload.get("discovery_engine_version")
+            == engine_version + WIDE_RESEARCH_PURGED_ENGINE_SUFFIX
+            and payload.get("split_policy") == WIDE_RESEARCH_PURGED_SPLIT_POLICY
+            and search_config.get("temporal_purge") is True
+            and float(search_config.get("temporal_embargo_seconds"))
+            == embargo_seconds
+            and purge.get("version") == WIDE_RESEARCH_TEMPORAL_PURGE_VERSION
+            and purge.get("no_fixture_reallocation") is True
+            and float(purge.get("embargo_seconds")) == embargo_seconds
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _wide_research_four_factor_summary_is_current(
+    payload: Mapping[str, Any],
+) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    search_config = payload.get("search_config")
+    if not isinstance(search_config, Mapping):
+        return False
+    try:
+        requested_memory_mb = int(
+            payload.get("worker_memory_limit_requested_mb") or 0
+        )
+        applied_memory_mb = int(payload.get("worker_memory_limit_mb") or 0)
+        return bool(
+            payload.get("cycle_type") == "discovery"
+            and payload.get("store_profile") == "exact_four_shadow"
+            and payload.get("shadow_only") is True
+            and payload.get("production_enabled") is False
+            and _wide_research_temporal_summary_is_current(
+                payload, WIDE_RESEARCH_DISCOVERY_ENGINE_VERSION
+            )
+            and int(payload.get("feature_schema_version"))
+            == WIDE_RESEARCH_FEATURE_SCHEMA_VERSION
+            and payload.get("threshold_grid_version")
+            == WIDE_RESEARCH_ATOMIC_GRID_VERSION
+            and search_config.get("selection_mode") == "standard"
+            and search_config.get("extended_features") is False
+            and search_config.get("error_refinement") is False
+            and tuple(search_config.get("depth_evaluation_budgets", ())) == ()
+            and float(search_config.get("min_signals_per_week")) == 0.0
+            and float(search_config.get("preferred_signals_per_week")) == 0.0
+            and float(search_config.get("max_signals_per_week")) == 0.0
+            and int(search_config.get("portfolio_max_rules")) == 1
+            and int(search_config.get("portfolio_beam_width")) == 32
+            and search_config.get("allow_feature_ranges") is False
+            and int(search_config.get("validation_window_count")) == 1
+            and int(search_config.get("min_conjunction_size")) == 4
+            and int(search_config.get("max_conjunction_size")) == 4
+            and int(search_config.get("beam_width"))
+            == WIDE_RESEARCH_FOUR_FACTOR_BEAM_WIDTH
+            and int(search_config.get("evaluation_budget"))
+            == WIDE_RESEARCH_FOUR_FACTOR_EVALUATION_BUDGET
+            and int(search_config.get("top_n"))
+            == WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES
+            and int(search_config.get("min_train_support"))
+            == WIDE_RESEARCH_FOUR_FACTOR_MIN_TRAIN_SUPPORT
+            and int(search_config.get("min_validation_support"))
+            == WIDE_RESEARCH_FOUR_FACTOR_MIN_VALIDATION_SUPPORT
+            and int(search_config.get("min_holdout_support"))
+            == WIDE_RESEARCH_FOUR_FACTOR_MIN_HOLDOUT_SUPPORT
+            and str(payload.get("prospective_start_utc") or "")
+            == str(WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC)
+            and requested_memory_mb == WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB
+            and 0 < applied_memory_mb <= requested_memory_mb
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _wide_research_primary_summary_is_current(
+    payload: Mapping[str, Any],
+) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    search_config = payload.get("search_config")
+    if not isinstance(search_config, Mapping):
+        return False
+    try:
+        requested_memory_mb = int(
+            payload.get("worker_memory_limit_requested_mb") or 0
+        )
+        applied_memory_mb = int(payload.get("worker_memory_limit_mb") or 0)
+        return bool(
+            payload.get("cycle_type") == "discovery"
+            and payload.get("store_profile") == "primary"
+            and payload.get("shadow_only") is False
+            and bool(payload.get("production_enabled"))
+            == bool(WIDE_RESEARCH_PRODUCTION_APPLY)
+            and _wide_research_temporal_summary_is_current(
+                payload, WIDE_RESEARCH_DISCOVERY_ENGINE_VERSION
+            )
+            and int(payload.get("feature_schema_version"))
+            == WIDE_RESEARCH_FEATURE_SCHEMA_VERSION
+            and payload.get("threshold_grid_version")
+            == WIDE_RESEARCH_ATOMIC_GRID_VERSION
+            and search_config.get("selection_mode") == "standard"
+            and search_config.get("extended_features") is False
+            and search_config.get("error_refinement") is False
+            and int(search_config.get("min_conjunction_size")) == 1
+            and int(search_config.get("max_conjunction_size")) == 3
+            and int(search_config.get("beam_width")) == 64
+            and int(search_config.get("evaluation_budget")) == 12000
+            and tuple(search_config.get("depth_evaluation_budgets", ())) == ()
+            and int(search_config.get("top_n")) == 10
+            and int(search_config.get("min_train_support")) == 40
+            and int(search_config.get("min_validation_support")) == 15
+            and int(search_config.get("min_holdout_support")) == 15
+            and float(search_config.get("min_signals_per_week")) == 0.0
+            and float(search_config.get("preferred_signals_per_week")) == 0.0
+            and float(search_config.get("max_signals_per_week")) == 0.0
+            and int(search_config.get("portfolio_max_rules")) == 1
+            and int(search_config.get("portfolio_beam_width")) == 32
+            and search_config.get("allow_feature_ranges") is False
+            and int(search_config.get("validation_window_count")) == 1
+            and str(payload.get("prospective_start_utc") or "")
+            == str(WIDE_RESEARCH_PROSPECTIVE_START_UTC)
+            and requested_memory_mb == WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB
+            and 0 < applied_memory_mb <= requested_memory_mb
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _wide_research_precision_summary_is_current(
+    payload: Mapping[str, Any],
+) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    search_config = payload.get("search_config")
+    if not isinstance(search_config, Mapping):
+        return False
+    try:
+        requested_memory_mb = int(
+            payload.get("worker_memory_limit_requested_mb") or 0
+        )
+        applied_memory_mb = int(payload.get("worker_memory_limit_mb") or 0)
+        return bool(
+            payload.get("cycle_type") == "discovery"
+            and payload.get("store_profile") == "precision_shadow"
+            and payload.get("shadow_only") is True
+            and payload.get("production_enabled") is False
+            and _wide_research_temporal_summary_is_current(
+                payload, WIDE_RESEARCH_DISCOVERY_ENGINE_VERSION
+            )
+            and int(payload.get("feature_schema_version"))
+            == WIDE_RESEARCH_FEATURE_SCHEMA_VERSION
+            and payload.get("threshold_grid_version")
+            == WIDE_RESEARCH_ATOMIC_GRID_VERSION
+            and search_config.get("selection_mode") == "precision_first"
+            and search_config.get("extended_features") is False
+            and search_config.get("error_refinement") is False
+            and search_config.get("allow_feature_ranges") is False
+            and int(search_config.get("validation_window_count")) == 1
+            and int(search_config.get("min_conjunction_size")) == 2
+            and int(search_config.get("max_conjunction_size"))
+            == WIDE_RESEARCH_PRECISION_MAX_CONJUNCTION_SIZE
+            and int(search_config.get("beam_width"))
+            == WIDE_RESEARCH_PRECISION_BEAM_WIDTH
+            and int(search_config.get("evaluation_budget"))
+            == WIDE_RESEARCH_PRECISION_EVALUATION_BUDGET
+            and tuple(
+                int(value)
+                for value in search_config.get(
+                    "depth_evaluation_budgets", []
+                )
+            )
+            == tuple(WIDE_RESEARCH_PRECISION_DEPTH_BUDGETS)
+            and int(search_config.get("top_n"))
+            == WIDE_RESEARCH_PRECISION_DISCOVERY_TOP_N
+            and int(search_config.get("min_train_support"))
+            == WIDE_RESEARCH_PRECISION_MIN_TRAIN_SUPPORT
+            and int(search_config.get("min_validation_support"))
+            == WIDE_RESEARCH_PRECISION_MIN_VALIDATION_SUPPORT
+            and int(search_config.get("min_holdout_support"))
+            == WIDE_RESEARCH_PRECISION_MIN_HOLDOUT_SUPPORT
+            and float(search_config.get("min_signals_per_week"))
+            == WIDE_RESEARCH_PRECISION_MIN_SIGNALS_PER_WEEK
+            and float(search_config.get("preferred_signals_per_week"))
+            == WIDE_RESEARCH_PRECISION_PREFERRED_SIGNALS_PER_WEEK
+            and float(search_config.get("max_signals_per_week"))
+            == WIDE_RESEARCH_PRECISION_MAX_SIGNALS_PER_WEEK
+            and int(search_config.get("portfolio_max_rules"))
+            == WIDE_RESEARCH_PRECISION_PORTFOLIO_MAX_RULES
+            and int(search_config.get("portfolio_beam_width"))
+            == WIDE_RESEARCH_PRECISION_PORTFOLIO_BEAM_WIDTH
+            and str(payload.get("prospective_start_utc") or "")
+            == str(WIDE_RESEARCH_PRECISION_PROSPECTIVE_START_UTC)
+            and requested_memory_mb == WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB
+            and 0 < applied_memory_mb <= requested_memory_mb
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _wide_research_rare_precision_summary_is_current(
+    payload: Mapping[str, Any],
+) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    search_config = payload.get("search_config")
+    if not isinstance(search_config, Mapping):
+        return False
+    profile_contract = payload.get("profile_contract")
+    if not isinstance(profile_contract, Mapping):
+        return False
+    lifecycle_policy = profile_contract.get("lifecycle_policy")
+    terminal_review = profile_contract.get("terminal_review")
+    if not isinstance(lifecycle_policy, Mapping) or not isinstance(
+        terminal_review, Mapping
+    ):
+        return False
+    expected_lifecycle_policy = (
+        WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.manifest()
+    )
+    expected_lifecycle_policy["allowed_looks"] = list(
+        WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.allowed_looks
+    )
+    try:
+        requested_memory_mb = int(
+            payload.get("worker_memory_limit_requested_mb") or 0
+        )
+        applied_memory_mb = int(payload.get("worker_memory_limit_mb") or 0)
+        return bool(
+            payload.get("cycle_type") == "discovery"
+            and payload.get("store_profile") == "rare_precision_shadow"
+            and payload.get("shadow_only") is True
+            and payload.get("production_enabled") is False
+            and _wide_research_temporal_summary_is_current(
+                payload, WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_ENGINE_VERSION
+            )
+            and int(payload.get("feature_schema_version"))
+            == WIDE_RESEARCH_FEATURE_SCHEMA_VERSION
+            and payload.get("threshold_grid_version")
+            == WIDE_RESEARCH_RARE_PRECISION_ATOMIC_GRID_VERSION
+            and search_config.get("selection_mode") == "rare_precision"
+            and search_config.get("extended_features") is True
+            and search_config.get("error_refinement") is True
+            and int(search_config.get("min_conjunction_size")) == 2
+            and int(search_config.get("max_conjunction_size"))
+            == WIDE_RESEARCH_RARE_PRECISION_MAX_CONJUNCTION_SIZE
+            and int(search_config.get("beam_width"))
+            == WIDE_RESEARCH_RARE_PRECISION_BEAM_WIDTH
+            and int(search_config.get("evaluation_budget"))
+            == WIDE_RESEARCH_RARE_PRECISION_EVALUATION_BUDGET
+            and tuple(
+                int(value)
+                for value in search_config.get(
+                    "depth_evaluation_budgets", []
+                )
+            )
+            == tuple(WIDE_RESEARCH_RARE_PRECISION_DEPTH_BUDGETS)
+            and int(search_config.get("top_n"))
+            == WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_TOP_N
+            and int(search_config.get("min_train_support"))
+            == WIDE_RESEARCH_RARE_PRECISION_MIN_TRAIN_SUPPORT
+            and int(search_config.get("min_validation_support"))
+            == WIDE_RESEARCH_RARE_PRECISION_MIN_VALIDATION_SUPPORT
+            and int(search_config.get("min_holdout_support"))
+            == WIDE_RESEARCH_RARE_PRECISION_MIN_HOLDOUT_SUPPORT
+            and float(search_config.get("min_signals_per_week")) == 0.0
+            and float(search_config.get("preferred_signals_per_week")) == 0.0
+            and float(search_config.get("max_signals_per_week")) == 0.0
+            and int(search_config.get("portfolio_max_rules"))
+            == WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_MAX_RULES
+            and int(search_config.get("portfolio_beam_width"))
+            == WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_BEAM_WIDTH
+            and search_config.get("allow_feature_ranges") is True
+            and int(search_config.get("validation_window_count"))
+            == WIDE_RESEARCH_RARE_PRECISION_VALIDATION_WINDOW_COUNT
+            and int(profile_contract.get("max_shadow_rules"))
+            == WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES
+            and dict(lifecycle_policy) == expected_lifecycle_policy
+            and terminal_review.get("enabled") is True
+            and int(terminal_review.get("final_look")) == 200
+            and float(terminal_review.get("min_point_hit_rate")) == 0.90
+            and str(payload.get("prospective_start_utc") or "")
+            == str(WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC)
+            and requested_memory_mb == WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB
+            and 0 < applied_memory_mb <= requested_memory_mb
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _wide_research_initial_discovery_delay_seconds(
+    *,
+    discovery_file: Optional[str] = None,
+    interval_seconds: Optional[int] = None,
+    require_four_factor_profile: bool = False,
+    require_precision_profile: bool = False,
+    require_rare_precision_profile: bool = False,
+) -> float:
+    """Reuse a recent successful cycle across ordinary service restarts."""
+
+    effective_file = discovery_file or WIDE_RESEARCH_DISCOVERY_FILE
+    effective_interval = (
+        WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS
+        if interval_seconds is None
+        else max(1, int(interval_seconds))
+    )
+    try:
+        with open(effective_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("cycle_type") != "discovery"
+            or not payload.get("run_id")
+            or not isinstance(payload.get("registry"), dict)
+        ):
+            return 0.0
+        if not (
+            require_four_factor_profile
+            or require_precision_profile
+            or require_rare_precision_profile
+        ):
+            if not _wide_research_primary_summary_is_current(payload):
+                return 0.0
+        if require_four_factor_profile and not (
+            _wide_research_four_factor_summary_is_current(payload)
+        ):
+            return 0.0
+        if require_precision_profile and not (
+            _wide_research_precision_summary_is_current(payload)
+        ):
+            return 0.0
+        if require_rare_precision_profile and not (
+            _wide_research_rare_precision_summary_is_current(payload)
+        ):
+            return 0.0
+        completed = _parse_iso_utc(payload.get("completed_at_utc"))
+        if completed is None:
+            return 0.0
+        age = (datetime.now(timezone.utc) - completed).total_seconds()
+        if age < 0.0 or age >= float(effective_interval):
+            return 0.0
+        return max(0.0, float(effective_interval) - age)
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+def _wide_research_discovery_next_delay(
+    result: Mapping[str, Any],
+    *,
+    success_interval_seconds: int,
+    consecutive_failures: int,
+) -> Tuple[float, int]:
+    """Back off deterministic worker failures without starving ML workers."""
+
+    if result.get("status") == "completed":
+        return float(success_interval_seconds), 0
+    if result.get("reason") in {
+        "heavy_worker_busy",
+        "durable_retries_pending",
+    }:
+        return float(WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS), int(
+            consecutive_failures
+        )
+    failures = max(0, int(consecutive_failures)) + 1
+    retry_ladder = (3600.0, 21600.0, 86400.0)
+    return retry_ladder[min(failures - 1, len(retry_ladder) - 1)], failures
+
+
+def wide_research_daemon() -> None:
+    logger.info(
+        "[WIDE_RESEARCH_DAEMON] started primary_enabled=%s "
+        "auto_discovery=%s auto_lifecycle=%s production_apply=%s "
+        "four_factor_enabled=%s four_factor_auto_discovery=%s "
+        "four_factor_hard_shadow_only=true precision_enabled=%s "
+        "precision_auto_discovery=%s precision_auto_lifecycle=%s "
+        "precision_hard_shadow_only=true rare_precision_enabled=%s "
+        "rare_precision_auto_discovery=%s "
+        "rare_precision_auto_lifecycle=%s "
+        "rare_precision_hard_shadow_only=true",
+        ENABLE_WIDE_RESEARCH,
+        WIDE_RESEARCH_AUTO_DISCOVERY,
+        WIDE_RESEARCH_AUTO_LIFECYCLE,
+        WIDE_RESEARCH_PRODUCTION_APPLY,
+        ENABLE_WIDE_RESEARCH_FOUR_FACTOR,
+        WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY,
+        ENABLE_WIDE_RESEARCH_PRECISION,
+        WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY,
+        WIDE_RESEARCH_PRECISION_AUTO_LIFECYCLE,
+        ENABLE_WIDE_RESEARCH_RARE_PRECISION,
+        WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY,
+        WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE,
+    )
+    initial_delay_primary = (
+        _wide_research_initial_discovery_delay_seconds()
+        if ENABLE_WIDE_RESEARCH and WIDE_RESEARCH_AUTO_DISCOVERY
+        else 0.0
+    )
+    initial_delay_4f = (
+        _wide_research_initial_discovery_delay_seconds(
+            discovery_file=WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_FILE,
+            interval_seconds=(
+                WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS
+            ),
+            require_four_factor_profile=True,
+        )
+        if ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+        and WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY
+        else 0.0
+    )
+    initial_delay_precision = (
+        _wide_research_initial_discovery_delay_seconds(
+            discovery_file=WIDE_RESEARCH_PRECISION_DISCOVERY_FILE,
+            interval_seconds=(
+                WIDE_RESEARCH_PRECISION_DISCOVERY_INTERVAL_SECONDS
+            ),
+            require_precision_profile=True,
+        )
+        if ENABLE_WIDE_RESEARCH_PRECISION
+        and WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY
+        else 0.0
+    )
+    initial_delay_rare_precision = (
+        _wide_research_initial_discovery_delay_seconds(
+            discovery_file=WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE,
+            interval_seconds=(
+                WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_INTERVAL_SECONDS
+            ),
+            require_rare_precision_profile=True,
+        )
+        if ENABLE_WIDE_RESEARCH_RARE_PRECISION
+        and WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY
+        else 0.0
+    )
+    next_discovery_primary = time.monotonic() + initial_delay_primary
+    next_discovery_4f = time.monotonic() + initial_delay_4f
+    next_discovery_precision = time.monotonic() + initial_delay_precision
+    next_discovery_rare_precision = (
+        time.monotonic() + initial_delay_rare_precision
+    )
+    primary_first_run = True
+    four_factor_first_run = True
+    precision_first_run = True
+    rare_precision_first_run = True
+    primary_discovery_failures = 0
+    four_factor_discovery_failures = 0
+    precision_discovery_failures = 0
+    rare_precision_discovery_failures = 0
+    if initial_delay_primary > 0.0:
+        logger.info(
+            "[WIDE_RESEARCH_DAEMON] recent_discovery_reused=true "
+            "next_discovery_seconds=%.1f",
+            initial_delay_primary,
+        )
+    if initial_delay_4f > 0.0:
+        logger.info(
+            "[WIDE_RESEARCH_4F_DAEMON] recent_discovery_reused=true "
+            "next_discovery_seconds=%.1f shadow_only=true",
+            initial_delay_4f,
+        )
+    if initial_delay_precision > 0.0:
+        logger.info(
+            "[WIDE_RESEARCH_PRECISION_DAEMON] "
+            "recent_discovery_reused=true next_discovery_seconds=%.1f "
+            "shadow_only=true",
+            initial_delay_precision,
+        )
+    if initial_delay_rare_precision > 0.0:
+        logger.info(
+            "[WIDE_RESEARCH_RARE_PRECISION_DAEMON] "
+            "recent_discovery_reused=true next_discovery_seconds=%.1f "
+            "shadow_only=true",
+            initial_delay_rare_precision,
+        )
+    primary_controller: Optional[WideResearchController] = None
+    precision_controller: Optional[WideResearchController] = None
+    rare_precision_controller: Optional[WideResearchController] = None
+    try:
+        if ENABLE_WIDE_RESEARCH:
+            try:
+                store, _layer, primary_controller, _router = (
+                    _get_wide_research_components()
+                )
+                recovery = store.recover()
+                logger.info("[WIDE_RESEARCH_RECOVERY] %s", recovery)
+                if WIDE_RESEARCH_AUTO_LIFECYCLE and _wide_research_retry_gate(
+                    _layer, log_tag="WIDE_RESEARCH"
+                ):
+                    primary_controller.reconcile()
+            except Exception:
+                primary_controller = None
+                logger.exception(
+                    "[WIDE_RESEARCH_RECOVERY_ERROR] "
+                    "production_unchanged=true"
+                )
+        if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+            try:
+                store_4f, _layer_4f, _controller_4f = (
+                    _get_wide_research_four_factor_components()
+                )
+                recovery_4f = store_4f.recover()
+                logger.info(
+                    "[WIDE_RESEARCH_4F_RECOVERY] %s shadow_only=true",
+                    recovery_4f,
+                )
+            except Exception:
+                logger.exception(
+                    "[WIDE_RESEARCH_4F_RECOVERY_ERROR] "
+                    "shadow_only=true production_unchanged=true"
+                )
+        if ENABLE_WIDE_RESEARCH_PRECISION:
+            try:
+                store_precision, _layer_precision, precision_controller = (
+                    _get_wide_research_precision_components()
+                )
+                recovery_precision = store_precision.recover()
+                logger.info(
+                    "[WIDE_RESEARCH_PRECISION_RECOVERY] %s "
+                    "shadow_only=true",
+                    recovery_precision,
+                )
+                if (
+                    WIDE_RESEARCH_PRECISION_AUTO_LIFECYCLE
+                    and _wide_research_retry_gate(
+                        _layer_precision,
+                        log_tag="WIDE_RESEARCH_PRECISION",
+                    )
+                ):
+                    lifecycle_precision = precision_controller.reconcile()
+                    logger.info(
+                        "[WIDE_RESEARCH_PRECISION_LIFECYCLE] "
+                        "reviewed=%s promoted_phase_id=%s "
+                        "production_apply=false shadow_only=true",
+                        len(lifecycle_precision.get("readiness") or []),
+                        lifecycle_precision.get("promoted_phase_id"),
+                    )
+            except Exception:
+                precision_controller = None
+                logger.exception(
+                    "[WIDE_RESEARCH_PRECISION_RECOVERY_ERROR] "
+                    "shadow_only=true production_unchanged=true"
+                )
+        if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+            try:
+                (
+                    store_rare_precision,
+                    _layer_rare_precision,
+                    rare_precision_controller,
+                ) = _get_wide_research_rare_precision_components()
+                recovery_rare_precision = store_rare_precision.recover()
+                logger.info(
+                    "[WIDE_RESEARCH_RARE_PRECISION_RECOVERY] %s "
+                    "shadow_only=true",
+                    recovery_rare_precision,
+                )
+                if (
+                    WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE
+                    and _wide_research_retry_gate(
+                        _layer_rare_precision,
+                        log_tag="WIDE_RESEARCH_RARE_PRECISION",
+                    )
+                ):
+                    lifecycle_rare_precision = (
+                        rare_precision_controller.reconcile()
+                    )
+                    logger.info(
+                        "[WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE] "
+                        "reviewed=%s promoted_phase_id=%s "
+                        "production_apply=false shadow_only=true",
+                        len(
+                            lifecycle_rare_precision.get("readiness") or []
+                        ),
+                        lifecycle_rare_precision.get("promoted_phase_id"),
+                    )
+            except Exception:
+                rare_precision_controller = None
+                logger.exception(
+                    "[WIDE_RESEARCH_RARE_PRECISION_RECOVERY_ERROR] "
+                    "shadow_only=true production_unchanged=true"
+                )
+        while not _wide_research_stop.is_set():
+            now = time.monotonic()
+            if (
+                ENABLE_WIDE_RESEARCH
+                and WIDE_RESEARCH_AUTO_DISCOVERY
+                and now >= next_discovery_primary
+            ):
+                discovery = run_wide_research_discovery_once(
+                    trigger=(
+                        "startup"
+                        if primary_first_run and initial_delay_primary == 0.0
+                        else "scheduled"
+                    )
+                )
+                primary_first_run = False
+                retry_seconds, primary_discovery_failures = (
+                    _wide_research_discovery_next_delay(
+                        discovery,
+                        success_interval_seconds=(
+                            WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS
+                        ),
+                        consecutive_failures=primary_discovery_failures,
+                    )
+                )
+                if discovery.get("status") != "completed":
+                    logger.warning(
+                        "[WIDE_RESEARCH_WORKER_RETRY] reason=%s "
+                        "consecutive_failures=%s retry_seconds=%.1f",
+                        discovery.get("reason"),
+                        primary_discovery_failures,
+                        retry_seconds,
+                    )
+                next_discovery_primary = time.monotonic() + float(
+                    retry_seconds
+                )
+            now = time.monotonic()
+            if (
+                ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+                and WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY
+                and now >= next_discovery_4f
+            ):
+                discovery_4f = run_wide_research_four_factor_discovery_once(
+                    trigger=(
+                        "startup"
+                        if four_factor_first_run and initial_delay_4f == 0.0
+                        else "scheduled"
+                    )
+                )
+                four_factor_first_run = False
+                retry_seconds_4f, four_factor_discovery_failures = (
+                    _wide_research_discovery_next_delay(
+                        discovery_4f,
+                        success_interval_seconds=(
+                            WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS
+                        ),
+                        consecutive_failures=four_factor_discovery_failures,
+                    )
+                )
+                if discovery_4f.get("status") != "completed":
+                    logger.warning(
+                        "[WIDE_RESEARCH_4F_WORKER_RETRY] reason=%s "
+                        "consecutive_failures=%s retry_seconds=%.1f "
+                        "shadow_only=true",
+                        discovery_4f.get("reason"),
+                        four_factor_discovery_failures,
+                        retry_seconds_4f,
+                    )
+                next_discovery_4f = time.monotonic() + float(
+                    retry_seconds_4f
+                )
+            now = time.monotonic()
+            if (
+                ENABLE_WIDE_RESEARCH_PRECISION
+                and WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY
+                and now >= next_discovery_precision
+            ):
+                discovery_precision = (
+                    run_wide_research_precision_discovery_once(
+                        trigger=(
+                            "startup"
+                            if precision_first_run
+                            and initial_delay_precision == 0.0
+                            else "scheduled"
+                        )
+                    )
+                )
+                precision_first_run = False
+                (
+                    retry_seconds_precision,
+                    precision_discovery_failures,
+                ) = _wide_research_discovery_next_delay(
+                    discovery_precision,
+                    success_interval_seconds=(
+                        WIDE_RESEARCH_PRECISION_DISCOVERY_INTERVAL_SECONDS
+                    ),
+                    consecutive_failures=precision_discovery_failures,
+                )
+                if discovery_precision.get("status") != "completed":
+                    logger.warning(
+                        "[WIDE_RESEARCH_PRECISION_WORKER_RETRY] reason=%s "
+                        "consecutive_failures=%s retry_seconds=%.1f "
+                        "shadow_only=true",
+                        discovery_precision.get("reason"),
+                        precision_discovery_failures,
+                        retry_seconds_precision,
+                    )
+                next_discovery_precision = time.monotonic() + float(
+                    retry_seconds_precision
+                )
+            now = time.monotonic()
+            if (
+                ENABLE_WIDE_RESEARCH_RARE_PRECISION
+                and WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY
+                and now >= next_discovery_rare_precision
+            ):
+                discovery_rare_precision = (
+                    run_wide_research_rare_precision_discovery_once(
+                        trigger=(
+                            "startup"
+                            if rare_precision_first_run
+                            and initial_delay_rare_precision == 0.0
+                            else "scheduled"
+                        )
+                    )
+                )
+                rare_precision_first_run = False
+                (
+                    retry_seconds_rare_precision,
+                    rare_precision_discovery_failures,
+                ) = _wide_research_discovery_next_delay(
+                    discovery_rare_precision,
+                    success_interval_seconds=(
+                        WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_INTERVAL_SECONDS
+                    ),
+                    consecutive_failures=(
+                        rare_precision_discovery_failures
+                    ),
+                )
+                if discovery_rare_precision.get("status") != "completed":
+                    logger.warning(
+                        "[WIDE_RESEARCH_RARE_PRECISION_WORKER_RETRY] "
+                        "reason=%s consecutive_failures=%s "
+                        "retry_seconds=%.1f shadow_only=true",
+                        discovery_rare_precision.get("reason"),
+                        rare_precision_discovery_failures,
+                        retry_seconds_rare_precision,
+                    )
+                next_discovery_rare_precision = (
+                    time.monotonic() + float(retry_seconds_rare_precision)
+                )
+            if (
+                ENABLE_WIDE_RESEARCH
+                and WIDE_RESEARCH_AUTO_LIFECYCLE
+                and primary_controller is not None
+            ):
+                try:
+                    retries_clear = _wide_research_retry_gate(
+                        _get_wide_research_layer(),
+                        log_tag="WIDE_RESEARCH",
+                    )
+                    lifecycle = (
+                        primary_controller.reconcile()
+                        if retries_clear
+                        else {}
+                    )
+                    if lifecycle.get("promoted_phase_id") or (
+                        lifecycle.get("degradation") or {}
+                    ).get("eligible"):
+                        logger.info(
+                            "[WIDE_RESEARCH_LIFECYCLE] "
+                            "promoted_phase_id=%s degradation=%s "
+                            "production_apply=%s",
+                            lifecycle.get("promoted_phase_id"),
+                            lifecycle.get("degradation"),
+                            WIDE_RESEARCH_PRODUCTION_APPLY,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[WIDE_RESEARCH_LIFECYCLE_ERROR] "
+                        "production_unchanged=true"
+                    )
+            if (
+                ENABLE_WIDE_RESEARCH_PRECISION
+                and WIDE_RESEARCH_PRECISION_AUTO_LIFECYCLE
+                and precision_controller is not None
+            ):
+                try:
+                    retries_clear = _wide_research_retry_gate(
+                        _get_wide_research_precision_layer(),
+                        log_tag="WIDE_RESEARCH_PRECISION",
+                    )
+                    lifecycle_precision = (
+                        precision_controller.reconcile()
+                        if retries_clear
+                        else {}
+                    )
+                    ready_count = sum(
+                        row.get("target_state") == "READY"
+                        and bool(row.get("eligible"))
+                        for row in lifecycle_precision.get("readiness") or []
+                        if isinstance(row, Mapping)
+                    )
+                    if ready_count:
+                        logger.info(
+                            "[WIDE_RESEARCH_PRECISION_LIFECYCLE] "
+                            "reviewed=%s ready=%s promoted_phase_id=%s "
+                            "production_apply=false shadow_only=true",
+                            len(lifecycle_precision.get("readiness") or []),
+                            ready_count,
+                            lifecycle_precision.get("promoted_phase_id"),
+                        )
+                except Exception:
+                    logger.exception(
+                        "[WIDE_RESEARCH_PRECISION_LIFECYCLE_ERROR] "
+                        "shadow_only=true production_unchanged=true"
+                    )
+            if (
+                ENABLE_WIDE_RESEARCH_RARE_PRECISION
+                and WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE
+                and rare_precision_controller is not None
+            ):
+                try:
+                    retries_clear = _wide_research_retry_gate(
+                        _get_wide_research_rare_precision_layer(),
+                        log_tag="WIDE_RESEARCH_RARE_PRECISION",
+                    )
+                    lifecycle_rare_precision = (
+                        rare_precision_controller.reconcile()
+                        if retries_clear
+                        else {}
+                    )
+                    review_rows = [
+                        row
+                        for row in (
+                            lifecycle_rare_precision.get("readiness") or []
+                        )
+                        if isinstance(row, Mapping)
+                    ]
+                    ready_count = sum(
+                        row.get("target_state") == "READY"
+                        and bool(row.get("eligible"))
+                        for row in review_rows
+                    )
+                    terminal_count = sum(
+                        bool(row.get("terminal_review"))
+                        for row in review_rows
+                    )
+                    if ready_count or terminal_count:
+                        logger.info(
+                            "[WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE] "
+                            "reviewed=%s ready=%s terminal_review=%s "
+                            "promoted_phase_id=%s production_apply=false "
+                            "shadow_only=true",
+                            len(review_rows),
+                            ready_count,
+                            terminal_count,
+                            lifecycle_rare_precision.get(
+                                "promoted_phase_id"
+                            ),
+                        )
+                except Exception:
+                    logger.exception(
+                        "[WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_ERROR] "
+                        "shadow_only=true production_unchanged=true"
+                    )
+            timeout = float(WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS)
+            if ENABLE_WIDE_RESEARCH and WIDE_RESEARCH_AUTO_DISCOVERY:
+                timeout = min(
+                    timeout,
+                    max(1.0, next_discovery_primary - time.monotonic()),
+                )
+            if (
+                ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+                and WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY
+            ):
+                timeout = min(
+                    timeout,
+                    max(1.0, next_discovery_4f - time.monotonic()),
+                )
+            if (
+                ENABLE_WIDE_RESEARCH_PRECISION
+                and WIDE_RESEARCH_PRECISION_AUTO_DISCOVERY
+            ):
+                timeout = min(
+                    timeout,
+                    max(
+                        1.0,
+                        next_discovery_precision - time.monotonic(),
+                    ),
+                )
+            if (
+                ENABLE_WIDE_RESEARCH_RARE_PRECISION
+                and WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY
+            ):
+                timeout = min(
+                    timeout,
+                    max(
+                        1.0,
+                        next_discovery_rare_precision - time.monotonic(),
+                    ),
+                )
+            _wide_research_wakeup.wait(timeout)
+            _wide_research_wakeup.clear()
+    except Exception:
+        logger.exception(
+            "[WIDE_RESEARCH_DAEMON_ERROR] production_unchanged=true"
+        )
+    logger.info("[WIDE_RESEARCH_DAEMON] stopped")
+
+
+def start_wide_research_daemon() -> None:
+    global _wide_research_thread
+    if not (
+        ENABLE_WIDE_RESEARCH
+        or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+        or ENABLE_WIDE_RESEARCH_PRECISION
+        or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+    ):
+        logger.info("[WIDE_RESEARCH_DAEMON] disabled")
+        return
+    if _wide_research_thread and _wide_research_thread.is_alive():
+        return
+    _wide_research_stop.clear()
+    _wide_research_wakeup.clear()
+    _wide_research_thread = threading.Thread(
+        target=wide_research_daemon,
+        name="wide-research-controller",
+        daemon=True,
+    )
+    _wide_research_thread.start()
+
+
+def stop_wide_research_daemon(timeout: float = 10.0) -> None:
+    _wide_research_stop.set()
+    _wide_research_wakeup.set()
+    with _wide_research_active_process_lock:
+        process = _wide_research_active_process
+    _terminate_subprocess(process, timeout=min(5.0, max(0.1, timeout)))
+    thread = _wide_research_thread
+    if thread and thread.is_alive():
+        thread.join(timeout=max(0.0, float(timeout)))
+
+
+_signal_reputation_lock = threading.RLock()
+_signal_reputation_rebuild_lock = threading.Lock()
+_signal_reputation_thread_lock = threading.RLock()
+_signal_reputation_active_process_lock = threading.RLock()
+_signal_reputation_active_process: Optional[subprocess.Popen[str]] = None
+_signal_reputation_refresh_thread: Optional[threading.Thread] = None
+_signal_reputation_stop = threading.Event()
+_signal_reputation_model_cache: Dict[str, Any] = {}
+_signal_reputation_last_refresh_ts = 0.0
+_signal_reputation_dirty = True
+_signal_reputation_revision = 0
+
+
+def _signal_reputation_config(
+    *,
+    expanded_blend_enabled: Optional[bool] = None,
+) -> ReputationConfig:
+    expanded_enabled = (
+        ENABLE_SIGNAL_REPUTATION_EXPANDED_SHADOW
+        if expanded_blend_enabled is None
+        else bool(expanded_blend_enabled)
+    )
+    return ReputationConfig(
+        half_life_days=SIGNAL_REPUTATION_HALF_LIFE_DAYS,
+        prior_global=SIGNAL_REPUTATION_PRIOR_GLOBAL,
+        prior_league=SIGNAL_REPUTATION_PRIOR_LEAGUE,
+        prior_team=SIGNAL_REPUTATION_PRIOR_TEAM,
+        prior_team_league=SIGNAL_REPUTATION_PRIOR_TEAM_LEAGUE,
+        prior_role=SIGNAL_REPUTATION_PRIOR_ROLE,
+        caps_pp=(1.0, 2.0, 3.0, 5.0),
+        expanded_blend_enabled=expanded_enabled,
+        expanded_blend_telegram_weight=SIGNAL_REPUTATION_BLEND_TELEGRAM_WEIGHT,
+        expanded_blend_next15_telegram_weight=(
+            SIGNAL_REPUTATION_BLEND_NEXT15_TELEGRAM_WEIGHT
+        ),
+        expanded_blend_next15_recommended_cap_pp=1.0,
+        expanded_blend_to90_recommended_cap_pp=2.0,
+        expanded_channel_min_prob_to90=CHANNEL_SIGNAL_MIN_PROB_TO90,
+        expanded_channel_min_reputation_delta_to90_pp=(
+            CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP
+        ),
+        expanded_channel_min_adjusted_intensity=(
+            CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY
+        ),
+        expanded_channel_min_season_context_factor=(
+            CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR
+        ),
+    )
+
+
+def _signal_reputation_artifact_is_safe(
+    artifact: Mapping[str, Any],
+    *,
+    expected_generated_at_utc: Optional[str] = None,
+) -> bool:
+    if (
+        not isinstance(artifact, Mapping)
+        or _safe_int(artifact.get("schema_version"), 0) < 1
+        or artifact.get("shadow_only") is not True
+        or not isinstance(artifact.get("cohorts"), Mapping)
+        or not str(artifact.get("generated_at_utc") or "")
+    ):
+        return False
+    if expected_generated_at_utc is not None:
+        return str(artifact.get("generated_at_utc") or "") == str(
+            expected_generated_at_utc
+        )
+    return True
+
+
+def invalidate_signal_reputation_model() -> None:
+    global _signal_reputation_dirty, _signal_reputation_revision
+    with _signal_reputation_lock:
+        _signal_reputation_dirty = True
+        _signal_reputation_revision += 1
+
+
+def _refresh_signal_reputation_model_local(
+    force: bool = False,
+    *,
+    history_path: Optional[str] = None,
+    output_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """In-process implementation reserved for the short-lived worker/tests."""
+    global _signal_reputation_model_cache, _signal_reputation_last_refresh_ts
+    global _signal_reputation_dirty
+    if not (
+        ENABLE_SIGNAL_REPUTATION_SHADOW
+        or ENABLE_SIGNAL_REPUTATION_AUTO_APPLY
+    ):
+        return {}
+    now_ts = time.time()
+    with _signal_reputation_lock:
+        cache_fresh = (
+            bool(_signal_reputation_model_cache)
+            and not force
+            and (
+                now_ts - _signal_reputation_last_refresh_ts
+                < SIGNAL_REPUTATION_REFRESH_SECONDS
+            )
+            and (
+                not _signal_reputation_dirty
+                or now_ts - _signal_reputation_last_refresh_ts
+                < SIGNAL_REPUTATION_MIN_REBUILD_SECONDS
+            )
+        )
+        if cache_fresh:
+            return _signal_reputation_model_cache
+        try:
+            joined = (
+                load_joined_decision_snapshots(
+                    history_path,
+                    include_pending=False,
+                )
+                if history_path is not None
+                else load_joined_decision_snapshots(include_pending=False)
+            )
+            model = build_reputation_model(
+                joined,
+                config=_signal_reputation_config(),
+                now=datetime.now(timezone.utc),
+            )
+            destination = output_path or SIGNAL_REPUTATION_MODEL_FILE
+            save_reputation_model(destination, model)
+            _signal_reputation_model_cache = model
+            _signal_reputation_last_refresh_ts = now_ts
+            _signal_reputation_dirty = False
+            all_targets = (
+                ((model.get("cohorts") or {}).get("all_decisions") or {}).get("targets") or {}
+            )
+            telegram_targets = (
+                ((model.get("cohorts") or {}).get("telegram_signals") or {}).get("targets") or {}
+            )
+            logger.info(
+                "[SIGNAL_REPUTATION_MODEL] rebuilt=True all_next15_rows=%s all_to90_rows=%s telegram_next15_rows=%s telegram_to90_rows=%s file=%s",
+                (all_targets.get("next15") or {}).get("rows", 0),
+                (all_targets.get("to90") or {}).get("rows", 0),
+                (telegram_targets.get("next15") or {}).get("rows", 0),
+                (telegram_targets.get("to90") or {}).get("rows", 0),
+                destination,
+            )
+            return model
+        except Exception:
+            logger.exception("[SIGNAL_REPUTATION_MODEL_ERROR] action=rebuild")
+            if not _signal_reputation_model_cache:
+                _signal_reputation_model_cache = load_reputation_model(
+                    SIGNAL_REPUTATION_MODEL_FILE
+                )
+            _signal_reputation_last_refresh_ts = now_ts
+            return _signal_reputation_model_cache
+
+
+@contextmanager
+def _signal_reputation_history_snapshot():
+    """Provide a stable decision journal tree to the reputation worker."""
+    active = os.path.abspath(DECISION_SNAPSHOTS_FILE)
+    with tempfile.TemporaryDirectory(prefix="goalbot-reputation-") as temporary:
+        snapshot_active = os.path.join(temporary, os.path.basename(active))
+        with _decision_snapshot_lock:
+            for source in _decision_snapshot_paths(active):
+                destination = os.path.join(temporary, os.path.basename(source))
+                # A snapshot must not share inode metadata with its source.
+                shutil.copy2(source, destination)
+        yield snapshot_active
+
+
+def _signal_reputation_fallback(now_ts: float) -> Dict[str, Any]:
+    global _signal_reputation_model_cache, _signal_reputation_last_refresh_ts
+    with _signal_reputation_lock:
+        if not _signal_reputation_model_cache:
+            _signal_reputation_model_cache = load_reputation_model(
+                SIGNAL_REPUTATION_MODEL_FILE
+            )
+        _signal_reputation_last_refresh_ts = now_ts
+        return _signal_reputation_model_cache
+
+
+def _signal_reputation_refresh_due_locked(
+    now_ts: float,
+    *,
+    force: bool,
+) -> bool:
+    if force or not _signal_reputation_model_cache:
+        return True
+    age = max(0.0, float(now_ts) - _signal_reputation_last_refresh_ts)
+    if _signal_reputation_dirty:
+        return age >= float(SIGNAL_REPUTATION_MIN_REBUILD_SECONDS)
+    return age >= float(SIGNAL_REPUTATION_REFRESH_SECONDS)
+
+
+def _refresh_signal_reputation_model_isolated(
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Rebuild reputation in an exec child so its large heap is reclaimed."""
+    global _signal_reputation_model_cache, _signal_reputation_last_refresh_ts
+    global _signal_reputation_dirty, _signal_reputation_active_process
+    if not (
+        ENABLE_SIGNAL_REPUTATION_SHADOW
+        or ENABLE_SIGNAL_REPUTATION_AUTO_APPLY
+    ):
+        return {}
+    now_ts = time.time()
+    with _signal_reputation_lock:
+        if not _signal_reputation_refresh_due_locked(now_ts, force=force):
+            return _signal_reputation_model_cache
+    if not _signal_reputation_rebuild_lock.acquire(blocking=False):
+        with _signal_reputation_lock:
+            if _signal_reputation_model_cache:
+                return _signal_reputation_model_cache
+        return load_reputation_model(SIGNAL_REPUTATION_MODEL_FILE)
+
+    process: Optional[subprocess.Popen[str]] = None
+    worker_slot_acquired = False
+    try:
+        with _signal_reputation_lock:
+            if not _signal_reputation_refresh_due_locked(
+                time.time(), force=force
+            ):
+                return _signal_reputation_model_cache
+            build_revision = _signal_reputation_revision
+        worker_slot_acquired = _model_worker_slot.acquire(blocking=False)
+        if not worker_slot_acquired:
+            logger.info(
+                "[SIGNAL_REPUTATION_WORKER] status=deferred reason=heavy_worker_busy stale_model_served=true"
+            )
+            return _signal_reputation_fallback(now_ts)
+        canonical_model = os.path.abspath(SIGNAL_REPUTATION_MODEL_FILE)
+        with _model_candidate_path(
+            canonical_model,
+            prefix=".reputation-candidate-",
+        ) as candidate_model:
+            with _signal_reputation_history_snapshot() as snapshot_path:
+                environment = os.environ.copy()
+                environment["GOALBOT_LIBRARY_MODE"] = "1"
+                with _signal_reputation_active_process_lock:
+                    if _signal_reputation_stop.is_set():
+                        with _signal_reputation_lock:
+                            return _signal_reputation_model_cache
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            os.path.join(
+                                os.path.dirname(os.path.abspath(__file__)),
+                                "scripts",
+                                "build_signal_reputation.py",
+                            ),
+                            "--input",
+                            snapshot_path,
+                            "--output",
+                            candidate_model,
+                        ],
+                        cwd=os.path.dirname(os.path.abspath(__file__)),
+                        env=environment,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    _signal_reputation_active_process = process
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=float(SIGNAL_REPUTATION_SUBPROCESS_TIMEOUT_SECONDS)
+                    )
+                except subprocess.TimeoutExpired:
+                    _terminate_subprocess(process)
+                    logger.error(
+                        "[SIGNAL_REPUTATION_WORKER_ERROR] reason=timeout timeout_seconds=%s old_model_preserved=true",
+                        SIGNAL_REPUTATION_SUBPROCESS_TIMEOUT_SECONDS,
+                    )
+                    return _signal_reputation_fallback(now_ts)
+            if process.returncode != 0:
+                logger.error(
+                    "[SIGNAL_REPUTATION_WORKER_ERROR] reason=exit returncode=%s stderr=%s old_model_preserved=true",
+                    process.returncode,
+                    (stderr or "")[-2000:],
+                )
+                return _signal_reputation_fallback(now_ts)
+            try:
+                worker_result = json.loads(stdout)
+            except (TypeError, ValueError):
+                logger.error(
+                    "[SIGNAL_REPUTATION_WORKER_ERROR] reason=invalid_json stdout=%s old_model_preserved=true",
+                    (stdout or "")[-2000:],
+                )
+                return _signal_reputation_fallback(now_ts)
+            if not isinstance(worker_result, dict):
+                return _signal_reputation_fallback(now_ts)
+            model = load_reputation_model(candidate_model)
+            if not _signal_reputation_artifact_is_safe(
+                model,
+                expected_generated_at_utc=str(
+                    worker_result.get("generated_at_utc") or ""
+                ),
+            ):
+                logger.error(
+                    "[SIGNAL_REPUTATION_WORKER_ERROR] reason=invalid_candidate old_model_preserved=true"
+                )
+                return _signal_reputation_fallback(now_ts)
+            if _signal_reputation_stop.is_set():
+                with _signal_reputation_lock:
+                    return _signal_reputation_model_cache
+            os.replace(candidate_model, canonical_model)
+            with _signal_reputation_lock:
+                _signal_reputation_model_cache = model
+                _signal_reputation_last_refresh_ts = time.time()
+                _signal_reputation_dirty = (
+                    _signal_reputation_revision != build_revision
+                )
+        logger.info(
+            "[SIGNAL_REPUTATION_WORKER] status=%s rows=%s isolated_process=true",
+            worker_result.get("status") if isinstance(worker_result, dict) else None,
+            worker_result.get("rows") if isinstance(worker_result, dict) else None,
+        )
+        return model
+    except Exception:
+        logger.exception("[SIGNAL_REPUTATION_WORKER_ERROR] reason=exception")
+        return _signal_reputation_fallback(now_ts)
+    finally:
+        _terminate_subprocess(process)
+        with _signal_reputation_active_process_lock:
+            if _signal_reputation_active_process is process:
+                _signal_reputation_active_process = None
+        if worker_slot_acquired:
+            _model_worker_slot.release()
+        _signal_reputation_rebuild_lock.release()
+        gc.collect()
+
+
+def _schedule_signal_reputation_refresh(*, force: bool = False) -> bool:
+    global _signal_reputation_refresh_thread
+    if _signal_reputation_stop.is_set():
+        return False
+    with _signal_reputation_thread_lock:
+        thread = _signal_reputation_refresh_thread
+        if thread is not None and thread.is_alive():
+            return False
+        thread = threading.Thread(
+            target=_refresh_signal_reputation_model_isolated,
+            kwargs={"force": bool(force)},
+            name="signal-reputation-worker",
+            daemon=True,
+        )
+        _signal_reputation_refresh_thread = thread
+        thread.start()
+        return True
+
+
+def stop_signal_reputation_worker(timeout: float = 5.0) -> None:
+    _signal_reputation_stop.set()
+    with _signal_reputation_active_process_lock:
+        active_process = _signal_reputation_active_process
+    _terminate_subprocess(active_process, timeout=min(5.0, max(0.1, timeout)))
+    with _signal_reputation_thread_lock:
+        thread = _signal_reputation_refresh_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(0.0, float(timeout)))
+
+
+def refresh_signal_reputation_model(force: bool = False) -> Dict[str, Any]:
+    """Serve the current model immediately and refresh it in background."""
+    global _signal_reputation_model_cache
+    if not SIGNAL_REPUTATION_ISOLATED_REFRESH_ENABLED:
+        return _refresh_signal_reputation_model_local(force=force)
+    if not (
+        ENABLE_SIGNAL_REPUTATION_SHADOW
+        or ENABLE_SIGNAL_REPUTATION_AUTO_APPLY
+    ):
+        return {}
+    now_ts = time.time()
+    with _signal_reputation_lock:
+        current = _signal_reputation_model_cache
+    if not current:
+        loaded = load_reputation_model(SIGNAL_REPUTATION_MODEL_FILE)
+        if loaded:
+            with _signal_reputation_lock:
+                if not _signal_reputation_model_cache:
+                    _signal_reputation_model_cache = loaded
+                current = _signal_reputation_model_cache
+    with _signal_reputation_lock:
+        refresh_due = _signal_reputation_refresh_due_locked(
+            now_ts,
+            force=force,
+        )
+        current = _signal_reputation_model_cache
+    if refresh_due:
+        _schedule_signal_reputation_refresh(force=force)
+    return current
+
+
+def _signal_reputation_auto_stage(fixture_count: Any) -> Dict[str, Any]:
+    fixtures = max(0, _safe_int(fixture_count, 0))
+    if fixtures >= SIGNAL_REPUTATION_AUTO_STAGE_3_FIXTURES:
+        return {
+            "stage": 3,
+            "cap_pp": 3.0,
+            "next_threshold": None,
+            "remaining": 0,
+        }
+    if fixtures >= SIGNAL_REPUTATION_AUTO_STAGE_2_FIXTURES:
+        return {
+            "stage": 2,
+            "cap_pp": 2.0,
+            "next_threshold": SIGNAL_REPUTATION_AUTO_STAGE_3_FIXTURES,
+            "remaining": SIGNAL_REPUTATION_AUTO_STAGE_3_FIXTURES - fixtures,
+        }
+    if fixtures >= SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES:
+        return {
+            "stage": 1,
+            "cap_pp": 1.0,
+            "next_threshold": SIGNAL_REPUTATION_AUTO_STAGE_2_FIXTURES,
+            "remaining": SIGNAL_REPUTATION_AUTO_STAGE_2_FIXTURES - fixtures,
+        }
+    return {
+        "stage": 0,
+        "cap_pp": 0.0,
+        "next_threshold": SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES,
+        "remaining": SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES - fixtures,
+    }
+
+
+def apply_signal_reputation_auto(
+    *,
+    fixture_id: int,
+    minute: int,
+    match_identity: Mapping[str, Any],
+    score_home: int,
+    score_away: int,
+    prob_next_15: float,
+    prob_to90: float,
+) -> Dict[str, Any]:
+    """Apply target-specific reputation only after unique-fixture readiness."""
+    expanded_requested = bool(ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY)
+    production_cohort = "expanded_blend" if expanded_requested else "telegram_signals"
+    base_values = {
+        "next15": clamp(float(prob_next_15), 0.0, 100.0),
+        "to90": clamp(float(prob_to90), 0.0, 100.0),
+    }
+    application: Dict[str, Any] = {
+        "enabled": bool(ENABLE_SIGNAL_REPUTATION_AUTO_APPLY),
+        "cohort": production_cohort,
+        "expanded_requested": expanded_requested,
+        "fallback_cohort": None,
+        "model_generated_at_utc": None,
+        "active": False,
+        "targets": {},
+    }
+    if not ENABLE_SIGNAL_REPUTATION_AUTO_APPLY:
+        for target, base in base_values.items():
+            application["targets"][target] = {
+                "fixture_count": 0,
+                "stage": 0,
+                "cap_pp": 0.0,
+                "base_probability": round(base, 6),
+                "adjusted_probability": round(base, 6),
+                "applied_delta_pp": 0.0,
+                "remaining": SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES,
+                "status": "disabled",
+            }
+        return application
+
+    try:
+        model = refresh_signal_reputation_model()
+        projection_input = {
+            "fixture_id": int(fixture_id),
+            "minute": int(minute),
+            "match": {
+                "league_id": match_identity.get("league_id"),
+                "home_team_id": match_identity.get("home_team_id"),
+                "away_team_id": match_identity.get("away_team_id"),
+                "score_home": int(score_home),
+                "score_away": int(score_away),
+            },
+            "probabilities": {
+                "prob_next_15": base_values["next15"],
+                "prob_to90": base_values["to90"],
+                "reputation_base_prob_next_15": base_values["next15"],
+                "reputation_base_prob_to90": base_values["to90"],
+            },
+        }
+        try:
+            projection = evaluate_shadow_decision(
+                projection_input,
+                model,
+                config=_signal_reputation_config(
+                    expanded_blend_enabled=expanded_requested
+                ),
+            )
+        except Exception:
+            if not expanded_requested:
+                raise
+            logger.exception(
+                "[SIGNAL_REPUTATION_EXPANDED_FALLBACK] fixture_id=%s minute=%s reason=evaluation_error fallback=telegram_signals",
+                fixture_id,
+                minute,
+            )
+            projection = evaluate_shadow_decision(
+                projection_input,
+                model,
+                config=_signal_reputation_config(expanded_blend_enabled=False),
+            )
+            production_cohort = "telegram_signals"
+            application["cohort"] = production_cohort
+            application["fallback_cohort"] = production_cohort
+        application["model_generated_at_utc"] = projection.get(
+            "model_generated_at_utc"
+        )
+        projection_cohorts = projection.get("cohorts") or {}
+        cohort_targets = (
+            (projection_cohorts.get(production_cohort) or {}).get("targets", {})
+        )
+        if production_cohort == "expanded_blend" and not cohort_targets:
+            production_cohort = "telegram_signals"
+            application["cohort"] = production_cohort
+            application["fallback_cohort"] = production_cohort
+            cohort_targets = (
+                (projection_cohorts.get(production_cohort) or {}).get("targets", {})
+            )
+            logger.warning(
+                "[SIGNAL_REPUTATION_EXPANDED_FALLBACK] fixture_id=%s minute=%s reason=missing_projection fallback=telegram_signals",
+                fixture_id,
+                minute,
+            )
+        for target, base in base_values.items():
+            target_projection = cohort_targets.get(target) or {}
+            fixture_count = _safe_int(
+                (target_projection.get("sample") or {}).get("target_fixtures"),
+                0,
+            )
+            stage = _signal_reputation_auto_stage(fixture_count)
+            if production_cohort == "expanded_blend" and stage["stage"] > 0:
+                cap_pp = max(
+                    0.0,
+                    _safe_float(target_projection.get("recommended_cap_pp"), 0.0),
+                )
+                adjusted = _safe_float(
+                    target_projection.get("recommended_probability"),
+                    base,
+                )
+            else:
+                cap_pp = float(stage["cap_pp"])
+                cap_key = str(int(cap_pp)) if cap_pp > 0 else ""
+                adjusted = base
+            if production_cohort != "expanded_blend" and cap_key:
+                adjusted = _safe_float(
+                    (target_projection.get("probability_by_cap") or {}).get(
+                        cap_key
+                    ),
+                    base,
+                )
+            adjusted = clamp(float(adjusted), 0.0, 100.0)
+            applied_delta = adjusted - base
+            application["targets"][target] = {
+                "fixture_count": fixture_count,
+                "stage": int(stage["stage"]),
+                "cap_pp": cap_pp,
+                "base_probability": round(base, 6),
+                "adjusted_probability": round(adjusted, 6),
+                "applied_delta_pp": round(applied_delta, 6),
+                "raw_delta_pp": _safe_float(
+                    target_projection.get("raw_delta_pp"), 0.0
+                ),
+                "next_threshold": stage["next_threshold"],
+                "remaining": int(stage["remaining"]),
+                "status": "active" if cap_pp > 0 else "collecting",
+            }
+            if cap_pp > 0:
+                application["active"] = True
+
+        next15_result = application["targets"].get("next15") or {}
+        to90_result = application["targets"].get("to90") or {}
+        logger.info(
+            "[SIGNAL_REPUTATION_AUTO] fixture_id=%s minute=%s enabled=True active=%s cohort=%s expanded_requested=%s fallback_cohort=%s next15_fixtures=%s next15_stage=%s next15_cap_pp=%.1f next15_base=%.2f next15_adjusted=%.2f next15_delta_pp=%.2f next15_remaining=%s to90_fixtures=%s to90_stage=%s to90_cap_pp=%.1f to90_base=%.2f to90_adjusted=%.2f to90_delta_pp=%.2f to90_remaining=%s",
+            fixture_id,
+            minute,
+            application["active"],
+            application["cohort"],
+            expanded_requested,
+            application["fallback_cohort"],
+            next15_result.get("fixture_count", 0),
+            next15_result.get("stage", 0),
+            float(next15_result.get("cap_pp", 0.0)),
+            float(next15_result.get("base_probability", base_values["next15"])),
+            float(next15_result.get("adjusted_probability", base_values["next15"])),
+            float(next15_result.get("applied_delta_pp", 0.0)),
+            next15_result.get("remaining", 0),
+            to90_result.get("fixture_count", 0),
+            to90_result.get("stage", 0),
+            float(to90_result.get("cap_pp", 0.0)),
+            float(to90_result.get("base_probability", base_values["to90"])),
+            float(to90_result.get("adjusted_probability", base_values["to90"])),
+            float(to90_result.get("applied_delta_pp", 0.0)),
+            to90_result.get("remaining", 0),
+        )
+    except Exception:
+        logger.exception(
+            "[SIGNAL_REPUTATION_AUTO_ERROR] fixture_id=%s minute=%s",
+            fixture_id,
+            minute,
+        )
+        for target, base in base_values.items():
+            application["targets"][target] = {
+                "fixture_count": 0,
+                "stage": 0,
+                "cap_pp": 0.0,
+                "base_probability": round(base, 6),
+                "adjusted_probability": round(base, 6),
+                "applied_delta_pp": 0.0,
+                "remaining": SIGNAL_REPUTATION_AUTO_STAGE_1_FIXTURES,
+                "status": "error_neutral",
+            }
+    return application
+
+
+def apply_signal_reputation_to_probability_result(
+    fixture_metrics: Dict[str, Any],
+    minute: int,
+    probability_result: Mapping[str, Any],
+    *,
+    application_context: str,
+) -> Dict[str, Any]:
+    """
+    Apply reputation to a fresh or previously adjusted 45+ result.
+
+    Explicit reputation_base_* fields always win, making this operation
+    idempotent: applying it twice recalculates from the same clean model output
+    instead of adding the previous delta again.
+    """
+    result = dict(probability_result or {})
+    fixture_id = get_fixture_id(fixture_metrics)
+    if fixture_id is None:
+        logger.warning(
+            "[SIGNAL_REPUTATION_RESULT] context=%s fixture_id=unknown minute=%s applied=False reason=missing_fixture_id",
+            application_context,
+            minute,
+        )
+        return result
+
+    base_next15 = _safe_float(
+        result.get("reputation_base_prob_next_15"),
+        _safe_float(result.get("prob_next_15"), 0.0),
+    )
+    base_to90 = _safe_float(
+        result.get("reputation_base_prob_to90"),
+        _safe_float(result.get("prob_to90"), 0.0),
+    )
+    if has_normal_time_finished(fixture_metrics):
+        application = {
+            "enabled": bool(ENABLE_SIGNAL_REPUTATION_AUTO_APPLY),
+            "cohort": (
+                "expanded_blend"
+                if ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY
+                else "telegram_signals"
+            ),
+            "model_generated_at_utc": None,
+            "active": False,
+            "skip_reason": "normal_time_finished",
+            "targets": {
+                target: {
+                    "fixture_count": 0,
+                    "stage": 0,
+                    "cap_pp": 0.0,
+                    "base_probability": round(base, 6),
+                    "adjusted_probability": round(base, 6),
+                    "applied_delta_pp": 0.0,
+                    "remaining": 0,
+                    "status": "normal_time_finished",
+                }
+                for target, base in (
+                    ("next15", base_next15),
+                    ("to90", base_to90),
+                )
+            },
+        }
+        result.update(
+            {
+                "reputation_base_prob_next_15": base_next15,
+                "reputation_adjusted_prob_next_15": base_next15,
+                "reputation_base_prob_to90": base_to90,
+                "reputation_adjusted_prob_to90": base_to90,
+                "reputation_application": application,
+                "reputation_application_context": str(application_context or "unknown"),
+                "prob_next_15": base_next15,
+                "prob_to90": base_to90,
+            }
+        )
+        logger.info(
+            "[SIGNAL_REPUTATION_RESULT] context=%s fixture_id=%s minute=%s "
+            "active=False skipped=True reason=normal_time_finished "
+            "base_next15=%.2f adjusted_next15=%.2f base_to90=%.2f adjusted_to90=%.2f",
+            application_context,
+            fixture_id,
+            minute,
+            base_next15,
+            base_next15,
+            base_to90,
+            base_to90,
+        )
+        return result
+
+    match_identity = build_match_identity_context(fixture_metrics)
+    score_home = _safe_int(
+        _unwrap_value(fixture_metrics.get("score_home")),
+        0,
+    )
+    score_away = _safe_int(
+        _unwrap_value(fixture_metrics.get("score_away")),
+        0,
+    )
+    application = apply_signal_reputation_auto(
+        fixture_id=int(fixture_id),
+        minute=int(minute),
+        match_identity=match_identity,
+        score_home=score_home,
+        score_away=score_away,
+        prob_next_15=base_next15,
+        prob_to90=base_to90,
+    )
+    next15_target = (application.get("targets") or {}).get("next15") or {}
+    to90_target = (application.get("targets") or {}).get("to90") or {}
+    adjusted_next15 = clamp(
+        _safe_float(next15_target.get("adjusted_probability"), base_next15),
+        0.0,
+        100.0,
+    )
+    adjusted_to90 = clamp(
+        _safe_float(to90_target.get("adjusted_probability"), base_to90),
+        0.0,
+        100.0,
+    )
+
+    result.update(
+        {
+            "reputation_base_prob_next_15": base_next15,
+            "reputation_adjusted_prob_next_15": adjusted_next15,
+            "reputation_base_prob_to90": base_to90,
+            "reputation_adjusted_prob_to90": adjusted_to90,
+            "reputation_application": application,
+            "reputation_application_context": str(application_context or "unknown"),
+            "prob_next_15": adjusted_next15,
+            "prob_to90": adjusted_to90,
+        }
+    )
+    logger.info(
+        "[SIGNAL_REPUTATION_RESULT] context=%s fixture_id=%s minute=%s active=%s base_next15=%.2f adjusted_next15=%.2f base_to90=%.2f adjusted_to90=%.2f",
+        application_context,
+        fixture_id,
+        minute,
+        bool(application.get("active", False)),
+        base_next15,
+        adjusted_next15,
+        base_to90,
+        adjusted_to90,
+    )
+    return result
+
+
+def compute_probability_45_plus_with_reputation(
+    fixture_metrics: Dict[str, Any],
+    minute: int,
+    *,
+    application_context: str,
+) -> Dict[str, Any]:
+    """Single 45+ probability path used by both Telegram send and updates."""
+    base_result = compute_probability_45_plus(fixture_metrics, minute)
+    return apply_signal_reputation_to_probability_result(
+        fixture_metrics,
+        minute,
+        base_result,
+        application_context=application_context,
+    )
+
+
+def _compact_shadow_reputation_projection(
+    projection: Mapping[str, Any],
+    *,
+    shadow_key: str,
+    journal_status: str,
+) -> Dict[str, Any]:
+    compact_cohorts: Dict[str, Any] = {}
+    raw_cohorts = projection.get("cohorts")
+    raw_cohorts = raw_cohorts if isinstance(raw_cohorts, Mapping) else {}
+    for cohort_name, raw_cohort in raw_cohorts.items():
+        raw_cohort = raw_cohort if isinstance(raw_cohort, Mapping) else {}
+        compact_targets: Dict[str, Any] = {}
+        raw_targets = raw_cohort.get("targets")
+        raw_targets = raw_targets if isinstance(raw_targets, Mapping) else {}
+        for target_name, raw_target in raw_targets.items():
+            raw_target = raw_target if isinstance(raw_target, Mapping) else {}
+            compact_target = {
+                "base_probability": raw_target.get("base_probability"),
+                "raw_delta_pp": raw_target.get("raw_delta_pp"),
+                "applied_delta_pp_by_cap": dict(
+                    raw_target.get("applied_delta_pp_by_cap") or {}
+                ),
+                "probability_by_cap": dict(
+                    raw_target.get("probability_by_cap") or {}
+                ),
+            }
+            for optional_key in (
+                "available",
+                "recommended_cap_pp",
+                "recommended_applied_delta_pp",
+                "recommended_probability",
+                "blend",
+            ):
+                if optional_key in raw_target:
+                    compact_target[optional_key] = copy.deepcopy(
+                        raw_target.get(optional_key)
+                    )
+            compact_targets[str(target_name)] = compact_target
+        compact_cohorts[str(cohort_name)] = {
+            "targets": compact_targets,
+            "decision_by_cap": dict(raw_cohort.get("decision_by_cap") or {}),
+        }
+        for optional_key in (
+            "recommended_decision",
+            "recommended_channel_filter_passed",
+            "production_apply",
+            "blend_version",
+            "recommended_caps_pp",
+            "configured_telegram_weights",
+        ):
+            if optional_key in raw_cohort:
+                compact_cohorts[str(cohort_name)][optional_key] = copy.deepcopy(
+                    raw_cohort.get(optional_key)
+                )
+    return {
+        "schema_version": _safe_int(projection.get("schema_version"), 1),
+        "shadow_only": True,
+        "shadow_key": shadow_key,
+        "journal_status": str(journal_status),
+        "model_generated_at_utc": projection.get("model_generated_at_utc"),
+        "baseline_decision": projection.get("baseline_decision"),
+        "cohorts": compact_cohorts,
+    }
+
+
+def attach_shadow_reputation(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLE_SIGNAL_REPUTATION_SHADOW:
+        return snapshot
+    try:
+        model = refresh_signal_reputation_model()
+        projection = evaluate_shadow_decision(
+            snapshot, model, config=_signal_reputation_config()
+        )
+        shadow_key = (
+            f"projection:{snapshot.get('decision_id')}:"
+            f"v{projection.get('schema_version', 1)}"
+        )
+        shadow_record = {
+            "record_type": "projection",
+            "shadow_key": shadow_key,
+            "decision_id": snapshot.get("decision_id"),
+            "fixture_id": snapshot.get("fixture_id"),
+            "created_at_utc": snapshot.get("created_at_utc") or _utc_now_iso(),
+            "minute": snapshot.get("minute"),
+            "match": dict(snapshot.get("match") or {}),
+            "decision": dict(snapshot.get("decision") or {}),
+            "gates": dict(snapshot.get("gates") or {}),
+            "publication_policy": dict(
+                snapshot.get("publication_policy") or {}
+            ),
+            "legacy_selection_gates": dict(
+                snapshot.get("legacy_selection_gates") or {}
+            ),
+            "channel_signal_filter": dict(
+                snapshot.get("channel_signal_filter") or {}
+            ),
+            "telegram": dict(snapshot.get("telegram") or {}),
+            "probabilities": dict(snapshot.get("probabilities") or {}),
+            "shadow_reputation": projection,
+        }
+        try:
+            shadow_written = append_shadow_record(
+                SIGNAL_REPUTATION_SHADOW_FILE,
+                shadow_record,
+                rotate_max_bytes=SIGNAL_REPUTATION_ROTATE_MAX_BYTES,
+            )
+            journal_status = "written" if shadow_written else "existing"
+            snapshot.pop("shadow_reputation", None)
+            snapshot.pop("shadow_reputation_fallback", None)
+            snapshot["shadow_reputation_summary"] = (
+                _compact_shadow_reputation_projection(
+                    projection,
+                    shadow_key=shadow_key,
+                    journal_status=journal_status,
+                )
+            )
+        except Exception:
+            snapshot.pop("shadow_reputation", None)
+            snapshot["shadow_reputation_summary"] = (
+                _compact_shadow_reputation_projection(
+                    projection,
+                    shadow_key=shadow_key,
+                    journal_status="fallback_embedded",
+                )
+            )
+            snapshot["shadow_reputation_fallback"] = projection
+            logger.exception(
+                "[SIGNAL_REPUTATION_SHADOW_ERROR] action=append_projection decision_id=%s fallback=embedded",
+                snapshot.get("decision_id"),
+            )
+        balanced = (
+            ((projection.get("cohorts") or {}).get("all_decisions") or {})
+            .get("targets", {})
+        )
+        reputation_application = snapshot.get("reputation_application")
+        reputation_application = (
+            reputation_application
+            if isinstance(reputation_application, dict)
+            else {}
+        )
+        next15 = balanced.get("next15") or {}
+        to90 = balanced.get("to90") or {}
+        expanded_targets = (
+            ((projection.get("cohorts") or {}).get("expanded_blend") or {})
+            .get("targets", {})
+        )
+        expanded_next15 = expanded_targets.get("next15") or {}
+        expanded_to90 = expanded_targets.get("to90") or {}
+        logger.info(
+            "[SIGNAL_REPUTATION_SHADOW] decision_id=%s fixture_id=%s minute=%s cohort=all_decisions base_next15=%.2f shadow_next15_cap3=%.2f delta_next15=%.2f base_to90=%.2f shadow_to90_cap3=%.2f delta_to90=%.2f expanded_enabled=%s expanded_production_apply=false expanded_next15_recommended=%.2f expanded_next15_cap_pp=%.1f expanded_to90_recommended=%.2f expanded_to90_cap_pp=%.1f expanded_recommended_decision=%s baseline_decision=%s shadow_decision_cap3=%s auto_applied=%s",
+            snapshot.get("decision_id"),
+            snapshot.get("fixture_id"),
+            snapshot.get("minute"),
+            _safe_float(next15.get("base_probability"), 0.0),
+            _safe_float((next15.get("probability_by_cap") or {}).get("3"), 0.0),
+            _safe_float(next15.get("raw_delta_pp"), 0.0),
+            _safe_float(to90.get("base_probability"), 0.0),
+            _safe_float((to90.get("probability_by_cap") or {}).get("3"), 0.0),
+            _safe_float(to90.get("raw_delta_pp"), 0.0),
+            bool(expanded_targets),
+            _safe_float(expanded_next15.get("recommended_probability"), 0.0),
+            _safe_float(expanded_next15.get("recommended_cap_pp"), 0.0),
+            _safe_float(expanded_to90.get("recommended_probability"), 0.0),
+            _safe_float(expanded_to90.get("recommended_cap_pp"), 0.0),
+            ((projection.get("cohorts") or {}).get("expanded_blend") or {}).get(
+                "recommended_decision"
+            ),
+            projection.get("baseline_decision"),
+            (((projection.get("cohorts") or {}).get("all_decisions") or {}).get("decision_by_cap") or {}).get("3"),
+            bool(reputation_application.get("active", False)),
+        )
+    except Exception:
+        logger.exception(
+            "[SIGNAL_REPUTATION_SHADOW_ERROR] decision_id=%s",
+            snapshot.get("decision_id"),
+        )
+    return snapshot
+
+
+def append_shadow_outcome_record(
+    decision_id: Any,
+    fixture_id: int,
+    outcome: Mapping[str, Any],
+    resolved_at_utc: str,
+    *,
+    outcome_schema_version: int = DECISION_OUTCOME_SCHEMA_VERSION,
+    outcome_revision: int = 0,
+) -> None:
+    if not ENABLE_SIGNAL_REPUTATION_SHADOW:
+        if ENABLE_SIGNAL_REPUTATION_AUTO_APPLY:
+            invalidate_signal_reputation_model()
+        return
+    try:
+        revision_suffix = (
+            f":r{int(outcome_revision)}" if int(outcome_revision) > 0 else ""
+        )
+        append_shadow_record(
+            SIGNAL_REPUTATION_SHADOW_FILE,
+            {
+                "record_type": "outcome",
+                "shadow_key": (
+                    f"outcome:{decision_id}:v{int(outcome_schema_version)}"
+                    f"{revision_suffix}"
+                ),
+                "decision_id": decision_id,
+                "fixture_id": int(fixture_id),
+                "created_at_utc": resolved_at_utc,
+                "outcome_schema_version": int(outcome_schema_version),
+                "outcome_revision": int(outcome_revision),
+                "outcome": dict(outcome),
+            },
+            rotate_max_bytes=SIGNAL_REPUTATION_ROTATE_MAX_BYTES,
+        )
+        invalidate_signal_reputation_model()
+    except Exception:
+        logger.exception(
+            "[SIGNAL_REPUTATION_SHADOW_ERROR] action=append_outcome decision_id=%s",
+            decision_id,
+        )
+
+
+def _snapshot_dedupe_key(record: Dict[str, Any]) -> Optional[str]:
+    base_key = _decision_record_id(record, source="dedupe")
+    if not base_key:
+        return None
+    record_type = str(record.get("record_type") or "decision")
+    schema = int(record.get("outcome_schema_version") or record.get("schema_version") or 1)
+    revision = get_outcome_revision(record) if record_type == "outcome" else 0
+    suffix = f":r{revision}" if revision > 0 else ""
+    return f"{base_key}:{record_type}:v{schema}{suffix}"
+
+
+def _trim_decision_snapshot_key_cache(keys: Set[str], order: deque) -> None:
+    limit = int(DECISION_SNAPSHOT_DEDUPE_MAX_KEYS)
+    if limit <= 0:
+        return
+    while len(order) > limit:
+        keys.discard(order.popleft())
+
+
+def _load_decision_snapshot_keys(path: str) -> Tuple[Set[str], deque]:
+    keys: Set[str] = set()
+    order: deque = deque()
+    for record in iter_decision_snapshot_records(path):
+        key = _snapshot_dedupe_key(record)
+        if key and key not in keys:
+            keys.add(key)
+            order.append(key)
+            _trim_decision_snapshot_key_cache(keys, order)
+    return keys, order
+
+
+def _decision_snapshot_record_rank(record: Mapping[str, Any]) -> Tuple[int, str]:
+    return (
+        _safe_int(record.get("schema_version"), 1),
+        str(record.get("created_at_utc") or ""),
+    )
+
+
+def _decision_snapshot_outcome_rank(record: Any) -> Tuple[int, int, str]:
+    if isinstance(record, tuple) and len(record) >= 4:
+        return (
+            _safe_int(record[0], 1),
+            _safe_int(record[1], 0),
+            str(record[2] or ""),
+        )
+    if isinstance(record, tuple) and len(record) >= 2:
+        # Compatibility with an index tuple created before revisions existed.
+        return (_safe_int(record[0], 1), 0, str(record[1] or ""))
+    record = record if isinstance(record, Mapping) else {}
+    return outcome_record_rank(record)
+
+
+def _decision_snapshot_outcome_is_current_terminal(
+    record: Any,
+) -> bool:
+    if isinstance(record, tuple) and len(record) >= 4:
+        return (
+            str(record[3] or "") in {"resolved", "void", "quarantine"}
+            and _safe_int(record[0], 0)
+            >= int(DECISION_OUTCOME_SCHEMA_VERSION)
+        )
+    if isinstance(record, tuple) and len(record) >= 3:
+        return (
+            str(record[2] or "") in {"resolved", "void", "quarantine"}
+            and _safe_int(record[0], 0)
+            >= int(DECISION_OUTCOME_SCHEMA_VERSION)
+        )
+    if not isinstance(record, Mapping):
+        return False
+    outcome = record.get("outcome")
+    outcome = outcome if isinstance(outcome, dict) else {}
+    return (
+        str(outcome.get("status") or "")
+        in {"resolved", "void", "quarantine"}
+        and _safe_int(record.get("outcome_schema_version"), 0)
+        >= int(DECISION_OUTCOME_SCHEMA_VERSION)
+    )
+
+
+def _new_decision_snapshot_index() -> Dict[str, Any]:
+    """Create a pending-only index; terminal history remains on disk."""
+    return {
+        "decisions_by_id": {},
+        "decision_ids_by_fixture": {},
+        # Only compact rank/status markers are kept here.  Full terminal
+        # outcomes and decisions are never retained by the live process.
+        "outcomes_by_id": {},
+        "pending_decision_ids_by_fixture": {},
+    }
+
+
+def _set_index_decision_pending(
+    index: Dict[str, Any],
+    decision_id: str,
+) -> None:
+    decisions = index.setdefault("decisions_by_id", {})
+    outcomes = index.setdefault("outcomes_by_id", {})
+    pending_by_fixture = index.setdefault("pending_decision_ids_by_fixture", {})
+    decision = decisions.get(decision_id)
+    if not isinstance(decision, dict):
+        return
+    fixture_id = _safe_int(decision.get("fixture_id"), -1)
+    if fixture_id < 0:
+        return
+    bucket = pending_by_fixture.setdefault(fixture_id, set())
+    if _decision_snapshot_outcome_is_current_terminal(outcomes.get(decision_id)):
+        bucket.discard(decision_id)
+        if not bucket:
+            pending_by_fixture.pop(fixture_id, None)
+        fixture_ids = index.setdefault("decision_ids_by_fixture", {}).get(
+            fixture_id
+        )
+        if isinstance(fixture_ids, set):
+            fixture_ids.discard(decision_id)
+            if not fixture_ids:
+                index["decision_ids_by_fixture"].pop(fixture_id, None)
+        decisions.pop(decision_id, None)
+    else:
+        bucket.add(decision_id)
+
+
+def _apply_decision_snapshot_index_record(
+    index: Dict[str, Any],
+    record: Mapping[str, Any],
+) -> None:
+    decision_id = _decision_record_id(record, source="index")
+    if not decision_id:
+        return
+    record_type = str(record.get("record_type") or "")
+
+    if record_type == "decision":
+        decisions = index.setdefault("decisions_by_id", {})
+        ids_by_fixture = index.setdefault("decision_ids_by_fixture", {})
+        pending_by_fixture = index.setdefault("pending_decision_ids_by_fixture", {})
+        current = decisions.get(decision_id)
+        if (
+            isinstance(current, dict)
+            and _decision_snapshot_record_rank(record)
+            < _decision_snapshot_record_rank(current)
+        ):
+            return
+
+        if isinstance(current, dict):
+            previous_fixture_id = _safe_int(current.get("fixture_id"), -1)
+            next_fixture_id = _safe_int(record.get("fixture_id"), -1)
+            if previous_fixture_id >= 0 and previous_fixture_id != next_fixture_id:
+                old_ids = ids_by_fixture.get(previous_fixture_id)
+                if isinstance(old_ids, set):
+                    old_ids.discard(decision_id)
+                    if not old_ids:
+                        ids_by_fixture.pop(previous_fixture_id, None)
+                old_pending = pending_by_fixture.get(previous_fixture_id)
+                if isinstance(old_pending, set):
+                    old_pending.discard(decision_id)
+                    if not old_pending:
+                        pending_by_fixture.pop(previous_fixture_id, None)
+
+        stored = copy.deepcopy(dict(record))
+        decisions[decision_id] = stored
+        fixture_id = _safe_int(stored.get("fixture_id"), -1)
+        if fixture_id >= 0:
+            ids_by_fixture.setdefault(fixture_id, set()).add(decision_id)
+            _set_index_decision_pending(index, decision_id)
+        return
+
+    if record_type == "outcome":
+        outcomes = index.setdefault("outcomes_by_id", {})
+        current = outcomes.get(decision_id)
+        if (
+            current is not None
+            and _decision_snapshot_outcome_rank(record)
+            < _decision_snapshot_outcome_rank(current)
+        ):
+            return
+        raw_outcome = (
+            record.get("outcome")
+            if isinstance(record.get("outcome"), Mapping)
+            else {}
+        )
+        revision = get_outcome_revision(record)
+        if revision > 0:
+            outcomes[decision_id] = (
+                _safe_int(record.get("outcome_schema_version"), 1),
+                revision,
+                str(record.get("created_at_utc") or ""),
+                str(raw_outcome.get("status") or ""),
+            )
+        else:
+            outcomes[decision_id] = (
+                _safe_int(record.get("outcome_schema_version"), 1),
+                str(record.get("created_at_utc") or ""),
+                str(raw_outcome.get("status") or ""),
+            )
+        _set_index_decision_pending(index, decision_id)
+
+
+def _invalidate_decision_snapshot_index(path: Optional[str] = None) -> None:
+    active = os.path.abspath(path or DECISION_SNAPSHOTS_FILE)
+    with _decision_snapshot_lock:
+        _decision_snapshot_indexes_by_file.pop(active, None)
+
+
+def _get_decision_snapshot_index(path: Optional[str] = None) -> Dict[str, Any]:
+    active = os.path.abspath(path or DECISION_SNAPSHOTS_FILE)
+    with _decision_snapshot_lock:
+        cached = _decision_snapshot_indexes_by_file.get(active)
+        if cached is not None:
+            return cached
+
+        try:
+            cached = _new_decision_snapshot_index()
+            for record in iter_decision_snapshot_records(active):
+                _apply_decision_snapshot_index_record(cached, record)
+            _decision_snapshot_indexes_by_file[active] = cached
+            logger.info(
+                "[DECISION_INDEX] file=%s pending_fixtures=%s pending_decisions=%s outcome_markers=%s terminal_payloads_retained=0",
+                active,
+                len(cached["pending_decision_ids_by_fixture"]),
+                len(cached["decisions_by_id"]),
+                len(cached["outcomes_by_id"]),
+            )
+            return cached
+        except Exception:
+            logger.exception(
+                "[DECISION_INDEX_ERROR] action=build file=%s fallback=full_scan",
+                active,
+            )
+            return {"invalid": True}
+
+
+def get_decision_snapshots_for_fixture(
+    fixture_id: int,
+    path: Optional[str] = None,
+    *,
+    include_terminal: bool = False,
+) -> List[Dict[str, Any]]:
+    if include_terminal:
+        decisions: Dict[str, Dict[str, Any]] = {}
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        for record in iter_decision_snapshot_records(path):
+            if _safe_int(record.get("fixture_id"), -1) != int(fixture_id):
+                continue
+            decision_id = _decision_record_id(record, source="fixture_reader")
+            if not decision_id:
+                continue
+            if record.get("record_type") == "decision":
+                current = decisions.get(decision_id)
+                if (
+                    current is None
+                    or _decision_snapshot_record_rank(record)
+                    >= _decision_snapshot_record_rank(current)
+                ):
+                    decisions[decision_id] = dict(record)
+            elif record.get("record_type") == "outcome":
+                current = outcomes.get(decision_id)
+                if (
+                    current is None
+                    or _decision_snapshot_outcome_rank(record)
+                    >= _decision_snapshot_outcome_rank(current)
+                ):
+                    outcomes[decision_id] = dict(record)
+        records = []
+        for decision_id, decision in decisions.items():
+            item = dict(decision)
+            outcome_record = outcomes.get(decision_id)
+            if outcome_record is not None:
+                item["outcome"] = dict(outcome_record.get("outcome") or {})
+                item["outcome_schema_version"] = _safe_int(
+                    outcome_record.get("outcome_schema_version"), 1
+                )
+                revision = get_outcome_revision(outcome_record)
+                if revision > 0:
+                    item["outcome_revision"] = revision
+                item["outcome_record_created_at_utc"] = outcome_record.get(
+                    "created_at_utc"
+                )
+            records.append(item)
+    else:
+        with _decision_snapshot_lock:
+            index = _get_decision_snapshot_index(path)
+            if not index.get("invalid"):
+                decisions = index.get("decisions_by_id") or {}
+                decision_ids = (index.get("decision_ids_by_fixture") or {}).get(
+                    int(fixture_id), set()
+                )
+                records = [
+                    copy.deepcopy(decisions[decision_id])
+                    for decision_id in tuple(decision_ids)
+                    if decision_id in decisions
+                ]
+            else:
+                records = []
+        if index.get("invalid"):
+            records = [
+                dict(record)
+                for record in iter_decision_snapshot_records(path)
+                if record.get("record_type") == "decision"
+                and _safe_int(record.get("fixture_id"), -1) == int(fixture_id)
+            ]
+    records.sort(
+        key=lambda record: (
+            _safe_int(record.get("minute"), 0),
+            str(record.get("created_at_utc") or ""),
+            str(record.get("decision_id") or ""),
+        )
+    )
+    return records
+
+
+def _update_decision_snapshot_index(path: str, record: Dict[str, Any]) -> None:
+    index = _decision_snapshot_indexes_by_file.get(path)
+    if index is None:
+        return
+    _apply_decision_snapshot_index_record(index, record)
+
+
+def _rotate_decision_snapshot_if_needed(path: str, incoming_bytes: int) -> Optional[str]:
+    limit = int(DECISION_SNAPSHOT_ROTATE_MAX_BYTES)
+    if limit <= 0 or not os.path.exists(path):
+        return None
+    try:
+        current_size = os.path.getsize(path)
+    except OSError:
+        return None
+    if current_size <= 0 or current_size + int(incoming_bytes) <= limit:
+        return None
+    stem, extension = os.path.splitext(path)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    archive = f"{stem}.{stamp}{extension}.gz"
+    counter = 1
+    while os.path.exists(archive):
+        archive = f"{stem}.{stamp}.{counter}{extension}.gz"
+        counter += 1
+    temporary_archive = archive + ".tmp"
+    try:
+        with open(path, "rb") as source, gzip.open(temporary_archive, "wb", compresslevel=6) as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+        os.replace(temporary_archive, archive)
+        os.remove(path)
+    except Exception:
+        try:
+            if os.path.exists(temporary_archive):
+                os.remove(temporary_archive)
+        except OSError:
+            pass
+        raise
+    compressed_size = os.path.getsize(archive)
+    logger.info(
+        "[DECISION_SNAPSHOT_ROTATE] source=%s archive=%s bytes=%s compressed_bytes=%s",
+        path, archive, current_size, compressed_size,
+    )
+    return archive
+
+
+def append_decision_snapshot(snapshot: dict) -> bool:
+    """Best-effort append-only writer with per-file restart-safe deduplication."""
+    if not ENABLE_DECISION_SNAPSHOTS:
+        return False
+    try:
+        record = dict(snapshot) if isinstance(snapshot, dict) else {}
+        base_key = _decision_record_id(record, source="append")
+        if not base_key:
+            raise ValueError("decision snapshot has no valid decision key")
+        decision_key = _snapshot_dedupe_key(record)
+        if not decision_key:
+            raise ValueError("decision snapshot has no dedupe key")
+        path = os.path.abspath(DECISION_SNAPSHOTS_FILE)
+        with _decision_snapshot_lock:
+            keys = _decision_snapshot_keys_by_file.get(path)
+            if keys is None:
+                keys, order = _load_decision_snapshot_keys(path)
+                _decision_snapshot_keys_by_file[path] = keys
+                _decision_snapshot_order_by_file[path] = order
+            else:
+                order = _decision_snapshot_order_by_file.setdefault(path, deque(keys))
+            if decision_key in keys:
+                return False
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            _rotate_decision_snapshot_if_needed(path, len((payload + "\n").encode("utf-8")))
+            with open(path, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(payload + "\n")
+                fh.flush()
+            keys.add(decision_key)
+            order.append(decision_key)
+            _trim_decision_snapshot_key_cache(keys, order)
+            try:
+                _update_decision_snapshot_index(path, record)
+            except Exception:
+                _decision_snapshot_indexes_by_file.pop(path, None)
+                logger.exception(
+                    "[DECISION_INDEX_ERROR] action=update file=%s fallback=rebuild",
+                    path,
+                )
+        decision = record.get("decision", {})
+        probabilities = record.get("probabilities", {})
+        logger.info(
+            "[DECISION_SNAPSHOT] decision_id=%s fixture_id=%s minute=%s "
+            "window=%s decision=%s prob_to90=%.2f "
+            "active_publication_allow=%s channel_filter_passed=%s "
+            "legacy_selected_threshold=%.2f legacy_decision_margin_to90=%.2f "
+            "legacy_dynamic_enabled=%s legacy_decision_changed_vs_old=%s file=%s",
+            record.get("decision_id"), record.get("fixture_id"), record.get("minute"), record.get("window_name"),
+            decision.get("final_decision"), float(probabilities.get("prob_to90") or 0.0),
+            decision.get("active_publication_allow"),
+            decision.get("channel_signal_filter_passed"),
+            float(decision.get("selected_prob_to90_threshold") or 0.0), float(decision.get("decision_margin_to90") or 0.0),
+            decision.get("dynamic_threshold_enabled"), decision.get("overall_decision_changed_vs_old"), path,
+        )
+        return True
+    except Exception:
+        logger.exception("[DECISION_SNAPSHOT_ERROR] file=%s", DECISION_SNAPSHOTS_FILE)
+        return False
+
+
+def resolve_decision_snapshot_outcomes(
+    fixture_id: int,
+    events: List[Dict[str, Any]],
+    fixture_context: Dict[str, Any],
+    normal_time_score: Optional[Tuple[int, int]],
+    resolved_at_utc: str,
+    observation_records: Optional[List[Dict[str, Any]]] = None,
+    *,
+    include_terminal_records: bool = False,
+    terminalized_observation_ids: Optional[Set[str]] = None,
+) -> int:
+    """Append a restart-safe, score-aligned outcome for every stored decision."""
+    if not ENABLE_DECISION_SNAPSHOTS and not ENABLE_OBSERVATION_HISTORY:
+        return 0
+    decisions = (
+        get_decision_snapshots_for_fixture(
+            fixture_id,
+            include_terminal=include_terminal_records,
+        )
+        if ENABLE_DECISION_SNAPSHOTS and _decision_snapshot_paths()
+        else []
+    )
+
+    written = 0
+    for decision in decisions:
+        signal_minute = _safe_int(decision.get("minute"), 0)
+        match = decision.get("match") if isinstance(decision.get("match"), dict) else {}
+        snapshot_score = (
+            _safe_int(match.get("score_home"), 0),
+            _safe_int(match.get("score_away"), 0),
+        )
+        available_normal_goals = sum(
+            1 for event in (events or [])
+            if classify_goal_scope(event, fixture_context) in {
+                GoalScope.FIRST_HALF, GoalScope.SECOND_HALF_NORMAL_TIME
+            }
+        )
+        label_alignment_method = (
+            "snapshot_score_event_prefix"
+            if available_normal_goals >= snapshot_score[0] + snapshot_score[1]
+            else "strict_clock_minute_fallback"
+        )
+        classified = _classified_goals_after_signal(
+            events, signal_minute, fixture_context, snapshot_score=snapshot_score
+        )
+        normal = classified["normal_time"]
+        extra = classified["extra_time"]
+        shootout = classified["shootout"]
+        clocks = [entry[0].clock_minute for entry in normal if entry[0].clock_minute is not None]
+        first = normal[0][0] if normal else None
+        integrity = _resolve_outcome_integrity(
+            fixture_id=fixture_id,
+            signal_score=snapshot_score,
+            normal_time_score=normal_time_score,
+            normal_time_event_count=len(normal),
+        )
+        has_normal_time_goal = integrity.goal_to90_normal_time is True
+        score_delta = int(integrity.score_delta or 0)
+        goal_result_source = integrity.goal_result_source
+        score_timeline = get_score_timeline(fixture_id)
+        next_15_label = resolve_goal_within_horizon(
+            signal_minute, snapshot_score, 15, clocks, score_timeline,
+            normal_time_score, len(normal),
+        )
+        next_25_label = resolve_goal_within_horizon(
+            signal_minute, snapshot_score, 25, clocks, score_timeline,
+            normal_time_score, len(normal),
+        )
+        before_75_label = resolve_goal_within_horizon(
+            signal_minute, snapshot_score, max(0, 75 - signal_minute), clocks,
+            score_timeline, normal_time_score, len(normal),
+        )
+        outcome = {
+            "status": integrity.status,
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "goal_within_15": next_15_label["value"],
+            "goal_within_15_source": next_15_label["source"],
+            "goal_within_15_quality": next_15_label["quality"],
+            "goal_within_15_horizon_end_minute": next_15_label["horizon_end_minute"],
+            "goal_within_15_interval_start_minute": next_15_label["goal_interval_start_minute"],
+            "goal_within_15_interval_end_minute": next_15_label["goal_interval_end_minute"],
+            "goal_within_25": next_25_label["value"],
+            "goal_within_25_source": next_25_label["source"],
+            "goal_within_25_quality": next_25_label["quality"],
+            "goal_before_75": before_75_label["value"],
+            "goal_before_75_source": before_75_label["source"],
+            "goal_to90": has_normal_time_goal,
+            "goal_to90_normal_time": has_normal_time_goal,
+            "goal_in_extra_time": bool(extra),
+            "goals_after_snapshot": max(len(normal), score_delta),
+            "first_goal_minute_after_snapshot": first.clock_minute if first else None,
+            "first_normal_time_goal_after_snapshot": first.to_dict() if first else None,
+            "normal_time_final_score_home": normal_time_score[0] if normal_time_score else None,
+            "normal_time_final_score_away": normal_time_score[1] if normal_time_score else None,
+            "normal_time_result": integrity.normal_time_result,
+            "goal_result_source": goal_result_source,
+            "outcome_integrity_conflict": integrity.conflict,
+            "outcome_integrity_conflict_details": integrity.conflict_details,
+            "label_alignment_method": label_alignment_method,
+            "snapshot_score_home": snapshot_score[0],
+            "snapshot_score_away": snapshot_score[1],
+            "shootout_event_count_excluded": len(shootout),
+            "resolved_at_utc": resolved_at_utc,
+        }
+        outcome_schema_version = max(
+            int(DECISION_OUTCOME_SCHEMA_VERSION),
+            get_outcome_schema_version(decision),
+        )
+        outcome_revision = next_outcome_revision(
+            decision,
+            outcome,
+            schema_version=outcome_schema_version,
+        )
+        if outcome_revision is None:
+            continue
+        outcome["outcome_revision"] = int(outcome_revision)
+        record = {
+            "record_type": "outcome",
+            "decision_id": decision.get("decision_id"),
+            "decision_key": decision.get("decision_key") or decision.get("decision_id"),
+            "fixture_id": int(fixture_id),
+            "outcome_schema_version": int(outcome_schema_version),
+            "outcome_revision": int(outcome_revision),
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "created_at_utc": resolved_at_utc,
+            "outcome": outcome,
+        }
+        if append_decision_snapshot(record):
+            written += 1
+            append_shadow_outcome_record(
+                record.get("decision_id"),
+                int(fixture_id),
+                outcome,
+                resolved_at_utc,
+                outcome_schema_version=outcome_schema_version,
+                outcome_revision=outcome_revision,
+            )
+            logger.info(
+                "[DECISION_OUTCOME] schema=%s revision=%s decision_id=%s goal_to90_normal_time=%s goal_in_extra_time=%s normal_time_result=%s",
+                outcome_schema_version,
+                outcome_revision,
+                record.get("decision_id"), outcome["goal_to90_normal_time"], outcome["goal_in_extra_time"],
+                outcome["normal_time_result"],
+            )
+    resolve_observation_history_outcomes(
+        fixture_id,
+        events,
+        fixture_context,
+        normal_time_score,
+        resolved_at_utc,
+        observations=observation_records,
+        terminalized_observation_ids=terminalized_observation_ids,
+    )
+    return written
+
+
+def void_decision_snapshot_outcomes(
+    fixture_id: int,
+    reason: str,
+    resolved_at_utc: str,
+    *,
+    include_terminal_records: bool = False,
+    observation_records: Optional[List[Dict[str, Any]]] = None,
+    terminalized_observation_ids: Optional[Set[str]] = None,
+) -> int:
+    """Close decisions for cancelled/abandoned fixtures without training labels."""
+    decisions = get_decision_snapshots_for_fixture(
+        fixture_id,
+        include_terminal=include_terminal_records,
+    )
+    written = 0
+    for decision in decisions:
+        outcome = {
+            "status": "void",
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "void_reason": str(reason or "terminal_without_normal_time_result"),
+            "resolved_at_utc": resolved_at_utc,
+        }
+        outcome_schema_version = max(
+            int(DECISION_OUTCOME_SCHEMA_VERSION),
+            get_outcome_schema_version(decision),
+        )
+        outcome_revision = next_outcome_revision(
+            decision,
+            outcome,
+            schema_version=outcome_schema_version,
+        )
+        if outcome_revision is None:
+            continue
+        outcome["outcome_revision"] = int(outcome_revision)
+        record = {
+            "record_type": "outcome",
+            "decision_id": decision.get("decision_id"),
+            "decision_key": decision.get("decision_key") or decision.get("decision_id"),
+            "fixture_id": int(fixture_id),
+            "outcome_schema_version": int(outcome_schema_version),
+            "outcome_revision": int(outcome_revision),
+            "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
+            "created_at_utc": resolved_at_utc,
+            "outcome": outcome,
+        }
+        appended = append_decision_snapshot(record)
+        written += int(appended)
+        if appended:
+            append_shadow_outcome_record(
+                record.get("decision_id"),
+                int(fixture_id),
+                record["outcome"],
+                resolved_at_utc,
+                outcome_schema_version=outcome_schema_version,
+                outcome_revision=outcome_revision,
+            )
+    void_observation_history_outcomes(
+        fixture_id,
+        reason,
+        resolved_at_utc,
+        include_terminal_records=include_terminal_records,
+        observations=observation_records,
+        terminalized_observation_ids=terminalized_observation_ids,
+    )
+    return written
+
+
+_decision_outcome_last_checked: Dict[int, float] = {}
+_outcome_correction_last_checked: Dict[int, float] = {}
+_outcome_correction_next_sweep_ts = 0.0
+_outcome_correction_sweep_lock = threading.Lock()
+_second_half_incomplete_retry_lock = threading.Lock()
+# fixture_id -> (consecutive incomplete responses, next retry epoch)
+_second_half_incomplete_retry: Dict[int, Tuple[int, float]] = {}
+
+
+def _second_half_incomplete_retry_is_due(fixture_id: int, current_ts: float) -> bool:
+    with _second_half_incomplete_retry_lock:
+        retry = _second_half_incomplete_retry.get(int(fixture_id))
+    return retry is None or float(current_ts) >= float(retry[1])
+
+
+def _defer_second_half_incomplete_retry(
+    fixture_id: int,
+    current_ts: float,
+) -> Tuple[int, int]:
+    fixture_key = int(fixture_id)
+    with _second_half_incomplete_retry_lock:
+        previous = _second_half_incomplete_retry.get(fixture_key)
+        attempts = int(previous[0]) + 1 if previous else 1
+        exponent = min(max(0, attempts - 1), 20)
+        delay_seconds = min(
+            int(SECOND_HALF_INCOMPLETE_RETRY_MAX_SECONDS),
+            int(SECOND_HALF_INCOMPLETE_RETRY_BASE_SECONDS) * (2 ** exponent),
+        )
+        _second_half_incomplete_retry[fixture_key] = (
+            attempts,
+            float(current_ts) + float(delay_seconds),
+        )
+    return attempts, int(delay_seconds)
+
+
+def _clear_second_half_incomplete_retry(fixture_id: int) -> None:
+    with _second_half_incomplete_retry_lock:
+        _second_half_incomplete_retry.pop(int(fixture_id), None)
+
+
+def _prune_second_half_incomplete_retries(missing_fixture_ids: Set[int]) -> None:
+    missing = {int(value) for value in missing_fixture_ids}
+    with _second_half_incomplete_retry_lock:
+        stale = set(_second_half_incomplete_retry) - missing
+        for fixture_id in stale:
+            _second_half_incomplete_retry.pop(fixture_id, None)
+
+
+def pending_decision_snapshot_fixture_ids() -> List[int]:
+    """Return fixtures that do not yet have a current-schema terminal outcome."""
+    with _decision_snapshot_lock:
+        index = _get_decision_snapshot_index()
+        if not index.get("invalid"):
+            return sorted(
+                int(fixture_id)
+                for fixture_id, decision_ids in tuple(
+                    (index.get("pending_decision_ids_by_fixture") or {}).items()
+                )
+                if decision_ids
+            )
+
+    pending: Set[int] = set()
+    for record in load_joined_decision_snapshots():
+        outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
+        outcome_schema = _safe_int(record.get("outcome_schema_version"), 0)
+        terminal = outcome.get("status") in {
+            "resolved", "void", "quarantine"
+        }
+        if not terminal or outcome_schema < int(DECISION_OUTCOME_SCHEMA_VERSION):
+            fixture_id = _safe_int(record.get("fixture_id"), -1)
+            if fixture_id >= 0:
+                pending.add(fixture_id)
+    return sorted(pending)
+
+
+def _rescheduled_pending_fixture_void_reason(
+    raw_fixture: Mapping[str, Any],
+    evidence_records: Iterable[Mapping[str, Any]],
+) -> Optional[str]:
+    """Detect a provider fixture id reset after live evidence already existed.
+
+    API-Football can move an abandoned fixture to a future kickoff while
+    keeping its id. Once the status is reset to NS/TBD, the old observation
+    must be closed without a label; otherwise the later replay would become
+    its (incorrect) outcome.
+    """
+
+    status_short = _extract_status_short_from_raw_fixture(dict(raw_fixture))
+    if status_short not in {"NS", "TBD"}:
+        return None
+    fixture_block = (
+        raw_fixture.get("fixture")
+        if isinstance(raw_fixture.get("fixture"), Mapping)
+        else {}
+    )
+    scheduled_at = _parse_iso_utc(fixture_block.get("date"))
+    if scheduled_at is None:
+        return None
+
+    evidence_times: List[datetime] = []
+    match_was_observed = False
+    for record in evidence_records:
+        if not isinstance(record, Mapping):
+            continue
+        created_at = _parse_iso_utc(record.get("created_at_utc"))
+        if created_at is not None:
+            evidence_times.append(created_at)
+        if _safe_int(record.get("minute"), -1) >= 0:
+            match_was_observed = True
+    if not evidence_times or not match_was_observed:
+        return None
+
+    latest_evidence_at = max(evidence_times)
+    shift_seconds = (scheduled_at - latest_evidence_at).total_seconds()
+    if shift_seconds < float(DECISION_OUTCOME_RESCHEDULE_MIN_SHIFT_SECONDS):
+        return None
+    return f"fixture_rescheduled_{status_short.lower()}"
+
+
+def reconcile_pending_decision_outcomes(
+    client,
+    live_fixture_ids: Optional[Set[int]] = None,
+    *,
+    limit: Optional[int] = None,
+    now_ts: Optional[float] = None,
+) -> Dict[str, int]:
+    """Resolve decisions for blocked as well as signalled fixtures.
+
+    Only fixtures no longer present in the live feed are queried. Unfinished
+    fixtures are rate-limited, while terminal fixtures are resolved once and
+    deduplicated by the append-only writer.
+    """
+    summary = {"checked": 0, "resolved_fixtures": 0, "void_fixtures": 0, "records_written": 0}
+    if not ENABLE_DECISION_SNAPSHOTS and not ENABLE_OBSERVATION_HISTORY:
+        return summary
+    live_ids = {int(value) for value in (live_fixture_ids or set())}
+    current_ts = float(now_ts if now_ts is not None else time.time())
+    max_fixtures = int(limit or DECISION_OUTCOME_RECONCILE_LIMIT)
+    candidates: List[int] = []
+    pending_fixture_ids = (
+        set(pending_decision_snapshot_fixture_ids())
+        if ENABLE_DECISION_SNAPSHOTS
+        else set()
+    )
+    global _outcome_correction_next_sweep_ts
+    correction_sweep_due = False
+    if ENABLE_OBSERVATION_HISTORY and ENABLE_OUTCOME_CORRECTION_RECHECK:
+        with _outcome_correction_sweep_lock:
+            if current_ts >= float(_outcome_correction_next_sweep_ts):
+                correction_sweep_due = True
+                _outcome_correction_next_sweep_ts = (
+                    current_ts + float(OUTCOME_CORRECTION_RECHECK_SECONDS)
+                )
+    current_datetime = datetime.fromtimestamp(current_ts, tz=timezone.utc)
+    correction_since = (
+        current_datetime - timedelta(hours=OUTCOME_CORRECTION_LOOKBACK_HOURS)
+        if correction_sweep_due
+        else None
+    )
+    pending_observation_times: Dict[int, str] = {}
+    pending_observation_ids, collectable_2h_ids, recent_terminal_ids = (
+        _observation_fixture_reconcile_sets(
+            recent_terminal_since=correction_since,
+            recent_terminal_until=current_datetime,
+            pending_oldest_by_fixture=pending_observation_times,
+        )
+        if ENABLE_OBSERVATION_HISTORY
+        else (set(), set(), set())
+    )
+    pending_fixture_ids.update(pending_observation_ids)
+    missing_second_half_ids = (
+        collectable_2h_ids - load_second_half_fixture_ids(SECOND_HALF_HISTORY_PATH)
+        if ENABLE_2H_COLLECTION
+        else set()
+    )
+    _prune_second_half_incomplete_retries(missing_second_half_ids)
+    prioritized_fixture_ids = [
+        *sorted(pending_fixture_ids),
+        *sorted(missing_second_half_ids - pending_fixture_ids),
+    ]
+    for fixture_id in prioritized_fixture_ids:
+        if fixture_id in live_ids:
+            continue
+        if (
+            fixture_id not in pending_fixture_ids
+            and fixture_id in missing_second_half_ids
+            and not _second_half_incomplete_retry_is_due(fixture_id, current_ts)
+        ):
+            continue
+        last_checked = float(_decision_outcome_last_checked.get(fixture_id, 0.0) or 0.0)
+        if current_ts - last_checked < DECISION_OUTCOME_RECHECK_SECONDS:
+            continue
+        candidates.append(fixture_id)
+        if len(candidates) >= max_fixtures:
+            break
+
+    correction_candidates: Set[int] = set()
+    if correction_sweep_due:
+        eligible_corrections = recent_terminal_ids - live_ids
+        for fixture_id in sorted(
+            eligible_corrections,
+            key=lambda value: (
+                float(_outcome_correction_last_checked.get(value, 0.0)),
+                int(value),
+            ),
+        ):
+            last_checked = float(
+                _outcome_correction_last_checked.get(fixture_id, 0.0) or 0.0
+            )
+            if current_ts - last_checked < OUTCOME_CORRECTION_RECHECK_SECONDS:
+                continue
+            correction_candidates.add(fixture_id)
+            if fixture_id not in candidates:
+                candidates.append(fixture_id)
+            if len(correction_candidates) >= OUTCOME_CORRECTION_RECHECK_LIMIT:
+                break
+        # Bound the in-memory scheduler to the actual lookback cohort.
+        for stale_fixture_id in (
+            set(_outcome_correction_last_checked) - recent_terminal_ids
+        ):
+            _outcome_correction_last_checked.pop(stale_fixture_id, None)
+
+    pending_observation_map = pending_observations_by_fixture(set(candidates))
+    if correction_candidates:
+        pending_observation_map.update(
+            pending_observations_by_fixture(
+                correction_candidates,
+                include_terminal=True,
+            )
+        )
+    terminal_statuses = {"resolved", "void", "quarantine"}
+    pending_observation_keys_by_fixture: Dict[int, Set[str]] = {}
+    for fixture_id, observation_records in pending_observation_map.items():
+        pending_keys = {
+            str(
+                observation.get("observation_key")
+                or observation.get("observation_id")
+                or ""
+            )
+            for observation in observation_records
+            if str((observation.get("outcome") or {}).get("status") or "")
+            not in terminal_statuses
+        }
+        pending_keys.discard("")
+        if pending_keys:
+            pending_observation_keys_by_fixture[int(fixture_id)] = pending_keys
+    second_half_stored = 0
+    terminalized_pending_fixture_ids: Set[int] = set()
+    for fixture_id in candidates:
+        confirmed_observation_ids: Set[str] = set()
+        _decision_outcome_last_checked[fixture_id] = current_ts
+        if fixture_id in correction_candidates:
+            _outcome_correction_last_checked[fixture_id] = current_ts
+        summary["checked"] += 1
+        try:
+            raw_fixture = client.fetch_fixture(fixture_id) or {}
+            status_short = _extract_status_short_from_raw_fixture(raw_fixture)
+            if fixture_id in pending_fixture_ids:
+                evidence_records = list(
+                    pending_observation_map.get(fixture_id, [])
+                )
+                if not evidence_records and ENABLE_DECISION_SNAPSHOTS:
+                    evidence_records = get_decision_snapshots_for_fixture(
+                        fixture_id
+                    )
+                reschedule_reason = _rescheduled_pending_fixture_void_reason(
+                    raw_fixture,
+                    evidence_records,
+                )
+                if reschedule_reason:
+                    written = void_decision_snapshot_outcomes(
+                        fixture_id,
+                        reschedule_reason,
+                        _utc_now_iso(),
+                        include_terminal_records=False,
+                        observation_records=pending_observation_map.get(
+                            fixture_id, []
+                        ),
+                        terminalized_observation_ids=confirmed_observation_ids,
+                    )
+                    summary["void_fixtures"] += 1
+                    summary["records_written"] += written
+                    expected_observation_ids = (
+                        pending_observation_keys_by_fixture.get(fixture_id, set())
+                    )
+                    if (
+                        fixture_id in pending_observation_ids
+                        and expected_observation_ids
+                        and expected_observation_ids.issubset(
+                            confirmed_observation_ids
+                        )
+                    ):
+                        terminalized_pending_fixture_ids.add(fixture_id)
+                    logger.warning(
+                        "[DECISION_OUTCOME_RESCHEDULE] fixture_id=%s "
+                        "status=%s reason=%s action=void_old_evidence",
+                        fixture_id,
+                        status_short,
+                        reschedule_reason,
+                    )
+                    continue
+            if status_short in {"CANC", "ABD", "AWD", "WO", "PST"}:
+                written = void_decision_snapshot_outcomes(
+                    fixture_id,
+                    f"fixture_status_{status_short.lower()}",
+                    _utc_now_iso(),
+                    include_terminal_records=fixture_id in correction_candidates,
+                    observation_records=pending_observation_map.get(
+                        fixture_id, []
+                    ),
+                    terminalized_observation_ids=confirmed_observation_ids,
+                )
+                summary["void_fixtures"] += 1
+                summary["records_written"] += written
+                expected_observation_ids = (
+                    pending_observation_keys_by_fixture.get(fixture_id, set())
+                )
+                if (
+                    fixture_id in pending_observation_ids
+                    and expected_observation_ids
+                    and expected_observation_ids.issubset(
+                        confirmed_observation_ids
+                    )
+                ):
+                    terminalized_pending_fixture_ids.add(fixture_id)
+                continue
+            if status_short not in {"FT", "AET", "PEN"}:
+                continue
+            score_blocks = normalize_score_blocks(raw_fixture)
+            normal_score_block = score_blocks.get("normal_time") or {}
+            normal_score = None
+            if normal_score_block.get("home") is not None and normal_score_block.get("away") is not None:
+                normal_score = (
+                    _safe_int(normal_score_block.get("home"), 0),
+                    _safe_int(normal_score_block.get("away"), 0),
+                )
+            if fixture_id in correction_candidates and normal_score is None:
+                logger.warning(
+                    "[OUTCOME_CORRECTION_DEFER] fixture_id=%s "
+                    "reason=normal_time_score_unavailable",
+                    fixture_id,
+                )
+                continue
+            fetch_events_response = getattr(
+                client, "fetch_fixture_events_response", None
+            )
+            if callable(fetch_events_response):
+                events_payload = fetch_events_response(fixture_id)
+                if fixture_id in correction_candidates and not isinstance(events_payload, list):
+                    logger.warning("[OUTCOME_CORRECTION_DEFER] fixture_id=%s reason=events_unavailable", fixture_id)
+                    continue
+                embedded_events = raw_fixture.get("events")
+                if not isinstance(embedded_events, list):
+                    fixture_block = raw_fixture.get("fixture")
+                    embedded_events = (
+                        fixture_block.get("events")
+                        if isinstance(fixture_block, dict)
+                        else []
+                    )
+                events = (
+                    events_payload
+                    if isinstance(events_payload, list)
+                    else embedded_events
+                    if isinstance(embedded_events, list)
+                    else []
+                )
+            else:
+                events_payload = client.fetch_fixture_events(fixture_id)
+                if fixture_id in correction_candidates and not isinstance(
+                    events_payload, list
+                ):
+                    logger.warning(
+                        "[OUTCOME_CORRECTION_DEFER] fixture_id=%s "
+                        "reason=events_unavailable",
+                        fixture_id,
+                    )
+                    continue
+                events = events_payload if isinstance(events_payload, list) else []
+            written = resolve_decision_snapshot_outcomes(
+                fixture_id,
+                events,
+                _fixture_event_context(raw_fixture),
+                normal_score,
+                _utc_now_iso(),
+                observation_records=pending_observation_map.get(fixture_id, []),
+                include_terminal_records=fixture_id in correction_candidates,
+                terminalized_observation_ids=confirmed_observation_ids,
+            )
+            summary["resolved_fixtures"] += 1
+            summary["records_written"] += written
+            expected_observation_ids = pending_observation_keys_by_fixture.get(
+                fixture_id, set()
+            )
+            if (
+                fixture_id in pending_observation_ids
+                and expected_observation_ids
+                and expected_observation_ids.issubset(
+                    confirmed_observation_ids
+                )
+            ):
+                terminalized_pending_fixture_ids.add(fixture_id)
+            if (
+                fixture_id in missing_second_half_ids
+                and _second_half_incomplete_retry_is_due(fixture_id, current_ts)
+            ):
+                try:
+                    stored_second_half = store_second_half_history_payload(
+                        raw_fixture,
+                        events_payload,
+                        source="observation_reconcile",
+                        aggregate=False,
+                        # Keep retroactive backfill in true chronological order.
+                        # The parser derives a stable kickoff-based finish time
+                        # instead of making an old fixture look newly finished.
+                        observed_finished_at_utc=None,
+                        raise_incomplete=True,
+                    )
+                    second_half_stored += int(stored_second_half)
+                    if stored_second_half:
+                        _clear_second_half_incomplete_retry(fixture_id)
+                except IncompleteSecondHalfDataError as exc:
+                    attempts, retry_seconds = _defer_second_half_incomplete_retry(
+                        fixture_id,
+                        current_ts,
+                    )
+                    logger.warning(
+                        "[2H_DATA_DEFER] fixture_id=%s source=observation_reconcile "
+                        "reason=%s attempts=%s retry_seconds=%s",
+                        fixture_id,
+                        exc,
+                        attempts,
+                        retry_seconds,
+                    )
+        except Exception:
+            logger.exception("[DECISION_OUTCOME_RECONCILE] fixture_id=%s action=failed", fixture_id)
+    if terminalized_pending_fixture_ids:
+        # Re-read the cheap derived index after durable writes.  A rolling
+        # seed/observation may have arrived after the initial preload; using
+        # only the old set would falsely hide that late pending evidence from
+        # health telemetry.  This query does not rescan the source archives.
+        _observation_fixture_reconcile_sets()
+    if second_half_stored:
+        _aggregate_second_half_history(source="observation_reconcile_batch")
+    if summary["checked"]:
+        logger.info(
+            "[DECISION_OUTCOME_RECONCILE] checked=%s resolved_fixtures=%s void_fixtures=%s records_written=%s second_half_stored=%s second_half_missing_candidates=%s correction_rechecks=%s",
+            summary["checked"], summary["resolved_fixtures"], summary["void_fixtures"], summary["records_written"], second_half_stored, len(missing_second_half_ids),
+            len(correction_candidates),
+        )
+    return summary
+
 
 # -------------------------
 # Monitoring & handling events after sending a signal
@@ -12440,7 +28618,10 @@ def _score_change_allowed_fallback(match_id: int) -> bool:
     except Exception:
         return False
 
-def recompute_goals_after_signal(match_id: int, events: List[Dict[str, Any]], init_score: Tuple[int, int], cur_score: Tuple[int, int]) -> List[int]:
+def recompute_goals_after_signal(
+    match_id: int, events: List[Dict[str, Any]], init_score: Tuple[int, int],
+    cur_score: Tuple[int, int], fixture_context: Optional[Dict[str, Any]] = None,
+) -> List[int]:
     """
     Rebuild list of goal minutes after signal based ONLY on valid (counted) events.
     Also limits list length to actual number of goals after signal based on score.
@@ -12473,9 +28654,11 @@ def recompute_goals_after_signal(match_id: int, events: List[Dict[str, Any]], in
         
         if not _is_valid_counted_goal(ev):
             continue
+        if NORMAL_TIME_BOUNDARY_MODE == "strict" and not is_normal_time_goal(ev, fixture_context or {}):
+            continue
         
         # Use new extraction function that handles extra time correctly
-        m = _extract_event_minute(ev)
+        m = _extract_event_time(ev, fixture_context or {}).clock_minute
         if m is None:
             continue
         
@@ -12497,6 +28680,59 @@ def recompute_goals_after_signal(match_id: int, events: List[Dict[str, Any]], in
     
     return minutes
 
+
+def _normal_time_score_at_boundary(
+    fixture: Dict[str, Any], current_score: Tuple[int, int],
+    extra_time_goals: List[Tuple[EventTime, Dict[str, Any]]],
+) -> Tuple[Tuple[int, int], str]:
+    score_block = fixture.get("score") if isinstance(fixture.get("score"), dict) else {}
+    normal_block = score_block.get("normal_time") if isinstance(score_block.get("normal_time"), dict) else None
+    if normal_block and normal_block.get("home") is not None and normal_block.get("away") is not None:
+        return (int(normal_block["home"]), int(normal_block["away"])), str(normal_block.get("source") or "score.fulltime")
+
+    home_id = _unwrap_metric_int(fixture.get("team_home_id"))
+    away_id = _unwrap_metric_int(fixture.get("team_away_id"))
+    home, away = int(current_score[0]), int(current_score[1])
+    complete = True
+    for _, event in extra_time_goals:
+        raw = event.get("raw") if isinstance(event.get("raw"), dict) else event
+        team = raw.get("team") if isinstance(raw.get("team"), dict) else {}
+        team_id = _safe_int(team.get("id"), -1)
+        if home_id is not None and team_id == home_id:
+            home -= 1
+        elif away_id is not None and team_id == away_id:
+            away -= 1
+        else:
+            complete = False
+    if complete and home >= 0 and away >= 0:
+        return (home, away), "events"
+    return current_score, "boundary_current_score"
+
+
+def render_normal_time_boundary_message(
+    header_text: str,
+    normal_time_result: str,
+    normal_time_score: Tuple[int, int],
+    went_to_extra_time: bool,
+) -> str:
+    won = str(normal_time_result).upper() == "WIN"
+    lines = [
+        str(header_text or "🚨 Сигнал"),
+        "",
+        "✅ Основное время завершено" if won else "❌ Основное время завершено",
+        f"Счёт после основного времени: {normal_time_score[0]} - {normal_time_score[1]}",
+        (
+            "После сигнала был гол в основном времени."
+            if won else "После сигнала гола в основном времени не было."
+        ),
+    ]
+    if went_to_extra_time:
+        lines.extend([
+            "Матч перешёл в дополнительное время.",
+            "Дополнительное время не входит в прогноз prob_to90.",
+        ])
+    return "\n".join(lines)
+
 # -------------------------
 # perform_monitor_update (modified to implement temporary goal/cancellation messages)
 # -------------------------
@@ -12515,10 +28751,23 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
 
         minute = int((fixture.get("elapsed") or {}).get("value") or 0)
         status_short = _normalize_status_short(fixture)
+        extra_value = _safe_int(get_metric_from_fixture(fixture, "extra_time", 0), 0)
+        fixture_context = {"status_short": status_short, "status": status_short}
+        current_period = classify_match_period(
+            fixture_status_short=status_short, elapsed=minute, extra=extra_value
+        )
+        logger.info(
+            "[MATCH_PERIOD] fixture_id=%s status=%s elapsed=%s extra=%s classified_period=%s",
+            match_id, status_short, minute, extra_value, current_period.value,
+        )
         current_home = int((fixture.get("score_home") or {}).get("value") or 0)
         current_away = int((fixture.get("score_away") or {}).get("value") or 0)
         current_score = (current_home, current_away)
         is_terminal_status = status_short in ("FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO")
+        if minute > 0 or is_terminal_status:
+            record_score_timeline_observation(
+                match_id, minute, current_home, current_away, status_short
+            )
 
         with state_lock:
             tracked_rec = state.get("tracked_matches", {}).get(str(match_id))
@@ -12588,6 +28837,17 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
             except Exception:
                 return int(current_home), int(current_away)
 
+        with state_lock:
+            signal_meta = state.get("signal_snapshot_meta", {}).get(str(match_id), {}) or {}
+            saved_signal_header = state.get("signal_header_texts", {}).get(str(match_id))
+        signal_model = str(signal_meta.get("signal_model") or "")
+        signal_route = "rescue" if str(signal_meta.get("signal_route") or "").lower() == "rescue" else "primary"
+        premium_badge = bool(
+            signal_meta.get("premium_badge", False)
+            and signal_meta.get("premium_badge_rule_version")
+            == PREMIUM_BADGE_RULE_VERSION
+        )
+
         prev_tracking = get_persistent_fixture_tracking(match_id)
         if not prev_tracking:
             with state_lock:
@@ -12601,14 +28861,27 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 }
                 mark_state_dirty()
 
-            prob_snapshot = compute_lambda_and_probability(fixture, minute).get("prob_goal_either_to75", 0.0)
+            if signal_model == "45_plus":
+                probability_snapshot = compute_probability_45_plus_with_reputation(
+                    fixture,
+                    minute,
+                    application_context="monitor_recovery",
+                )
+                prob_snapshot = probability_snapshot.get("prob_next_15", 0.0)
+                prob_snapshot_90 = probability_snapshot.get("prob_to90")
+            else:
+                probability_snapshot = compute_lambda_and_probability(fixture, minute)
+                prob_snapshot = probability_snapshot.get("prob_next_15", 0.0)
+                prob_snapshot_90 = probability_snapshot.get("prob_goal_either_to90")
             signal_score_snapshot = _get_signal_score_snapshot()
             header_text = render_live_message(
                 current_data=data,
                 signal_score=signal_score_snapshot,
                 prob_display=prob_snapshot,
-                prob_display_90=None,
+                prob_display_90=prob_snapshot_90,
                 is_admin_approved=False,
+                signal_route=signal_route,
+                premium_badge=premium_badge,
             )
             live_footer = build_live_footer(
                 current_data=data,
@@ -12676,6 +28949,14 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                     "last_pressure_index": calculate_pressure_index(fixture),
                 }
             st = state["match_goal_status"][str(match_id)]
+            st.setdefault("normal_time_outcome_finalized", False)
+            st.setdefault("normal_time_result", None)
+            st.setdefault("normal_time_resolved_at_utc", None)
+            st.setdefault("normal_time_final_score_home", None)
+            st.setdefault("normal_time_final_score_away", None)
+            st.setdefault("normal_time_goal_events_after_signal", [])
+            st.setdefault("extra_time_goal_events_after_signal", [])
+            st.setdefault("shootout_events_excluded", 0)
 
         try:
             init_home_i = int(init_score[0])
@@ -12684,7 +28965,27 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
             init_home_i, init_away_i = current_home, current_away
         init_score = (init_home_i, init_away_i)
 
-        scored_goals_after_signal = recompute_goals_after_signal(match_id, events, init_score, current_score)
+        scored_goals_after_signal = recompute_goals_after_signal(
+            match_id, events, init_score, current_score, fixture_context
+        )
+        signal_minute_for_scope = _safe_int(
+            state.get("match_initial_minute", {}).get(str(match_id), 0), 0
+        )
+        classified_after_signal = _classified_goals_after_signal(
+            events, signal_minute_for_scope, fixture_context
+        )
+        extra_time_goals_after_signal = classified_after_signal["extra_time"]
+        shootout_events_after_signal = classified_after_signal["shootout"]
+        for event_time, _ in extra_time_goals_after_signal:
+            logger.info(
+                "[EXTRA_TIME_GOAL_EXCLUDED] fixture_id=%s event_elapsed=%s event_extra=%s display_minute=%s signal_outcome_unchanged=True",
+                match_id, event_time.elapsed, event_time.extra, event_time.display_minute,
+            )
+        for event_time, _ in shootout_events_after_signal:
+            logger.info(
+                "[SHOOTOUT_EVENT_EXCLUDED] fixture_id=%s event_elapsed=%s event_extra=%s signal_outcome_unchanged=True",
+                match_id, event_time.elapsed, event_time.extra,
+            )
         now_ts = time.time()
         with state_lock:
             prev_goals = state.setdefault("match_goals_after_signal", {}).get(str(match_id), [])
@@ -12763,6 +29064,77 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
         is_finished = status_short in FINISHED_STATUSES
         if status_value in ("finished", "match finished"):
             is_finished = True
+
+        normal_time_boundary = has_normal_time_finished(fixture, st)
+        normal_time_already_finalized = bool(st.get("normal_time_outcome_finalized", False))
+        if NORMAL_TIME_BOUNDARY_MODE == "strict" and normal_time_boundary and not normal_time_already_finalized:
+            normal_score, normal_score_source = _normal_time_score_at_boundary(
+                fixture, current_score, extra_time_goals_after_signal
+            )
+            resolved_at = _utc_now_iso()
+            normal_score_increased = (
+                int(normal_score[0]) + int(normal_score[1])
+                > int(init_score[0]) + int(init_score[1])
+            )
+            normal_result = "WIN" if normal_score_increased or scored_goals_after_signal else "LOSS"
+            normal_event_payloads = [
+                _extract_event_time(event, fixture_context).to_dict()
+                for event in events
+                if is_normal_time_goal(event, fixture_context) and _event_happened_after_signal(match_id, event)
+            ]
+            extra_event_payloads = [entry[0].to_dict() for entry in extra_time_goals_after_signal]
+            with state_lock:
+                st["normal_time_outcome_finalized"] = True
+                st["normal_time_result"] = normal_result
+                st["normal_time_resolved_at_utc"] = resolved_at
+                st["normal_time_final_score_home"] = normal_score[0]
+                st["normal_time_final_score_away"] = normal_score[1]
+                st["normal_time_goal_events_after_signal"] = normal_event_payloads
+                st["extra_time_goal_events_after_signal"] = extra_event_payloads
+                st["shootout_events_excluded"] = len(shootout_events_after_signal)
+                st["normal_time_score_source"] = normal_score_source
+                mark_state_dirty()
+            logger.info(
+                "[NORMAL_TIME_BOUNDARY] fixture_id=%s previous_status=%s current_status=%s normal_time_finished=True boundary_reason=%s",
+                match_id, (tracked_rec or {}).get("status") if isinstance(tracked_rec, dict) else None,
+                status_short, "transition_to_et" if current_period in {
+                    MatchPeriod.EXTRA_TIME_FIRST_HALF, MatchPeriod.EXTRA_TIME_FIRST_HALF_STOPPAGE,
+                    MatchPeriod.EXTRA_TIME_BREAK, MatchPeriod.EXTRA_TIME_SECOND_HALF,
+                    MatchPeriod.EXTRA_TIME_SECOND_HALF_STOPPAGE,
+                } else ("pen" if is_shootout_active(fixture) else "ft"),
+            )
+            logger.info(
+                "[NORMAL_TIME_OUTCOME_FINALIZED] fixture_id=%s signal_minute=%s result=%s normal_time_goals_after_signal=%s score_increased=%s normal_time_final_score=%s-%s resolved_at=%s",
+                match_id, signal_minute_for_scope, normal_result, len(scored_goals_after_signal), normal_score_increased,
+                normal_score[0], normal_score[1], resolved_at,
+            )
+            logger.info(
+                "[NORMAL_TIME_SCORE_SOURCE] fixture_id=%s status=%s source=%s normal_time_score=%s-%s after_extra_time_score=None penalty_score=None",
+                match_id, status_short, normal_score_source, normal_score[0], normal_score[1],
+            )
+            try:
+                resolve_decision_snapshot_outcomes(
+                    match_id, events, fixture_context, normal_score, resolved_at
+                )
+            except Exception:
+                logger.exception("[DECISION_OUTCOME_V2] fixture_id=%s action=best_effort_failed", match_id)
+            try:
+                process_normal_time_outcomes_for_jsonl(
+                    match_id, events, fixture_context, normal_score, resolved_at
+                )
+            except Exception:
+                logger.exception("[TRAINING_OUTCOME_V2] fixture_id=%s action=best_effort_failed", match_id)
+            boundary_header = resolve_signal_header_title(
+                is_admin_approved=bool(st.get("approved_by_admin", False)),
+                signal_route=signal_route,
+                premium_badge=premium_badge,
+                saved_header_text=saved_signal_header,
+            )
+            boundary_text = render_normal_time_boundary_message(
+                boundary_header, normal_result, normal_score,
+                went_to_extra_time=is_extra_time_active(fixture) or is_shootout_active(fixture),
+            )
+            edit_telegram_message_improved(boundary_text, match_id)
         if isinstance(elapsed_label, str) and elapsed_label.strip().lower() in ("ft", "finished", "match finished"):
             is_finished = True
 
@@ -12776,17 +29148,16 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
 
         need_refresh = can_edit_now or score_changed or is_finished
 
-        signal_meta = {}
-        with state_lock:
-            signal_meta = state.get("signal_snapshot_meta", {}).get(str(match_id), {}) or {}
-        signal_model = str(signal_meta.get("signal_model") or "")
-
         res = None
         prob_90 = None
         if need_refresh:
             if signal_model == "45_plus":
-                res = compute_probability_45_plus(fixture, minute)
-                prob_now = res.get("prob_second_half_remain", 0.0)
+                res = compute_probability_45_plus_with_reputation(
+                    fixture,
+                    minute,
+                    application_context="update",
+                )
+                prob_now = res.get("prob_next_15", 0.0)
                 prob_90 = res.get("prob_to90") if res else None
                 logger.info(
                     f"[UPDATE_47+] match={match_id} minute={minute} "
@@ -12794,11 +29165,18 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                     f"live_intensity={res.get('adjusted_intensity', 0.0):.3f} "
                     f"lambda_2h={res.get('lambda_2h', 0.0):.4f} "
                     f"prob_next_15={res.get('prob_next_15', 0.0):.2f}% "
-                    f"prob_second_half_remain={prob_now:.2f}%"
+                    f"prob_to90={float(prob_90 or 0.0):.2f}% "
+                    f"reputation_active={bool((res.get('reputation_application') or {}).get('active', False))}"
+                )
+                persist_wide_monitor_snapshot(
+                    fixture_id=int(match_id),
+                    minute=int(minute),
+                    fixture_metrics=fixture,
+                    probability_result=res,
                 )
             else:
                 res = compute_lambda_and_probability(fixture, minute)
-                prob_now = res.get("prob_goal_either_to75", 0.0)
+                prob_now = res.get("prob_next_15", 0.0)
                 prob_90 = res.get("prob_goal_either_to90") if res else None
         else:
             with state_lock:
@@ -12806,7 +29184,8 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
 
         updated = False
 
-        if need_refresh and not st.get("finalized", False) and not is_finished:
+        if (need_refresh and not st.get("finalized", False) and not is_finished
+                and not (NORMAL_TIME_BOUNDARY_MODE == "strict" and st.get("normal_time_outcome_finalized", False))):
             is_admin_approved = st.get("approved_by_admin", False)
             main_text = render_live_message(
                 current_data=data,
@@ -12814,6 +29193,8 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 prob_display=prob_now,
                 prob_display_90=prob_90,
                 is_admin_approved=is_admin_approved,
+                signal_route=signal_route,
+                premium_badge=premium_badge,
             )
             live_footer = build_live_footer(
                 current_data=data,
@@ -12863,13 +29244,22 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
 
             signal_home = int(signal_score_snapshot[0])
             signal_away = int(signal_score_snapshot[1])
-            final_home = int(cur_score[0])
-            final_away = int(cur_score[1])
+            if NORMAL_TIME_BOUNDARY_MODE == "strict" and st.get("normal_time_outcome_finalized"):
+                final_home = int(st.get("normal_time_final_score_home", cur_score[0]))
+                final_away = int(st.get("normal_time_final_score_away", cur_score[1]))
+            else:
+                final_home = int(cur_score[0])
+                final_away = int(cur_score[1])
 
             with state_lock:
                 is_admin_approved = state["match_goal_status"][str(match_id)].get("approved_by_admin", False)
 
-            header_text = "🚨 Сигнал от админа" if is_admin_approved else "🚨 Сигнал"
+            header_text = resolve_signal_header_title(
+                is_admin_approved=is_admin_approved,
+                signal_route=signal_route,
+                premium_badge=premium_badge,
+                saved_header_text=saved_signal_header,
+            )
 
             msg = render_final_message({
                 "data": data,
@@ -12879,6 +29269,9 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 "final_home": final_home,
                 "final_away": final_away,
                 "goal_minutes": scored_goals_after_signal,
+                "normal_time_result": st.get("normal_time_result"),
+                "normal_time_boundary_mode": NORMAL_TIME_BOUNDARY_MODE,
+                "went_to_extra_time": status_short in {"AET", "PEN"},
             }, header_text=header_text)
             logger.info(
                 "[MESSAGE_MODE] FINAL rendered match=%s header=\"%s\" final=%s-%s signal=%s-%s goals=%s",
@@ -12893,8 +29286,16 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
 
             edited_final = edit_telegram_message_improved(msg, match_id)
             if edited_final:
-                final_badge = "✅" if bool(scored_goals_after_signal) else "❌"
-                final_text = f"{final_badge} Финальный счёт: {cur_score[0]} - {cur_score[1]}"
+                has_goal_after_signal = determine_normal_time_goal_result(
+                    signal_home,
+                    signal_away,
+                    final_home,
+                    final_away,
+                    scored_goals_after_signal,
+                    st.get("normal_time_result"),
+                )
+                final_badge = "✅" if has_goal_after_signal else "❌"
+                final_text = f"{final_badge} Счёт после основного времени: {final_home} - {final_away}"
 
                 with state_lock:
                     state["match_goal_status"][str(match_id)]["finalized"] = True
@@ -12916,17 +29317,10 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                             all_events = data.get("events", [])
                             goals_minutes = []
                             for ev in all_events:
-                                ev_type = ev.get("event_type", "")
-                                # Include goals but exclude own goals
-                                if ev_type == "goal":
-                                    detail = (ev.get("detail") or "").lower()
-                                    if "own" not in detail:
-                                        minute = ev.get("elapsed")
-                                        if minute is not None:
-                                            try:
-                                                goals_minutes.append(int(minute))
-                                            except (ValueError, TypeError):
-                                                pass
+                                if is_normal_time_goal(ev, fixture_context):
+                                    event_time = _extract_event_time(ev, fixture_context)
+                                    if event_time.clock_minute is not None:
+                                        goals_minutes.append(event_time.clock_minute)
 
                             # Label all rows for this match
                             label_match_rows(match_id, goals_minutes)
@@ -12951,6 +29345,9 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
             
             # JSONL: Process outcomes for all signals of this match
             process_match_outcomes_for_jsonl(match_id, client)
+
+            # 2H history: collect a single finished-match record with fixture_id dedup
+            collect_second_half_history_for_fixture(client, match_id)
             
             # Statistics are now calculated on-demand from match state (no update_daily_stats call)
             
@@ -13178,6 +29575,10 @@ def _extract_signal_format_fields(collected: Dict[str, Any]) -> Dict[str, Any]:
         "league_country_line": league_country_line,
         "minute": minute,
         "extra_time": extra_time,
+        "status_short": status_short,
+        "match_period": classify_match_period(
+            fixture_status_short=status_short, elapsed=minute, extra=extra_time
+        ).value,
         "is_halftime": is_halftime,
         "is_finished": is_finished,
         "score_home_now": score_home_now,
@@ -13199,6 +29600,142 @@ def _extract_signal_format_fields(collected: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def evaluate_channel_signal_filter(
+    prob_to90: Any,
+    score_home: Any,
+    score_away: Any,
+    *,
+    reputation_base_prob_to90: Any = None,
+    reputation_adjusted_prob_to90: Any = None,
+    adjusted_intensity: Any = None,
+    season_context_factor: Any = None,
+) -> Dict[str, Any]:
+    """Evaluate the authoritative BASE+p90 gate used before channel sends."""
+    result: Dict[str, Any] = {
+        "version": CHANNEL_SIGNAL_FILTER_VERSION,
+        "passed": False,
+        "reason": "invalid_input",
+        "min_prob_to90": float(CHANNEL_SIGNAL_MIN_PROB_TO90),
+        "min_reputation_delta_to90_pp": float(
+            CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP
+        ),
+        "min_adjusted_intensity": float(CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY),
+        "min_season_context_factor": float(
+            CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR
+        ),
+        "prob_to90": None,
+        "score_home": None,
+        "score_away": None,
+        "goals_at_snapshot": None,
+        "reputation_base_prob_to90": None,
+        "reputation_adjusted_prob_to90": None,
+        "reputation_delta_to90_pp": None,
+        "adjusted_intensity": None,
+        "season_context_factor": None,
+    }
+
+    try:
+        probability = float(prob_to90)
+        home = float(_unwrap_value(score_home))
+        away = float(_unwrap_value(score_away))
+        reputation_base = float(reputation_base_prob_to90)
+        reputation_adjusted = float(reputation_adjusted_prob_to90)
+        intensity = float(adjusted_intensity)
+        season_factor = float(season_context_factor)
+    except (TypeError, ValueError):
+        return result
+
+    if (
+        not math.isfinite(probability)
+        or probability < 0.0
+        or probability > 100.0
+        or not math.isfinite(home)
+        or not math.isfinite(away)
+        or home < 0.0
+        or away < 0.0
+        or not home.is_integer()
+        or not away.is_integer()
+        or not math.isfinite(reputation_base)
+        or reputation_base < 0.0
+        or reputation_base > 100.0
+        or not math.isfinite(reputation_adjusted)
+        or reputation_adjusted < 0.0
+        or reputation_adjusted > 100.0
+        or not math.isfinite(intensity)
+        or intensity < 0.0
+        or not math.isfinite(season_factor)
+        or season_factor < 0.0
+    ):
+        return result
+
+    home_int = int(home)
+    away_int = int(away)
+    goals = home_int + away_int
+    reputation_delta = round(reputation_adjusted - reputation_base, 6)
+    probability_passed = probability >= CHANNEL_SIGNAL_MIN_PROB_TO90
+    reputation_delta_passed = (
+        reputation_delta >= CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP
+    )
+    adjusted_intensity_passed = (
+        intensity >= CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY
+    )
+    season_context_passed = (
+        season_factor >= CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR
+    )
+    failed_conditions = []
+    if not probability_passed:
+        failed_conditions.append("prob_to90")
+    if not reputation_delta_passed:
+        failed_conditions.append("reputation_delta_to90_pp")
+    if not adjusted_intensity_passed:
+        failed_conditions.append("adjusted_intensity")
+    if not season_context_passed:
+        failed_conditions.append("season_context_factor")
+
+    result.update({
+        "passed": bool(
+            probability_passed
+            and reputation_delta_passed
+            and adjusted_intensity_passed
+            and season_context_passed
+        ),
+        "reason": "pass" if not failed_conditions else "+".join(failed_conditions),
+        "prob_to90": round(probability, 6),
+        "score_home": home_int,
+        "score_away": away_int,
+        "goals_at_snapshot": goals,
+        "reputation_base_prob_to90": round(reputation_base, 6),
+        "reputation_adjusted_prob_to90": round(reputation_adjusted, 6),
+        "reputation_delta_to90_pp": reputation_delta,
+        "adjusted_intensity": round(intensity, 6),
+        "season_context_factor": round(season_factor, 6),
+    })
+    return result
+
+
+def qualifies_for_premium_badge(
+    channel_signal_filter: Mapping[str, Any],
+) -> bool:
+    """Freeze the presentation-only Premium decision at signal publication."""
+    if not isinstance(channel_signal_filter, Mapping):
+        return False
+    if (
+        channel_signal_filter.get("version") != CHANNEL_SIGNAL_FILTER_VERSION
+        or channel_signal_filter.get("passed") is not True
+    ):
+        return False
+    try:
+        goals = float(channel_signal_filter.get("goals_at_snapshot"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        math.isfinite(goals)
+        and goals >= 0.0
+        and goals.is_integer()
+        and int(goals) <= PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT
+    )
+
+
 def _build_signal_snapshot_data(
     collected: Dict[str, Any],
     prob_display: float,
@@ -13206,10 +29743,14 @@ def _build_signal_snapshot_data(
     signal_minute: int,
     prob_display_90: Optional[float] = None,
     is_admin_approved: bool = False,
+    signal_route: str = "primary",
+    premium_badge: bool = False,
 ) -> Dict[str, Any]:
     fields = _extract_signal_format_fields(collected)
     return {
         "is_admin_approved": bool(is_admin_approved),
+        "signal_route": "rescue" if str(signal_route).lower() == "rescue" else "primary",
+        "premium_badge": bool(premium_badge),
         "home": fields["home"],
         "away": fields["away"],
         "league_country_line": fields["league_country_line"],
@@ -13235,15 +29776,50 @@ def _build_signal_snapshot_data(
     }
 
 
+def _format_probability_percent(value: Any) -> str:
+    try:
+        rounded = round(float(value), 1)
+    except (TypeError, ValueError):
+        rounded = 0.0
+    if rounded.is_integer():
+        return str(int(rounded))
+    return f"{rounded:.1f}"
+
+
+def resolve_signal_header_title(
+    *,
+    is_admin_approved: bool = False,
+    signal_route: str = "primary",
+    premium_badge: bool = False,
+    saved_header_text: Optional[str] = None,
+) -> str:
+    """Resolve the immutable signal title for live and final renderers."""
+    if premium_badge:
+        return "🚨 Premium Сигнал"
+    if is_admin_approved:
+        return "🚨 Сигнал от админа"
+
+    saved_title = str(saved_header_text or "").strip().splitlines()
+    if saved_title:
+        first_line = saved_title[0].strip()
+        if first_line == "🚨 Сигнал от админа":
+            return first_line
+    return "🚨 Сигнал"
+
+
 def build_signal_header(snapshot_data: Dict[str, Any]) -> str:
-    header_title = "🚨 Сигнал от админа" if snapshot_data.get("is_admin_approved") else "🚨 Сигнал"
+    header_title = resolve_signal_header_title(
+        is_admin_approved=bool(snapshot_data.get("is_admin_approved")),
+        signal_route=str(snapshot_data.get("signal_route") or "primary"),
+        premium_badge=bool(snapshot_data.get("premium_badge")),
+    )
     home = snapshot_data.get("home") or "Home"
     away = snapshot_data.get("away") or "Away"
     league_country_line = snapshot_data.get("league_country_line") or ""
     signal_score_home = int(snapshot_data.get("signal_score_home", 0) or 0)
     signal_score_away = int(snapshot_data.get("signal_score_away", 0) or 0)
     signal_minute = int(snapshot_data.get("signal_minute", 0) or 0)
-    prob_to75 = float(snapshot_data.get("prob_display", 0.0) or 0.0)
+    prob_next_15 = float(snapshot_data.get("prob_display", 0.0) or 0.0)
     prob_to90 = snapshot_data.get("prob_display_90")
 
     lines: List[str] = [
@@ -13255,12 +29831,13 @@ def build_signal_header(snapshot_data: Dict[str, Any]) -> str:
         "",
         f"Счет: {signal_score_home} - {signal_score_away} {signal_minute} минута",
         "",
-        f"Вероятность гола до 75 минуты: {prob_to75:.1f}%",
     ]
 
+    if signal_minute < 75:
+        lines.append(f"Гол в ближайшие 15 минут: {_format_probability_percent(prob_next_15)}%")
     if prob_to90 is not None:
         try:
-            lines.append(f"Вероятность гола до 90 минуты: {float(prob_to90):.1f}%")
+            lines.append(f"Гол до конца основного времени: {_format_probability_percent(prob_to90)}%")
         except Exception:
             pass
 
@@ -13281,11 +29858,8 @@ def build_signal_header(snapshot_data: Dict[str, Any]) -> str:
 def _format_current_minute_label(fields: Dict[str, Any]) -> str:
     minute = int(fields.get("minute", 0) or 0)
     extra_time = int(fields.get("extra_time", 0) or 0)
-    if minute >= 90 and extra_time > 0:
-        return f"90 (+{extra_time}) минута"
-    if minute >= 45 and minute < 90 and extra_time > 0:
-        return f"45 (+{extra_time}) минута"
-    return f"{minute} минута"
+    display = f"{minute}+{extra_time}" if extra_time > 0 else str(minute)
+    return f"{display}'"
 
 
 def render_live_message(
@@ -13294,6 +29868,8 @@ def render_live_message(
     prob_display: float,
     prob_display_90: Optional[float] = None,
     is_admin_approved: bool = False,
+    signal_route: str = "primary",
+    premium_badge: bool = False,
 ) -> str:
     fields = _extract_signal_format_fields(current_data)
     signal_home = int(signal_score[0])
@@ -13309,7 +29885,11 @@ def render_live_message(
         prob_val = 0.0
 
     parts: List[str] = []
-    title = "🚨 Сигнал от админа" if is_admin_approved else "🚨 Сигнал"
+    title = resolve_signal_header_title(
+        is_admin_approved=is_admin_approved,
+        signal_route=signal_route,
+        premium_badge=premium_badge,
+    )
     parts.append(title)
     parts.append("")
     parts.append(f"{fields.get('home', 'Home')} — {fields.get('away', 'Away')}")
@@ -13322,11 +29902,11 @@ def render_live_message(
         # Top score line must always remain the score at signal time.
         parts.append(f"Счет: {signal_home} - {signal_away} (Перерыв)")
         parts.append("")
-        parts.append(f"Вероятность гола до 75 минуты: {prob_val:.1f}%")
+        parts.append(f"Гол в ближайшие 15 минут: {_format_probability_percent(prob_val)}%")
         try:
-            parts.append(f"Вероятность гола до 90 минуты: {float(prob90_val):.1f}%")
+            parts.append(f"Гол до конца основного времени: {_format_probability_percent(prob90_val)}%")
         except Exception:
-            parts.append(f"Вероятность гола до 90 минуты: {prob_val:.1f}%")
+            parts.append(f"Гол до конца основного времени: {_format_probability_percent(prob_val)}%")
         parts.append("")
         parts.append(f"xG до 45 минуты: {float(fields.get('display_xg_h', 0.0)):.2f} - {float(fields.get('display_xg_a', 0.0)):.2f}")
         parts.append("")
@@ -13344,11 +29924,11 @@ def render_live_message(
     if not bool(fields.get("is_finished")):
         has_probability = False
         if minute < 75:
-            parts.append(f"Вероятность гола до 75 минуты: {prob_val:.1f}%")
+            parts.append(f"Гол в ближайшие 15 минут: {_format_probability_percent(prob_val)}%")
             has_probability = True
-        if minute < 90 and prob_display_90 is not None:
+        if prob_display_90 is not None:
             try:
-                parts.append(f"Вероятность гола до 90 минуты: {float(prob_display_90):.1f}%")
+                parts.append(f"Гол до конца основного времени: {_format_probability_percent(prob_display_90)}%")
                 has_probability = True
             except Exception:
                 pass
@@ -13364,6 +29944,28 @@ def render_live_message(
     parts.append(f"Угловые: {int(fields.get('corners_h', 0))} - {int(fields.get('corners_a', 0))}")
     parts.append(f"Владение: {int(fields.get('possession_h_int', 0))}% - {int(fields.get('possession_a_int', 0))}%")
     return "\n".join(parts)
+
+
+def determine_normal_time_goal_result(
+    signal_home: int,
+    signal_away: int,
+    final_home: int,
+    final_away: int,
+    goal_minutes: Optional[List[int]] = None,
+    normal_time_result: Optional[str] = None,
+) -> bool:
+    """Return whether a counted normal-time goal occurred after the signal.
+
+    The scoreboard delta is authoritative when event delivery is delayed or
+    incomplete. Valid event minutes and an already-finalized WIN remain
+    supporting fallbacks for score-correction edge cases.
+    """
+    signal_total = int(signal_home) + int(signal_away)
+    final_total = int(final_home) + int(final_away)
+    score_increased = final_total > signal_total
+    has_event_evidence = bool(goal_minutes)
+    finalized_win = str(normal_time_result or "").upper() == "WIN"
+    return bool(score_increased or has_event_evidence or finalized_win)
 
 
 def render_final_message(match_state: Dict[str, Any], header_text: str) -> str:
@@ -13383,9 +29985,20 @@ def render_final_message(match_state: Dict[str, Any], header_text: str) -> str:
     except Exception:
         goal_minutes = []
 
-    has_goals_after_signal = bool(goal_minutes)
+    has_goals_after_signal = determine_normal_time_goal_result(
+        signal_home,
+        signal_away,
+        final_home,
+        final_away,
+        goal_minutes,
+        match_state.get("normal_time_result"),
+    )
     badge = "✅" if has_goals_after_signal else "❌"
-    final_line = f"{badge} Финальный счёт: {final_home} - {final_away}"
+    went_to_extra_time = (
+        bool(match_state.get("went_to_extra_time"))
+        or str(fields.get("status_short") or "").upper() in {"AET", "PEN"}
+        or int(fields.get("minute", 0) or 0) > 105
+    )
 
     lines: List[str] = [
         str(header_text or "🚨 Сигнал"),
@@ -13407,10 +30020,17 @@ def render_final_message(match_state: Dict[str, Any], header_text: str) -> str:
     ]
 
     if goal_minutes:
-        goals_str = " ".join([f"{m}′" for m in goal_minutes])
+        goals_str = " ".join([f"{minute}′" for minute in goal_minutes])
         lines.extend(["", f"⚽️Голы: {goals_str}"])
 
-    lines.extend(["", final_line])
+    if went_to_extra_time:
+        lines.extend([
+            "",
+            f"{badge} Счёт после основного времени: {final_home} - {final_away}",
+            "Дополнительное время и серия пенальти не учитываются.",
+        ])
+    else:
+        lines.extend(["", f"{badge} Финальный счёт: {final_home}-{final_away}"])
     return "\n".join(lines)
 
 
@@ -13420,6 +30040,8 @@ def render_live_main_text(
     prob_display: float,
     prob_display_90: Optional[float] = None,
     is_admin_approved: bool = False,
+    signal_route: str = "primary",
+    premium_badge: bool = False,
 ) -> str:
     return render_live_message(
         current_data=current_data,
@@ -13427,6 +30049,8 @@ def render_live_main_text(
         prob_display=prob_display,
         prob_display_90=prob_display_90,
         is_admin_approved=is_admin_approved,
+        signal_route=signal_route,
+        premium_badge=premium_badge,
     )
 
 
@@ -13469,13 +30093,15 @@ def compose_signal_message(header_text: str, live_footer: str) -> str:
     return f"{header}\n\n{footer}"
 
 
-def format_signal_report_from_metrics(collected: Dict[str,Any], prob_display: float, initial_score: Tuple[int,int], extra_text: str="", prob_display_90: Optional[float]=None, match_id: Optional[int]=None, is_admin_approved: bool=False) -> str:
+def format_signal_report_from_metrics(collected: Dict[str,Any], prob_display: float, initial_score: Tuple[int,int], extra_text: str="", prob_display_90: Optional[float]=None, match_id: Optional[int]=None, is_admin_approved: bool=False, signal_route: str="primary", premium_badge: bool=False) -> str:
     header_text = render_live_message(
         current_data=collected,
         signal_score=initial_score,
         prob_display=prob_display,
         prob_display_90=prob_display_90,
         is_admin_approved=is_admin_approved,
+        signal_route=signal_route,
+        premium_badge=premium_badge,
     )
     if extra_text:
         return compose_signal_message(header_text, extra_text)
@@ -13636,7 +30262,200 @@ def dump_match_metrics_cli(fixture_id: int):
     data = client.collect_match_all(fixture_id)
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
+
+_memory_telemetry_lock = threading.RLock()
+_memory_telemetry_last_monotonic = 0.0
+
+
+def read_process_memory_kb(
+    status_path: str = "/proc/self/status",
+) -> Dict[str, Optional[int]]:
+    """Read Linux RSS/peak RSS without allocating a process snapshot."""
+    values: Dict[str, Optional[int]] = {"rss_kb": None, "peak_rss_kb": None}
+    labels = {"VmRSS": "rss_kb", "VmHWM": "peak_rss_kb"}
+    try:
+        with open(status_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                label, separator, remainder = raw_line.partition(":")
+                target = labels.get(label)
+                if not separator or target is None:
+                    continue
+                token = remainder.strip().split(None, 1)[0]
+                try:
+                    values[target] = int(token)
+                except (TypeError, ValueError):
+                    values[target] = None
+    except OSError:
+        pass
+    return values
+
+
+def collect_memory_telemetry() -> Dict[str, Any]:
+    """Collect only O(number-of-live-containers) counters; never scan journals."""
+    snapshot: Dict[str, Any] = dict(read_process_memory_kb())
+    with _cache_lock:
+        snapshot["api_cache_entries"] = len(_cache)
+    with tg_edit_queue._lock:
+        snapshot["tg_message_entries"] = len(
+            set(tg_edit_queue.last_edit_ts)
+            | set(tg_edit_queue.last_sent_hash)
+            | set(tg_edit_queue.last_activity_ts)
+        )
+        snapshot["tg_chat_blocks"] = len(tg_edit_queue.chat_block_until)
+    with _decision_snapshot_lock:
+        snapshot["decision_dedupe_keys"] = sum(
+            len(keys) for keys in _decision_snapshot_keys_by_file.values()
+        )
+        snapshot["decision_pending_records"] = sum(
+            len(index.get("decisions_by_id") or {})
+            for index in _decision_snapshot_indexes_by_file.values()
+        )
+        snapshot["decision_outcome_markers"] = sum(
+            len(index.get("outcomes_by_id") or {})
+            for index in _decision_snapshot_indexes_by_file.values()
+        )
+    with _observation_history_lock:
+        snapshot["observation_dedupe_keys"] = (
+            int(_observation_history_key_count)
+            if _observation_history_keys is not None
+            else 0
+        )
+    with _rolling_dynamics_lock:
+        rolling_stats = (
+            _rolling_dynamics_tracker.memory_stats()
+            if _rolling_dynamics_tracker is not None
+            else {
+                "fixtures": 0,
+                "history_records": 0,
+                "computed_payloads": 0,
+            }
+        )
+    snapshot.update(
+        {f"rolling_{key}": value for key, value in rolling_stats.items()}
+    )
+    with _shadow_ml_schedule_lock:
+        snapshot["shadow_ml_pending_fixtures"] = len(
+            _shadow_ml_pending_fixture_ids
+        )
+    with _market_benchmark_lock:
+        snapshot["market_queue_records"] = len(_market_benchmark_queue)
+        snapshot["market_pending_polls"] = len(
+            _market_benchmark_poll_buffer
+        )
+        snapshot["market_cache_fixtures"] = len(
+            _market_benchmark_quote_cache
+        )
+        snapshot["market_cache_quotes"] = sum(
+            len(records)
+            for records in _market_benchmark_quote_cache.values()
+        )
+        snapshot["market_dropped_records"] = int(
+            _market_benchmark_dropped_records
+        )
+        snapshot["market_dropped_polls"] = int(
+            _market_benchmark_dropped_polls
+        )
+    with _market_prediction_handoff_lock:
+        snapshot["market_prediction_handoffs"] = len(
+            _market_prediction_handoff
+        )
+    with state_lock:
+        snapshot["state_top_level_items"] = sum(
+            len(value)
+            for value in state.values()
+            if isinstance(value, (dict, list, set, tuple))
+        )
+    snapshot["decision_recheck_entries"] = len(
+        _decision_outcome_last_checked
+    )
+    return snapshot
+
+
+def log_memory_telemetry(*, force: bool = False) -> Optional[Dict[str, Any]]:
+    """Periodically prune bounded caches and emit actionable RSS counters."""
+    global _memory_telemetry_last_monotonic
+    current_monotonic = time.monotonic()
+    with _memory_telemetry_lock:
+        if (
+            not force
+            and current_monotonic - _memory_telemetry_last_monotonic
+            < float(MEMORY_TELEMETRY_INTERVAL_SECONDS)
+        ):
+            return None
+        _memory_telemetry_last_monotonic = current_monotonic
+
+    try:
+        cache_removed = cache_prune()
+        telegram_removed = tg_edit_queue.prune()
+        stale_recheck_cutoff = time.time() - 24 * 3600
+        for fixture_id, checked_at in list(
+            _decision_outcome_last_checked.items()
+        ):
+            if float(checked_at or 0.0) < stale_recheck_cutoff:
+                _decision_outcome_last_checked.pop(fixture_id, None)
+
+        snapshot = collect_memory_telemetry()
+        snapshot["api_cache_removed"] = cache_removed
+        snapshot["tg_cache_removed"] = telegram_removed
+        for key in (
+            "market_queue_records",
+            "market_pending_polls",
+            "market_cache_fixtures",
+            "market_cache_quotes",
+            "market_dropped_records",
+            "market_dropped_polls",
+            "market_prediction_handoffs",
+        ):
+            snapshot.setdefault(key, 0)
+        logger.info(
+            "[MEMORY] rss_mb=%s peak_rss_mb=%s api_cache=%s tg_messages=%s "
+            "decision_pending=%s decision_keys=%s decision_outcome_markers=%s "
+            "observation_keys=%s rolling_fixtures=%s rolling_history=%s "
+            "rolling_computed=%s market_queue=%s market_pending_polls=%s "
+            "market_cache_fixtures=%s market_cache_quotes=%s "
+            "market_dropped=%s market_dropped_polls=%s "
+            "market_prediction_handoffs=%s state_items=%s "
+            "pruned_api=%s pruned_tg=%s",
+            (
+                round(snapshot["rss_kb"] / 1024.0, 1)
+                if snapshot.get("rss_kb") is not None
+                else "unknown"
+            ),
+            (
+                round(snapshot["peak_rss_kb"] / 1024.0, 1)
+                if snapshot.get("peak_rss_kb") is not None
+                else "unknown"
+            ),
+            snapshot["api_cache_entries"],
+            snapshot["tg_message_entries"],
+            snapshot["decision_pending_records"],
+            snapshot["decision_dedupe_keys"],
+            snapshot["decision_outcome_markers"],
+            snapshot["observation_dedupe_keys"],
+            snapshot["rolling_fixtures"],
+            snapshot["rolling_history_records"],
+            snapshot["rolling_computed_payloads"],
+            snapshot["market_queue_records"],
+            snapshot["market_pending_polls"],
+            snapshot["market_cache_fixtures"],
+            snapshot["market_cache_quotes"],
+            snapshot["market_dropped_records"],
+            snapshot["market_dropped_polls"],
+            snapshot["market_prediction_handoffs"],
+            snapshot["state_top_level_items"],
+            cache_removed,
+            telegram_removed,
+        )
+        return snapshot
+    except Exception:
+        logger.exception(
+            "[MEMORY_TELEMETRY_ERROR] maintenance_skipped=true live_loop_unchanged=true"
+        )
+        return None
+
+
 def main_loop():
+    _signal_reputation_stop.clear()
     # Validate Telegram configuration (non-blocking, continues on error)
     if not validate_telegram_target():
         logger.warning("[TG] Telegram validation had warnings. Bot will continue, but messages may fail.")
@@ -13648,8 +30467,12 @@ def main_loop():
         logger.info("[GSHEETS] Google Sheets integration enabled")
     else:
         logger.warning("[GSHEETS] Google Sheets integration disabled")
-    
+
     client = APISportsMetricsClient(api_key=API_FOOTBALL_KEY, host=API_FOOTBALL_HOST, cache_ttl=CACHE_TTL)
+    start_market_benchmark_daemon(client)
+    start_shadow_ml_daemon()
+    start_wide_research_daemon()
+    start_research_health_monitor()
     start_monitor_daemon(client)
     start_callback_handler_daemon()  # Start callback handler for inline buttons
     if ENABLE_ADMIN_REVIEW_SIGNALS:
@@ -13662,21 +30485,32 @@ def main_loop():
     start_gsheets_labeler_daemon(client)  # Start Google Sheets labeler daemon for goal_next_15 backfill
     start_daily_cleanup_daemon(client)  # Start maintenance daemon (04:00 MSK smart cleanup)
     refresh_all_cup_leagues_now()  # Queue cup/problem leagues for one-by-one non-blocking refresh
+    bootstrap_leagues_from_2h_stats()  # Register all leagues previously observed in signal history
     send_permanent_instruction_message()  # Send permanent instruction message to channel (once)
     logger.info("Starting Goal Predictor Bot main loop...")
-    
+    log_memory_telemetry(force=True)
+
     # Счетчик циклов для периодической очистки no_stats
     loop_counter = 0
     global _league_stale_scan_date_msk, _league_last_queue_process_ts
-    
+    rolling_seed_executor = ThreadPoolExecutor(
+        max_workers=ROLLING_DYNAMICS_SEED_WORKERS,
+        thread_name_prefix="rolling-dynamics",
+    )
+    outcome_reconcile_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="outcome-reconcile",
+    )
+    outcome_reconcile_future = None
+
     try:
         while True:
             try:
                 # Периодическая очистка expired no_stats_fixtures (каждые 10 циклов)
                 loop_counter += 1
+                log_memory_telemetry()
                 if loop_counter % 10 == 0:
-                    cleanup_expired_no_stats_fixtures()
-                    cleanup_expired_no_stats_blocked()
+                    cleanup_expired_no_stats_state()
                 if loop_counter % 30 == 0:
                     cleanup_persist_matches()
 
@@ -13691,10 +30525,11 @@ def main_loop():
                 cup_processed = process_cup_league_queue(client, limit=50)
                 if cup_processed > 0:
                     logger.info("[LEAGUE_CUP_BATCH] processed_this_cycle=%s", cup_processed)
-                
+
                 raw_live = client._get("fixtures", params={"live":"all"}, cache=False) or {}
                 fixtures = raw_live.get("response") or []
                 logger.info(f"[LOOP] Fetched {len(fixtures)} live fixtures")
+                discover_live_leagues(fixtures)
 
                 live_active_ids: Set[int] = set()
                 for fixture in fixtures:
@@ -13723,6 +30558,38 @@ def main_loop():
                         fixture_id = int(fixture_id)
                         block_key = str(fixture_id)
 
+                        # Keep lightweight score coverage after the 46-60
+                        # decision window without fetching full statistics.
+                        with state_lock:
+                            has_score_timeline = (
+                                block_key in state.setdefault("score_timelines", {})
+                            )
+                        if has_score_timeline:
+                            raw_goals = fixture.get("goals") if isinstance(fixture, dict) else {}
+                            raw_fixture_obj = (
+                                fixture.get("fixture")
+                                if isinstance(fixture, dict) and isinstance(fixture.get("fixture"), dict)
+                                else fixture
+                            )
+                            raw_status_obj = (
+                                raw_fixture_obj.get("status")
+                                if isinstance(raw_fixture_obj, dict)
+                                else {}
+                            )
+                            raw_status_short = (
+                                raw_status_obj.get("short")
+                                if isinstance(raw_status_obj, dict)
+                                else raw_status_obj
+                            )
+                            if isinstance(raw_goals, dict):
+                                record_score_timeline_observation(
+                                    fixture_id,
+                                    _fixture_minute_from_raw(fixture),
+                                    _safe_int(raw_goals.get("home"), 0),
+                                    _safe_int(raw_goals.get("away"), 0),
+                                    str(raw_status_short or ""),
+                                )
+
                         # ПЕРВАЯ ПРОВЕРКА: длинная блокировка no-stats (быстрый skip)
                         if is_no_stats_blocked(block_key):
                             continue
@@ -13748,9 +30615,24 @@ def main_loop():
 
                         # Skip ordinary detailed processing for matches before the regular ordinary-signal window
                         if minute_i < REGULAR_SIGNAL_MIN_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
+                            schedule_rolling_dynamics_seed(
+                                rolling_seed_executor,
+                                client,
+                                fixture,
+                                fixture_id,
+                                minute_i,
+                            )
                             logger.info(
                                 f"[BLOCK_PRE_46] fixture_id={fixture_id} minute={minute_i} "
                                 f"reason=ordinary_signals_start_from_{REGULAR_SIGNAL_MIN_MINUTE}"
+                            )
+                            append_observation_history(
+                                build_prefilter_observation(
+                                    fixture_id=fixture_id,
+                                    minute=minute_i,
+                                    reason="pre_46_out_of_window",
+                                    raw_fixture=fixture,
+                                )
                             )
                             continue
 
@@ -13760,9 +30642,20 @@ def main_loop():
                                 f"[BLOCK_POST_60] fixture_id={fixture_id} minute={minute_i} "
                                 f"reason=ordinary_signals_stop_after_{REGULAR_SIGNAL_MAX_MINUTE}"
                             )
+                            append_observation_history(
+                                build_prefilter_observation(
+                                    fixture_id=fixture_id,
+                                    minute=minute_i,
+                                    reason="post_60_out_of_window",
+                                    raw_fixture=fixture,
+                                )
+                            )
                             continue
 
-                        data = client.collect_match_all(fixture_id)
+                        data = client.collect_match_all(
+                            fixture_id,
+                            live_fixture=fixture,
+                        )
                         fixture_metrics = data.get("fixture", {}) or {}
 
                         # Ensure fixture_id is in metrics for logging
@@ -13775,24 +30668,54 @@ def main_loop():
                             if raw_stats:
                                 data["statistics_raw"] = raw_stats
                                 raw_fixture = client.fetch_fixture(fixture_id) or {}
-                                stats_norm = client._normalize_statistics(raw_stats, raw_fixture)
+                                stats_norm = client._normalize_statistics(raw_stats, raw_fixture, fixture_metrics)
                                 if stats_norm:
                                     fixture_metrics.update(stats_norm)
 
                         # Diagnostics: raw keys and stats presence
                         logger.info(f"[RAW_KEYS] fixture_id={fixture_id} keys={list(data.keys())}")
+                        has_raw_statistics = "statistics_raw" in data
+                        stats_health_context = log_stats_health(
+                            fixture_id,
+                            fixture_metrics,
+                            has_raw_statistics=has_raw_statistics,
+                        )
+                        fixture_metrics["_has_raw_statistics"] = has_raw_statistics
+                        fixture_metrics["_stats_health"] = stats_health_context
                         has_stats_flag = (
                             ("statistics" in data) or ("stats" in data) or ("statistics_raw" in data)
                             or has_stats_data(fixture_metrics)
                         )
-                        logger.info(f"[HAS_STATS] fixture_id={fixture_id} has_statistics={has_stats_flag}")
+                        logger.info(
+                            "[HAS_STATS] fixture_id=%s has_statistics=%s has_raw_statistics=%s has_normalized_live_metrics=%s stats_health=%s",
+                            fixture_id,
+                            has_stats_flag,
+                            has_raw_statistics,
+                            stats_health_context.get("has_normalized_live_metrics", False),
+                            stats_health_context.get("stats_health", "bad"),
+                        )
 
                         # If still no stats, long-block to avoid log spam
                         if not has_stats_data(fixture_metrics):
                             coverage, _missing = compute_coverage_score(fixture_metrics)
                             if coverage == 0.0:
-                                block_no_stats_match_long(block_key, "no statistics in live data")
+                                block_no_stats_match_long(
+                                    block_key,
+                                    "no normalized live metrics "
+                                    f"has_raw_statistics={has_raw_statistics} "
+                                    f"has_normalized_live_metrics={stats_health_context.get('has_normalized_live_metrics', False)} "
+                                    f"stats_health={stats_health_context.get('stats_health', 'bad')}",
+                                )
                                 block_no_stats_fixture(fixture_id, minute_i, coverage)
+                                append_observation_history(
+                                    build_prefilter_observation(
+                                        fixture_id=fixture_id,
+                                        minute=minute_i,
+                                        reason="no_normalized_live_metrics",
+                                        fixture_metrics=fixture_metrics,
+                                        raw_fixture=fixture,
+                                    )
+                                )
                                 continue
 
                         minute = int((fixture_metrics.get("elapsed") or {}).get("value") or minute_i or 0)
@@ -13818,6 +30741,15 @@ def main_loop():
                                 logger.info(
                                     f"[TRANSITION] fixture_id={fixture_id} minute={minute} coverage={coverage:.2f} "
                                     f"missing={missing} - skipping first regular update until stats stabilize"
+                                )
+                                append_observation_history(
+                                    build_prefilter_observation(
+                                        fixture_id=fixture_id,
+                                        minute=minute,
+                                        reason="transition_stats_not_ready",
+                                        fixture_metrics=fixture_metrics,
+                                        raw_fixture=fixture,
+                                    )
                                 )
                                 continue
 
@@ -13858,15 +30790,53 @@ def main_loop():
                             )
                             continue
 
-                        # Use new 45+ probability model
-                        res_45 = compute_probability_45_plus(fixture_metrics, minute)
-                        prob_next_15 = res_45.get("prob_next_15", 0.0)
+                        # Use the same reputation-aware 45+ path as message updates.
+                        res_45 = compute_probability_45_plus_with_reputation(
+                            fixture_metrics,
+                            minute,
+                            application_context="send",
+                        )
+                        prob_next_15_decision = res_45.get("prob_next_15", 0.0)
+                        prob_next_15 = prob_next_15_decision
                         prob_second_half_remain = res_45.get("prob_second_half_remain", 0.0)
+                        prob_next_25 = res_45.get("prob_next_25", prob_second_half_remain)
+                        horizon_minutes_45 = res_45.get("horizon_minutes", 0.0)
+                        prob_to75_45 = res_45.get("prob_to75", 0.0)
+                        prob_to90_45 = res_45.get("prob_to90", prob_second_half_remain)
+                        prob_until_end_decision = prob_to90_45
+                        decision_remain_metric = "prob_to90"
+                        res_45["prob_until_end_decision"] = prob_until_end_decision
+                        res_45["decision_remain_metric"] = decision_remain_metric
+                        res_45["legacy_prob_second_half_remain"] = prob_second_half_remain
                         anti_garbage_passed = bool(res_45.get("anti_garbage_passed", True))
+                        decision_horizon_log_fragment = (
+                            f"prob_next_15={prob_next_15_decision:.2f} "
+                            f"legacy_threshold_next15={{threshold_next15:.2f}} "
+                            f"prob_until_end_decision={prob_until_end_decision:.2f} "
+                            f"decision_remain_metric={decision_remain_metric} "
+                            f"legacy_threshold_to90={{threshold_remain:.2f}} "
+                            f"legacy_threshold_source={{threshold_source}} "
+                            f"legacy_minute_bucket={{minute_bucket}} "
+                            f"legacy_dynamic_threshold_enabled={{dynamic_enabled}} "
+                            f"legacy_old_window_threshold={{old_threshold:.2f}} "
+                            f"legacy_threshold_remain_metric=prob_to90 "
+                            f"prob_next_25={prob_next_25:.2f} "
+                            f"prob_to75={prob_to75_45:.2f} "
+                            f"prob_to90={prob_to90_45:.2f} "
+                            f"legacy_prob_second_half_remain={prob_second_half_remain:.2f} "
+                            f"legacy_alias_for=prob_next_25 "
+                            f"horizon_minutes={horizon_minutes_45:.1f}"
+                        )
 
                         live_gate_checks: Dict[str, bool] = {}
                         live_gate_passed_count: Optional[int] = None
+                        legacy_live_gate_checks: Dict[str, bool] = {}
+                        legacy_live_gate_passed_count: Optional[int] = None
+                        garbage_checks: Dict[str, bool] = {}
+                        garbage_weak_count = 0
+                        live_gate_garbage = False
                         xg_total = 0.0
+                        xg_total_raw = float(res_45.get("xg_total", 0.0) or 0.0)
                         shots_on_target_total = 0.0
                         shots_in_box_total = 0.0
                         pressure_index = 0.0
@@ -13876,37 +30846,246 @@ def main_loop():
                             allow_tag = "ALLOW_WINDOW_1"
                             block_tag = "BLOCK_WINDOW_1"
                             threshold_next15 = WINDOW_1_NEXT_15_THRESHOLD
-                            threshold_remain = WINDOW_1_REMAIN_THRESHOLD
+                            threshold_info = get_prob_to90_decision_threshold(minute, "WINDOW_1")
+                            threshold_remain = threshold_info["threshold"]
+                            decision_log_fragment = decision_horizon_log_fragment.format(
+                                threshold_next15=threshold_next15,
+                                threshold_remain=threshold_remain,
+                                threshold_source=threshold_info["source"],
+                                minute_bucket=threshold_info["minute_bucket"],
+                                dynamic_enabled=threshold_info["dynamic_enabled"],
+                                old_threshold=threshold_info["fallback_threshold"],
+                            )
                             logger.info(
                                 f"[{window_tag}] fixture_id={fixture_id} minute={minute} "
-                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
-                                f"anti_garbage_passed={anti_garbage_passed} rule_path=window_1_hard_requirements"
+                                f"{decision_log_fragment} "
+                                f"legacy_anti_garbage_passed={anti_garbage_passed} "
+                                f"legacy_selection_publication_active=false"
                             )
                         else:
                             window_tag = "WINDOW_2_54_60"
                             allow_tag = "ALLOW_WINDOW_2"
                             block_tag = "BLOCK_WINDOW_2"
                             threshold_next15 = WINDOW_2_NEXT_15_THRESHOLD
-                            threshold_remain = WINDOW_2_REMAIN_THRESHOLD
-                            xg_total = float(res_45.get("xg_total", 0.0) or 0.0)
+                            threshold_info = get_prob_to90_decision_threshold(minute, "WINDOW_2")
+                            threshold_remain = threshold_info["threshold"]
+                            decision_log_fragment = decision_horizon_log_fragment.format(
+                                threshold_next15=threshold_next15,
+                                threshold_remain=threshold_remain,
+                                threshold_source=threshold_info["source"],
+                                minute_bucket=threshold_info["minute_bucket"],
+                                dynamic_enabled=threshold_info["dynamic_enabled"],
+                                old_threshold=threshold_info["fallback_threshold"],
+                            )
+                            xg_total = float(
+                                res_45.get(
+                                    "xg_total_effective",
+                                    res_45.get("xg_total", 0.0),
+                                )
+                                or 0.0
+                            )
                             shots_on_target_total = float(res_45.get("shots_on_target_total", 0.0) or 0.0)
                             shots_in_box_total = float(res_45.get("shots_in_box_total", 0.0) or 0.0)
                             pressure_index = float(res_45.get("pressure_index", 0.0) or 0.0)
-                            live_gate_checks = {
-                                "xg_total": xg_total >= 1.10,
-                                "shots_on_target_total": shots_on_target_total >= 4.0,
-                                "shots_in_box_total": shots_in_box_total >= 7.0,
-                                "pressure_index": pressure_index >= 18.0,
-                            }
-                            live_gate_passed_count = sum(1 for passed in live_gate_checks.values() if passed)
+                            live_gate_eval = evaluate_window_2_live_gate(
+                                xg_total=xg_total,
+                                shots_on_target_total=shots_on_target_total,
+                                shots_in_box_total=shots_in_box_total,
+                                pressure_index=pressure_index,
+                            )
+                            legacy_live_gate_checks = dict(live_gate_eval["legacy_live_gate_checks"])
+                            legacy_live_gate_passed_count = int(live_gate_eval["legacy_live_gate_passed_count"])
+                            garbage_checks = dict(live_gate_eval["garbage_checks"])
+                            garbage_weak_count = int(live_gate_eval["garbage_weak_count"])
+                            live_gate_garbage = bool(live_gate_eval["live_gate_garbage"])
+                            live_gate_checks = dict(live_gate_eval["live_gate_checks"])
+                            live_gate_passed_count = int(live_gate_eval["live_gate_passed_count"])
+                            if LOG_LIVE_GATE_DETAILS:
+                                logger.info(
+                                    "[LIVE_GATE] fixture_id=%s minute=%s mode=%s publication_active=false legacy_live_gate_passed_count=%s garbage_weak_count=%s live_gate_garbage=%s xg_total_raw=%.2f xg_total_effective=%.2f xg_confidence=%.3f xg_passed=%s shots_on_target_total=%.1f sot_passed=%s shots_in_box_total=%.1f box_passed=%s pressure_index=%.2f pressure_passed=%s xg_weak=%s sot_weak=%s box_weak=%s pressure_weak=%s",
+                                    fixture_id,
+                                    minute,
+                                    live_gate_eval["mode"],
+                                    legacy_live_gate_passed_count,
+                                    garbage_weak_count,
+                                    live_gate_garbage,
+                                    xg_total_raw,
+                                    xg_total,
+                                    _safe_float(res_45.get("xg_confidence"), 1.0),
+                                    legacy_live_gate_checks["xg_total"],
+                                    shots_on_target_total,
+                                    legacy_live_gate_checks["shots_on_target_total"],
+                                    shots_in_box_total,
+                                    legacy_live_gate_checks["shots_in_box_total"],
+                                    pressure_index,
+                                    legacy_live_gate_checks["pressure_index"],
+                                    garbage_checks["xg_weak"],
+                                    garbage_checks["sot_weak"],
+                                    garbage_checks["box_weak"],
+                                    garbage_checks["pressure_weak"],
+                                )
                             logger.info(
                                 f"[{window_tag}] fixture_id={fixture_id} minute={minute} "
-                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
-                                f"live_gate_passed_count={live_gate_passed_count} "
-                                f"anti_garbage_passed={anti_garbage_passed} rule_path=window_2_hard_requirements"
+                                f"{decision_log_fragment} "
+                                f"legacy_live_gate_passed_count={legacy_live_gate_passed_count} "
+                                f"legacy_garbage_weak_count={garbage_weak_count} "
+                                f"legacy_live_gate_garbage={live_gate_garbage} "
+                                f"legacy_anti_garbage_passed={anti_garbage_passed} "
+                                f"legacy_selection_publication_active=false"
                             )
+
+                        would_pass_dynamic = prob_until_end_decision >= threshold_remain
+                        would_pass_old_fixed = prob_until_end_decision >= threshold_info["fallback_threshold"]
+                        decision_changed_vs_old = would_pass_dynamic != would_pass_old_fixed
+                        logger.info(
+                            "[DYNAMIC_TO90_THRESHOLD] fixture_id=%s minute=%s window=%s prob_to90=%.2f dynamic_enabled=%s minute_bucket=%s selected_threshold=%.2f old_window_threshold=%.2f threshold_source=%s would_pass_dynamic=%s would_pass_old_fixed=%s decision_changed_vs_old=%s",
+                            fixture_id, minute, "WINDOW_1" if minute <= REGULAR_SIGNAL_WINDOW_1_MAX_MINUTE else "WINDOW_2",
+                            prob_to90_45, threshold_info["dynamic_enabled"], threshold_info["minute_bucket"],
+                            threshold_remain, threshold_info["fallback_threshold"], threshold_info["source"],
+                            would_pass_dynamic, would_pass_old_fixed, decision_changed_vs_old,
+                        )
+                        res_45.update({
+                            "selected_prob_to90_threshold": threshold_remain,
+                            "threshold_source": threshold_info["source"],
+                            "minute_bucket": threshold_info["minute_bucket"],
+                            "dynamic_threshold_enabled": threshold_info["dynamic_enabled"],
+                            "old_fixed_threshold": threshold_info["fallback_threshold"],
+                            "decision_changed_vs_old": decision_changed_vs_old,
+                        })
+
+                        readiness_passed = True
+                        readiness_reason: Optional[str] = None
+                        market_decision_evidence: Dict[str, Any] = {}
+
+                        def record_current_decision(
+                            final_decision: str,
+                            block_reason: Optional[str],
+                            *,
+                            current_rule_path: str = "",
+                            other_hard_gates_passed: bool = True,
+                            telegram_result: Optional[Dict[str, Any]] = None,
+                            observation_created_at_utc: Optional[str] = None,
+                            decision_created_at_utc: Optional[str] = None,
+                            market_evidence: Optional[Mapping[str, Any]] = None,
+                            _persist: bool = True,
+                        ) -> Dict[str, Any]:
+                            try:
+                                resolved_market_evidence = copy.deepcopy(
+                                    dict(market_evidence or {})
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[MARKET_BENCHMARK_EVIDENCE_ERROR] "
+                                    "fixture_id=%s minute=%s action=continue "
+                                    "production_unchanged=true",
+                                    fixture_id,
+                                    minute,
+                                )
+                                resolved_market_evidence = {}
+                            if (
+                                ENABLE_MARKET_BENCHMARK
+                                and _market_benchmark_started
+                                and not resolved_market_evidence.get(
+                                    "decision_created_at_utc"
+                                )
+                            ):
+                                resolved_market_evidence = (
+                                    prepare_market_benchmark_evidence(
+                                        fixture_id=fixture_id,
+                                        minute=minute,
+                                        fixture_metrics=fixture_metrics,
+                                        probability_result=res_45,
+                                        existing=resolved_market_evidence,
+                                    )
+                                )
+                            frozen_observation_time = str(
+                                observation_created_at_utc
+                                or resolved_market_evidence.get(
+                                    "observation_created_at_utc"
+                                )
+                                or _utc_now_iso()
+                            )
+                            frozen_decision_time = str(
+                                decision_created_at_utc
+                                or resolved_market_evidence.get(
+                                    "decision_created_at_utc"
+                                )
+                                or frozen_observation_time
+                            )
+                            score_home_value = _safe_int(_unwrap_value(fixture_metrics.get("score_home")), 0)
+                            score_away_value = _safe_int(_unwrap_value(fixture_metrics.get("score_away")), 0)
+                            if _persist:
+                                record_score_timeline_observation(
+                                    fixture_id,
+                                    minute,
+                                    score_home_value,
+                                    score_away_value,
+                                    _normalize_status_short(fixture_metrics),
+                                )
+                            live_required = window_tag == "WINDOW_2_54_60"
+                            if live_required:
+                                if LIVE_GATE_GARBAGE_ONLY:
+                                    current_live_passed = not bool(live_gate_garbage)
+                                else:
+                                    current_live_passed = (
+                                        live_gate_passed_count is not None
+                                        and live_gate_passed_count >= WINDOW_2_LIVE_GATE_MIN_PASSED
+                                    )
+                            else:
+                                current_live_passed = True
+                            snapshot = build_decision_snapshot(
+                                fixture_id=fixture_id,
+                                minute=minute,
+                                window_name="WINDOW_1" if not live_required else "WINDOW_2",
+                                match_identity=build_match_identity_context(fixture_metrics),
+                                score_home=score_home_value,
+                                score_away=score_away_value,
+                                probability_result=res_45,
+                                threshold_result=threshold_info,
+                                threshold_next15=threshold_next15,
+                                readiness_result={
+                                    "passed": readiness_passed,
+                                    "reason": readiness_reason,
+                                    "other_hard_gates_passed": other_hard_gates_passed,
+                                    "rule_path": current_rule_path,
+                                },
+                                live_gate_result={
+                                    "required": live_required,
+                                    "passed": current_live_passed,
+                                    "live_gate_passed_count": live_gate_passed_count,
+                                    "legacy_live_gate_passed_count": legacy_live_gate_passed_count,
+                                    "garbage_weak_count": garbage_weak_count,
+                                    "live_gate_garbage": live_gate_garbage,
+                                    "rule_path": current_rule_path,
+                                },
+                                anti_garbage_passed=anti_garbage_passed,
+                                final_decision=final_decision,
+                                block_reason=block_reason,
+                                factor_context=res_45,
+                                created_at_utc=frozen_observation_time,
+                                decision_created_at_utc=frozen_decision_time,
+                            )
+                            snapshot["telegram"] = dict(telegram_result) if isinstance(telegram_result, dict) else {
+                                "send_attempted": False,
+                                "send_ok": False,
+                                "message_id": None,
+                                "send_error_code": None,
+                                "send_error_description": None,
+                            }
+                            attach_shadow_reputation(snapshot)
+                            if not _persist:
+                                return snapshot
+                            append_decision_snapshot(snapshot)
+                            observation = build_observation_from_decision(
+                                snapshot,
+                                fixture_metrics,
+                                res_45,
+                            )
+                            persist_observation_and_score_shadow(
+                                observation,
+                                market_evidence=resolved_market_evidence,
+                            )
+                            return snapshot
 
                         live_gate_log_fragment = (
                             f" live_gate_passed_count={live_gate_passed_count}"
@@ -13922,120 +31101,296 @@ def main_loop():
                             ready, reason = is_first_signal_snapshot_ready(
                                 fixture_metrics,
                                 minute,
-                                prob_next_15,
-                                prob_second_half_remain,
+                                prob_next_15_decision,
+                                prob_to90_45,
                             )
                             if not ready:
+                                readiness_passed = False
+                                readiness_reason = reason
                                 logger.info(
                                     f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
-                                    f"{live_gate_log_fragment} reason=readiness readiness_reason={reason}"
+                                    f"{decision_log_fragment}{live_gate_log_fragment} reason=readiness readiness_reason={reason}"
                                 )
+                                record_current_decision("BLOCK", "readiness", current_rule_path="readiness")
                                 continue
                             logger.info(
                                 f"[READINESS_OK] fixture_id={fixture_id} minute={minute} "
-                                f"prob_next_15={prob_next_15:.1f}% prob_second_half_remain={prob_second_half_remain:.1f}% "
+                                f"{decision_log_fragment} "
                                 f"first_signal_snapshot validated"
                             )
-                        rule_path = ""
+                        rule_path = "base_p90_75_channel_gate"
+                        signal_route = "primary"
 
-                        if not anti_garbage_passed:
-                            logger.info(
-                                f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
-                                f"{live_gate_log_fragment} reason=anti-garbage"
+                        # The retired probability/live/anti-garbage gates remain
+                        # observable for comparison, but BASE+p90 is now the only
+                        # model-quality publication rule.
+                        legacy_probability_gate_passed, legacy_probability_block_reason = (
+                            evaluate_45_plus_probability_gates(
+                                prob_next_15_decision=prob_next_15_decision,
+                                prob_until_end_decision=prob_until_end_decision,
+                                threshold_next15=threshold_next15,
+                                threshold_remain=threshold_remain,
                             )
-                            continue
-
-                        if window_tag == "WINDOW_1_46_53":
-                            if prob_next_15 < threshold_next15:
-                                logger.info(
-                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
-                                    f"reason=next15"
-                                )
-                                continue
-
-                            if prob_second_half_remain < threshold_remain:
-                                logger.info(
-                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
-                                    f"reason=remain"
-                                )
-                                continue
-
-                            rule_path = "window_1_hard_gate"
-                        else:
-                            if prob_next_15 < threshold_next15:
-                                logger.info(
-                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
-                                    f"{live_gate_log_fragment} reason=next15"
-                                )
-                                continue
-
-                            if prob_second_half_remain < threshold_remain:
-                                logger.info(
-                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
-                                    f"{live_gate_log_fragment} reason=remain"
-                                )
-                                continue
-
-                            if live_gate_passed_count is not None and live_gate_passed_count < WINDOW_2_LIVE_GATE_MIN_PASSED:
-                                logger.info(
-                                    f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                    f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                    f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f} "
-                                    f"live_gate_passed_count={live_gate_passed_count} reason=live-gate "
-                                    f"xg_total={xg_total:.2f} xg_total_passed={live_gate_checks['xg_total']} "
-                                    f"shots_on_target_total={shots_on_target_total:.1f} shots_on_target_total_passed={live_gate_checks['shots_on_target_total']} "
-                                    f"shots_in_box_total={shots_in_box_total:.1f} shots_in_box_total_passed={live_gate_checks['shots_in_box_total']} "
-                                    f"pressure_index={pressure_index:.2f} pressure_index_passed={live_gate_checks['pressure_index']}"
-                                )
-                                continue
-
-                            rule_path = "window_2_hard_gate"
-
-                        logger.info(
-                            f"[{allow_tag}] fixture_id={fixture_id} minute={minute} "
-                            f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                            f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
-                            f"{live_gate_log_fragment} rule_path={rule_path} lambda_2h={res_45.get('lambda_2h', 0.0):.4f} "
-                            f"pipeline=compute_probability_45_plus"
                         )
-
-                        # Early strict mode filter still applies for 45+ signals
-                        if not check_early_strict_mode(fixture_metrics, minute):
-                            logger.info(
-                                f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
-                                f"{live_gate_log_fragment} rule_path=blocked_by_early_strict_mode"
+                        legacy_live_gate_passed = True
+                        if window_tag == "WINDOW_2_54_60":
+                            legacy_live_gate_passed = (
+                                not bool(live_gate_garbage)
+                                if LIVE_GATE_GARBAGE_ONLY
+                                else bool(
+                                    live_gate_passed_count is not None
+                                    and live_gate_passed_count
+                                    >= WINDOW_2_LIVE_GATE_MIN_PASSED
+                                )
                             )
-                            continue
+                        legacy_early_strict_passed = check_early_strict_mode(
+                            fixture_metrics,
+                            minute,
+                        )
+                        res_45["legacy_live_gate_passed_count"] = int(
+                            legacy_live_gate_passed_count or 0
+                        )
+                        res_45["garbage_weak_count"] = int(garbage_weak_count)
+                        res_45["live_gate_garbage"] = bool(live_gate_garbage)
+                        res_45["legacy_selection_gates"] = {
+                            "publication_active": False,
+                            "probability_gate_passed": bool(
+                                legacy_probability_gate_passed
+                            ),
+                            "probability_block_reason": legacy_probability_block_reason,
+                            "anti_garbage_passed": bool(anti_garbage_passed),
+                            "live_gate_passed": bool(legacy_live_gate_passed),
+                            "early_strict_passed": bool(
+                                legacy_early_strict_passed
+                            ),
+                            "rescue_publication_enabled": False,
+                        }
+                        res_45["rescue_evaluation"] = {
+                            "enabled": False,
+                            "candidate": False,
+                            "quality_passed": False,
+                            "reason": "retired_by_base_p90_75",
+                        }
+                        res_45["signal_route"] = signal_route
+                        logger.info(
+                            "[LEGACY_SELECTION_SHADOW] fixture_id=%s minute=%s "
+                            "probability_gate_passed=%s probability_block_reason=%s "
+                            "anti_garbage_passed=%s live_gate_passed=%s "
+                            "early_strict_passed=%s rescue_publication_enabled=false",
+                            fixture_id,
+                            minute,
+                            legacy_probability_gate_passed,
+                            legacy_probability_block_reason,
+                            anti_garbage_passed,
+                            legacy_live_gate_passed,
+                            legacy_early_strict_passed,
+                        )
 
                         if not validate_match_context_before_send(data):
                             logger.info(
                                 f"[{block_tag}] fixture_id={fixture_id} minute={minute} "
-                                f"prob_next_15={prob_next_15:.2f} threshold_next15={threshold_next15:.2f} "
-                                f"prob_second_half_remain={prob_second_half_remain:.2f} threshold_remain={threshold_remain:.2f}"
-                                f"{live_gate_log_fragment} rule_path=blocked_by_pre_send_validation"
+                                f"{decision_log_fragment}{live_gate_log_fragment} rule_path=blocked_by_pre_send_validation"
+                            )
+                            record_current_decision("BLOCK", "pre-send-validation", current_rule_path="blocked_by_pre_send_validation", other_hard_gates_passed=False)
+                            continue
+
+                        channel_signal_filter = evaluate_channel_signal_filter(
+                            prob_to90_45,
+                            fixture_metrics.get("score_home"),
+                            fixture_metrics.get("score_away"),
+                            reputation_base_prob_to90=res_45.get(
+                                "reputation_base_prob_to90"
+                            ),
+                            reputation_adjusted_prob_to90=res_45.get(
+                                "reputation_adjusted_prob_to90"
+                            ),
+                            adjusted_intensity=res_45.get(
+                                "adjusted_intensity"
+                            ),
+                            season_context_factor=res_45.get(
+                                "season_context_factor_45p"
+                            ),
+                        )
+                        res_45["channel_signal_filter"] = channel_signal_filter
+                        logger.info(
+                            "[CHANNEL_SIGNAL_FILTER] fixture_id=%s minute=%s passed=%s "
+                            "reason=%s prob_to90=%.2f min_prob_to90=%.2f "
+                            "score=%s-%s goals_at_snapshot=%s "
+                            "reputation_delta_to90_pp=%.2f "
+                            "min_reputation_delta_to90_pp=%.2f "
+                            "adjusted_intensity=%.3f min_adjusted_intensity=%.3f "
+                            "season_context_factor=%.3f min_season_context_factor=%.3f "
+                            "version=%s",
+                            fixture_id,
+                            minute,
+                            channel_signal_filter["passed"],
+                            channel_signal_filter["reason"],
+                            _safe_float(channel_signal_filter.get("prob_to90"), 0.0),
+                            CHANNEL_SIGNAL_MIN_PROB_TO90,
+                            channel_signal_filter.get("score_home"),
+                            channel_signal_filter.get("score_away"),
+                            channel_signal_filter.get("goals_at_snapshot"),
+                            _safe_float(
+                                channel_signal_filter.get(
+                                    "reputation_delta_to90_pp"
+                                ),
+                                0.0,
+                            ),
+                            CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP,
+                            _safe_float(
+                                channel_signal_filter.get(
+                                    "adjusted_intensity"
+                                ),
+                                0.0,
+                            ),
+                            CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY,
+                            _safe_float(
+                                channel_signal_filter.get(
+                                    "season_context_factor"
+                                ),
+                                0.0,
+                            ),
+                            CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR,
+                            CHANNEL_SIGNAL_FILTER_VERSION,
+                        )
+                        wide_router_decision = route_publication_with_wide_research(
+                            fixture_id=fixture_id,
+                            minute=minute,
+                            fixture_metrics=fixture_metrics,
+                            probability_result=res_45,
+                            current_filter_allow=bool(
+                                channel_signal_filter["passed"]
+                            ),
+                            evidence_sink=market_decision_evidence,
+                        )
+                        res_45["wide_research_router"] = dict(
+                            wide_router_decision
+                        )
+                        effective_publication_allow = bool(
+                            wide_router_decision.get("allow")
+                        )
+                        if wide_router_decision.get("applied") is True:
+                            rule_path = (
+                                "wide_research_champion:"
+                                + str(
+                                    wide_router_decision.get("rule_id")
+                                    or "unknown"
+                                )
+                            )
+                        logger.info(
+                            "[WIDE_RESEARCH_ROUTER] fixture_id=%s minute=%s "
+                            "applied=%s allow=%s source=%s reason=%s "
+                            "rule_id=%s phase_id=%s current_filter_allow=%s",
+                            fixture_id,
+                            minute,
+                            wide_router_decision.get("applied"),
+                            effective_publication_allow,
+                            wide_router_decision.get("source"),
+                            wide_router_decision.get("reason"),
+                            wide_router_decision.get("rule_id"),
+                            wide_router_decision.get("phase_id"),
+                            channel_signal_filter.get("passed"),
+                        )
+                        market_decision_evidence = (
+                            prepare_market_benchmark_evidence(
+                                fixture_id=fixture_id,
+                                minute=minute,
+                                fixture_metrics=fixture_metrics,
+                                probability_result=res_45,
+                                existing=market_decision_evidence,
+                            )
+                        )
+                        publication_observed_at_utc = str(
+                            market_decision_evidence.get(
+                                "observation_created_at_utc"
+                            )
+                            or _utc_now_iso()
+                        )
+                        publication_decision_at_utc = str(
+                            market_decision_evidence.get(
+                                "decision_created_at_utc"
+                            )
+                            or _utc_now_iso()
+                        )
+                        if not effective_publication_allow:
+                            with state_lock:
+                                removed_rescue_candidate = state.setdefault(
+                                    "rescue_candidates", {}
+                                ).pop(str(int(fixture_id)), None)
+                                if removed_rescue_candidate is not None:
+                                    mark_state_dirty()
+                            record_current_decision(
+                                "BLOCK",
+                                (
+                                    "wide-research-champion"
+                                    if wide_router_decision.get("applied") is True
+                                    else "channel-signal-filter"
+                                ),
+                                current_rule_path=rule_path,
+                                observation_created_at_utc=(
+                                    publication_observed_at_utc
+                                ),
+                                decision_created_at_utc=(
+                                    publication_decision_at_utc
+                                ),
+                                market_evidence=market_decision_evidence,
                             )
                             continue
 
-                        initial_score = (int((fixture_metrics.get("score_home") or {}).get("value") or 0),
-                                         int((fixture_metrics.get("score_away") or {}).get("value") or 0))
-                        
-                        # Keep prob_second_half_remain as the display probability; decision logic above uses both hard gates.
-                        prob_display = prob_second_half_remain
-                        prob_display_90 = res_45.get("prob_to90", prob_second_half_remain)
+                        initial_score = (
+                            _safe_int(
+                                _unwrap_value(
+                                    fixture_metrics.get("score_home")
+                                ),
+                                0,
+                            ),
+                            _safe_int(
+                                _unwrap_value(
+                                    fixture_metrics.get("score_away")
+                                ),
+                                0,
+                            ),
+                        )
+
+                        with state_lock:
+                            if state.setdefault("rescue_candidates", {}).pop(
+                                str(int(fixture_id)), None
+                            ) is not None:
+                                mark_state_dirty()
+
+                        logger.info(
+                            f"[{allow_tag}] fixture_id={fixture_id} minute={minute} "
+                            f"{decision_log_fragment}{live_gate_log_fragment} "
+                            f"rule_path={rule_path} filter_version={CHANNEL_SIGNAL_FILTER_VERSION} "
+                            f"lambda_2h={res_45.get('lambda_2h', 0.0):.4f} "
+                            f"pipeline=compute_probability_45_plus"
+                        )
+
+                        # Display the actual next-15 horizon; the decision remain gate uses prob_to90.
+                        prob_display = prob_next_15_decision
+                        prob_display_90 = prob_to90_45
+                        premium_badge = qualifies_for_premium_badge(
+                            channel_signal_filter
+                        )
+                        res_45["premium_badge"] = bool(premium_badge)
+                        res_45["premium_badge_rule_version"] = (
+                            PREMIUM_BADGE_RULE_VERSION
+                            if premium_badge
+                            else None
+                        )
+                        logger.info(
+                            "[PREMIUM_BADGE] fixture_id=%s minute=%s eligible=%s "
+                            "base_filter_passed=%s goals_at_snapshot=%s "
+                            "max_goals_at_snapshot=%s rule_version=%s "
+                            "presentation_only=true",
+                            fixture_id,
+                            minute,
+                            premium_badge,
+                            channel_signal_filter.get("passed"),
+                            channel_signal_filter.get("goals_at_snapshot"),
+                            PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT,
+                            PREMIUM_BADGE_RULE_VERSION,
+                        )
                         snapshot_data = _build_signal_snapshot_data(
                             collected=data,
                             prob_display=prob_display,
@@ -14043,6 +31398,8 @@ def main_loop():
                             signal_minute=minute,
                             prob_display_90=prob_display_90,
                             is_admin_approved=False,
+                            signal_route=signal_route,
+                            premium_badge=premium_badge,
                         )
                         header_text = build_signal_header(snapshot_data)
                         msg = render_live_message(
@@ -14051,18 +31408,190 @@ def main_loop():
                             prob_display=prob_display,
                             prob_display_90=prob_display_90,
                             is_admin_approved=False,
+                            signal_route=signal_route,
+                            premium_badge=premium_badge,
                         )
-                        mid_msg = send_to_telegram(
-                            msg,
-                            match_id=fixture_id,
-                            score_at_signal=initial_score,
-                            signal_minute=int(minute),
+                        analysis_decision_id = _decision_snapshot_id(
+                            fixture_id,
+                            minute,
+                            (
+                                "WINDOW_1"
+                                if minute <= REGULAR_SIGNAL_WINDOW_1_MAX_MINUTE
+                                else "WINDOW_2"
+                            ),
+                            "ALLOW",
                         )
+                        analysis_signal_key = (
+                            signal_analysis_ui.make_signal_key(analysis_decision_id)
+                            if signal_analysis_ui is not None
+                            else "unavailable"
+                        )
+                        analysis_signal_keyboard = (
+                            signal_analysis_ui.build_signal_keyboard(
+                                ENABLE_SIGNAL_ANALYSIS_UI,
+                                BOT_USERNAME,
+                                analysis_signal_key,
+                                SIGNAL_ANALYSIS_UI_MODE,
+                            )
+                            if signal_analysis_ui is not None
+                            else None
+                        )
+                        logger.info(
+                            "[ANALYSIS_UI_BUTTON] signal_key=%s fixture_id=%s mode=%s url_created=%s",
+                            analysis_signal_key, fixture_id, SIGNAL_ANALYSIS_UI_MODE, bool(analysis_signal_keyboard),
+                        )
+                        pre_send_market_observation: Optional[Dict[str, Any]] = None
+                        try:
+                            pre_send_snapshot = record_current_decision(
+                                "ALLOW",
+                                None,
+                                current_rule_path=rule_path,
+                                telegram_result={
+                                    "send_attempted": False,
+                                    "send_ok": False,
+                                    "message_id": None,
+                                    "send_error_code": None,
+                                    "send_error_description": None,
+                                },
+                                observation_created_at_utc=(
+                                    publication_observed_at_utc
+                                ),
+                                decision_created_at_utc=(
+                                    publication_decision_at_utc
+                                ),
+                                market_evidence=market_decision_evidence,
+                                _persist=False,
+                            )
+                            pre_send_market_observation = (
+                                freeze_observation_rolling_dynamics(
+                                    build_observation_from_decision(
+                                        pre_send_snapshot,
+                                        fixture_metrics,
+                                        res_45,
+                                    )
+                                )
+                            )
+                            if capture_market_benchmark_decision(
+                                pre_send_market_observation,
+                                prepared_evidence=market_decision_evidence,
+                                durable=True,
+                            ):
+                                market_decision_evidence[
+                                    "pre_send_record_key"
+                                ] = (
+                                    "market-benchmark-decision:v2:"
+                                    + str(
+                                        pre_send_market_observation.get(
+                                            "observation_id"
+                                        )
+                                    )
+                                )
+                        except Exception:
+                            logger.exception(
+                                "[MARKET_BENCHMARK_PRE_SEND_ERROR] fixture_id=%s "
+                                "minute=%s action=continue_telegram_send "
+                                "production_unchanged=true",
+                                fixture_id,
+                                minute,
+                            )
+                        telegram_send_started_at_utc = _utc_now_iso()
+                        mid_msg = None
+                        telegram_exception_code: Optional[str] = None
+                        try:
+                            mid_msg = send_to_telegram(
+                                msg,
+                                match_id=fixture_id,
+                                score_at_signal=initial_score,
+                                signal_minute=int(minute),
+                                reply_markup=analysis_signal_keyboard,
+                            )
+                        except Exception as telegram_error:
+                            telegram_exception_code = type(
+                                telegram_error
+                            ).__name__
+                            raise
+                        finally:
+                            telegram_send_finished_at_utc = _utc_now_iso()
+                            telegram_snapshot = {
+                                "send_attempted": True,
+                                "send_ok": bool(mid_msg),
+                                "message_id": int(mid_msg) if mid_msg else None,
+                                "send_error_code": (
+                                    telegram_exception_code
+                                    or (
+                                        None
+                                        if mid_msg
+                                        else "telegram_send_failed"
+                                    )
+                                ),
+                                "send_error_description": (
+                                    "send_to_telegram raised"
+                                    if telegram_exception_code
+                                    else (
+                                        None
+                                        if mid_msg
+                                        else "send_to_telegram returned no message_id"
+                                    )
+                                ),
+                                "send_started_at_utc": telegram_send_started_at_utc,
+                                "send_finished_at_utc": telegram_send_finished_at_utc,
+                            }
+                            if pre_send_market_observation is not None:
+                                append_market_benchmark_delivery(
+                                    pre_send_market_observation,
+                                    telegram_snapshot,
+                                    durable=False,
+                                )
+                        final_decision_snapshot = record_current_decision(
+                            "ALLOW",
+                            None,
+                            current_rule_path=rule_path,
+                            telegram_result=telegram_snapshot,
+                            observation_created_at_utc=(
+                                publication_observed_at_utc
+                            ),
+                            decision_created_at_utc=(
+                                publication_decision_at_utc
+                            ),
+                            market_evidence=market_decision_evidence,
+                        )
+                        final_decision_snapshot["season_context"] = {
+                            key: res_45.get(key) for key in (
+                                "league_avg_goals", "league_factor", "team_mix_factor",
+                                "home_matches", "away_matches", "home_avg_scored", "home_avg_conceded",
+                                "away_avg_scored", "away_avg_conceded", "home_attack_factor",
+                                "home_defense_factor", "away_attack_factor", "away_defense_factor",
+                                "season_context_factor_45p",
+                            )
+                        }
+                        final_decision_snapshot["second_half"] = {
+                            key: res_45.get(key) for key in (
+                                "team_sample_home", "team_sample_away", "league_sample",
+                                "sample_confidence", "fallback_reason", "team_2h_factor",
+                                "league_2h_factor", "score_state_factor", "context_multiplier",
+                            )
+                        }
+                        if ENABLE_SIGNAL_ANALYSIS_UI and signal_analysis_ui is not None and mid_msg and analysis_signal_keyboard:
+                            saved_analysis_key = signal_analysis_ui.save_analysis_snapshot(
+                                final_decision_snapshot,
+                                msg,
+                                SIGNAL_ANALYSIS_INDEX_FILE,
+                                SIGNAL_ANALYSIS_CACHE_TTL_SECONDS,
+                            )
+                            if saved_analysis_key != analysis_signal_key:
+                                logger.warning(
+                                    "[ANALYSIS_UI_ERROR] stage=save_after_send signal_key=%s error_type=key_mismatch_or_write",
+                                    analysis_signal_key,
+                                )
                         if mid_msg:
+                            with state_lock:
+                                if state.setdefault("rescue_candidates", {}).pop(str(int(fixture_id)), None) is not None:
+                                    mark_state_dirty()
                             logger.info(
                                 f"[{window_tag}] fixture_id={fixture_id} minute={minute} SENT "
+                                f"signal_route={signal_route} "
                                 f"score_state={initial_score[0]}-{initial_score[1]} "
-                                f"prob_second_half_remain={prob_second_half_remain:.2f} prob_next_15={prob_next_15:.2f} "
+                                f"{decision_log_fragment} "
                                 f"lambda_2h={res_45.get('lambda_2h', 0.0):.4f}"
                             )
                             save_signal_snapshot_state(
@@ -14073,9 +31602,24 @@ def main_loop():
                                 signal_minute=minute,
                                 message_id=int(mid_msg),
                                 chat_id=int(TELEGRAM_CHAT_ID),
-                                prob_to75=prob_second_half_remain,
-                                prob_to90=prob_display_90,
+                                prob_to75=prob_to75_45,
+                                prob_to90=prob_to90_45,
+                                prob_next_15=prob_next_15_decision,
+                                prob_next_25=prob_next_25,
+                                prob_until_end_decision=prob_until_end_decision,
+                                decision_remain_metric=decision_remain_metric,
+                                legacy_prob_second_half_remain=prob_second_half_remain,
                                 signal_model="45_plus",
+                                signal_route=signal_route,
+                                premium_badge=premium_badge,
+                                selected_prob_to90_threshold=threshold_remain,
+                                threshold_source=threshold_info["source"],
+                                minute_bucket=threshold_info["minute_bucket"],
+                                dynamic_threshold_enabled=threshold_info["dynamic_enabled"],
+                                old_fixed_threshold=threshold_info["fallback_threshold"],
+                                decision_changed_vs_old=decision_changed_vs_old,
+                                decision=final_decision_snapshot.get("decision"),
+                                telegram=telegram_snapshot,
                             )
                             # Calculate initial PressureIndex
                             fixture_data = data.get("fixture", {})
@@ -14083,7 +31627,7 @@ def main_loop():
                             initial_momentum = 0.0  # First signal has 0 momentum
                             
                             # Extract probability values from 45+ model
-                            prob_until_end = prob_second_half_remain
+                            prob_until_end = prob_until_end_decision
                             league_factor_used = res_45.get("combined_m_2h", 1.0)
                             _score01_final, match_score_value, _score_metrics = compute_match_score_v2(fixture_metrics, league_factor_used)
 
@@ -14100,6 +31644,8 @@ def main_loop():
                                 res_45=res_45,
                                 threshold_next15=threshold_next15,
                                 threshold_remain=threshold_remain,
+                                decision_snapshot=final_decision_snapshot,
+                                telegram_snapshot=telegram_snapshot,
                             )
                             training_record["snapshot_saved"] = bool(save_snapshot(training_snapshot))
                             _register_training_signal_record(training_record)
@@ -14132,8 +31678,16 @@ def main_loop():
                                     "processed_ids": [],
                                     "finalized": False,
                                     "last_reported_minute": minute,
-                                    "last_pressure_index": initial_pressure
-                                }
+                                    "last_pressure_index": initial_pressure,
+                                    "normal_time_outcome_finalized": False,
+                                    "normal_time_result": None,
+                                    "normal_time_resolved_at_utc": None,
+                                    "normal_time_final_score_home": None,
+                                    "normal_time_final_score_away": None,
+                                    "normal_time_goal_events_after_signal": [],
+                                    "extra_time_goal_events_after_signal": [],
+                                    "shootout_events_excluded": 0,
+                                 }
                                 state.setdefault("match_processed_event_ids", {})[str(fixture_id)] = []
                                 state.setdefault("match_sent_at", {})[str(fixture_id)] = time.time()
                                 state.setdefault("match_prob_status", {})[str(fixture_id)] = prob_actual
@@ -14152,12 +31706,58 @@ def main_loop():
                             update_persistent_fixture_tracking(fixture_id, fixture_metrics, sent_text=msg)
                     except Exception:
                         logger.exception("Error processing fixture inner")
+                if _research_health_monitor is not None:
+                    # Count after processing: this cycle may have just marked
+                    # initially eligible fixtures NO_STATS.
+                    eligible_count = _research_health_eligible_fixture_count(
+                        fixtures
+                    )
+                    _research_health_note("note_feed", eligible_count)
+                if (
+                    outcome_reconcile_future is not None
+                    and outcome_reconcile_future.done()
+                ):
+                    try:
+                        outcome_reconcile_future.result()
+                    except Exception:
+                        logger.exception(
+                            "[DECISION_OUTCOME_RECONCILE] action=background_failed"
+                        )
+                    outcome_reconcile_future = None
+                if loop_counter % DECISION_OUTCOME_RECONCILE_EVERY_CYCLES == 0:
+                    if outcome_reconcile_future is None:
+                        outcome_reconcile_future = (
+                            outcome_reconcile_executor.submit(
+                                reconcile_pending_decision_outcomes,
+                                client,
+                                set(live_active_ids),
+                                limit=DECISION_OUTCOME_RECONCILE_LIMIT,
+                            )
+                        )
+                        logger.info(
+                            "[DECISION_OUTCOME_RECONCILE] "
+                            "action=background_scheduled"
+                        )
+                    else:
+                        logger.warning(
+                            "[DECISION_OUTCOME_RECONCILE] "
+                            "action=background_skip reason=previous_run_active"
+                        )
                 time.sleep(CHECK_INTERVAL)
             except Exception:
                 logger.exception("Main loop iteration failed")
                 time.sleep(CHECK_INTERVAL)
     finally:
+        rolling_seed_executor.shutdown(wait=False)
+        outcome_reconcile_executor.shutdown(
+            wait=False, cancel_futures=True
+        )
+        stop_market_benchmark_daemon()
         stop_monitor_daemon()
+        stop_wide_research_daemon()
+        stop_research_health_monitor()
+        stop_shadow_ml_daemon()
+        stop_signal_reputation_worker()
 
 # -------------------------
 # Entrypoint
@@ -14166,6 +31766,19 @@ if __name__ == "__main__":
     # Setup logging first
     logger = setup_logging()
     logger.info("Logging initialized")
+    logger.info(
+        "[RESCUE_CONFIG] enabled=%s publication_active=false "
+        "dynamic_threshold_shadow_only=true dynamic_threshold_enabled=%s max_shortfall_pp=%.1f "
+        "min_controller_score=%.1f min_reliability=%.2f confirmation_observations=%s "
+        "instant_score=%.1f title_active=false",
+        ENABLE_RESCUE_SIGNALS,
+        ENABLE_DYNAMIC_PROB_TO90_THRESHOLD,
+        RESCUE_MAX_THRESHOLD_SHORTFALL_PP,
+        RESCUE_MIN_CONTROLLER_SCORE,
+        RESCUE_MIN_RELIABILITY,
+        RESCUE_CONFIRMATION_OBSERVATIONS,
+        RESCUE_INSTANT_CONTROLLER_SCORE,
+    )
     
     args = parse_args()
     if args.dump_match:
@@ -14183,6 +31796,7 @@ if __name__ == "__main__":
     if missing:
         logger.warning("Missing Telegram configuration: %s. Telegram functionality will be disabled.", ", ".join(missing))
 
+    log_feature_flags()
     logger.info("Starting Goal Predictor Bot (API-Football powered)...")
     try:
         main_loop()

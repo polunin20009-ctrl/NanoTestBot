@@ -1,8 +1,41 @@
+# Secrets
 .env
-venv/
-__pycache__/
-*.pyc
-*.log
-state*.json
-signals*.jsonl
 *.env
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# Runtime state
+test_bot_state.json
+state*.json
+*.lock
+test_zzz.json/
+
+# Generated data and artifacts
+data/
+stats/
+reports/
+*.jsonl
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3.retry/
+*.reconcile.sqlite3*
+
+# Backups
+*.bak
+*.jsonl.gz
+*.broken.*.json
+
+# Local notes
+РАБ ВАРИАНТ/
