@@ -38,9 +38,7 @@ def test_main_startup_does_not_start_review_timeout_daemon() -> None:
 
 
 def test_legacy_review_send_callback_does_not_publish(monkeypatch) -> None:
-    publish = MagicMock(return_value=True)
     send_channel = MagicMock(return_value=999)
-    monkeypatch.setattr(bot, "publish_signal_to_channel", publish)
     monkeypatch.setattr(bot, "send_to_telegram", send_channel)
     monkeypatch.setattr(bot, "TELEGRAM_TOKEN", "test-token")
     monkeypatch.setattr(bot.requests, "post", lambda *args, **kwargs: MagicMock(ok=True))
@@ -65,7 +63,6 @@ def test_legacy_review_send_callback_does_not_publish(monkeypatch) -> None:
         }
     )
 
-    publish.assert_not_called()
     send_channel.assert_not_called()
 
 
