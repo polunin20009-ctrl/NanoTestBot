@@ -123,6 +123,12 @@ from wide_research.features import (
 )
 from wide_research.live import ActiveRuleRouter, WideShadowLayer
 from wide_research.lifecycle import LifecyclePolicy
+from wide_research.portfolio import (
+    FrozenPortfolioLayer,
+    FrozenPortfolioMember,
+    FrozenPortfolioSpec,
+)
+from wide_research.rules import rule_manifest_from_dict
 from wide_research.store import WideResearchStore
 from wide_research.health_runtime import ResearchHealthMonitor
 from wide_research.health_snapshot import ProfileSnapshotSpec
@@ -1349,6 +1355,81 @@ WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES = max(
         )
     ),
 )
+# Immutable, research-only OR portfolios selected on 2026-09-20/21.  Their own
+# evidence starts at first runtime registration; historical results are metadata
+# only and are never imported into the prospective verdict.
+ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS = _parse_env_bool(
+    "ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS", False
+)
+WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE = os.environ.get(
+    "WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE",
+    os.path.join("data", "wide_research_frozen_portfolios.sqlite3"),
+)
+WIDE_RESEARCH_FROZEN_PORTFOLIO_MAX_DB_BYTES = max(
+    10 * 1024 * 1024,
+    int(
+        os.environ.get(
+            "WIDE_RESEARCH_FROZEN_PORTFOLIO_MAX_DB_BYTES",
+            str(512 * 1024 * 1024),
+        )
+    ),
+)
+WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON = max(
+    100,
+    int(os.environ.get("WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON", "200")),
+)
+WIDE_RESEARCH_FROZEN_MEMBER_REFS = {
+    "four_factor_volume": (
+        "exact_four_shadow",
+        "wide-aa99916f49da87ffd916",
+        "3b8ce853af0304b91a1982513ae2ea55df21043a80ed6ec0079ca616d6a198e1",
+    ),
+    "four_factor_total_shots": (
+        "exact_four_shadow",
+        "wide-292d027395d07e02dd66",
+        "d6bddbdc0f6583bb91ba226a30229340d2d16ba5e6e934136fdcd6d8a9bc7811",
+    ),
+    "four_factor_box_context": (
+        "exact_four_shadow",
+        "wide-024ee3811fbe580cac5e",
+        "bd09e36616a86962c607f7bc094782d56482749bb4e90f9c0615759ad7002489",
+    ),
+    "four_factor_sot_volume": (
+        "exact_four_shadow",
+        "wide-f424901a7cce76336cea",
+        "f10488242a1a829fe69e9e7b7fdc15b5784357816e41779b805d98302272b47c",
+    ),
+    "four_factor_strict_box_context": (
+        "exact_four_shadow",
+        "wide-5db20bf31755ee57e623",
+        "587fecfa33496e53a14b1c617606983155189209ae24d18f368e68ad68e8080e",
+    ),
+    "four_factor_game_state_box_context": (
+        "exact_four_shadow",
+        "wide-cb0bf970e96cb0269815",
+        "daadf0c9ae15a9d087ad2e6fb760c7673257b513fd1b4000f6e888cc3e6b275a",
+    ),
+    "rare_asymmetry": (
+        "rare_precision_shadow",
+        "wide-1f89b379f5d04f3ceb3f",
+        "38e6666d98fd031af2989f4e7aebc3228e621312c58bde70ea4aed267289a359",
+    ),
+    "rare_market_pressure": (
+        "rare_precision_shadow",
+        "wide-0bed4a7f285d9f108840",
+        "82139a90953630cfceaa7f02fec9a0e9613cc273c49e7f373f281a5d0da8c494",
+    ),
+    "rare_market_season_pace": (
+        "rare_precision_shadow",
+        "wide-9a553c7878963807ea7a",
+        "dd3395c8c80b08c1d690362380b764eeb178ce5706e71d26ed11ee93ab24234a",
+    ),
+    "rare_compact_volume": (
+        "rare_precision_shadow",
+        "wide-a27d592c8341b36b984b",
+        "48bd4850bc3c75f3647ae30932707d0581d213a622b5d01c5855c42742faa243",
+    ),
+}
 SHADOW_ML_RETRAIN_CHECK_SECONDS = max(
     300, int(os.environ.get("SHADOW_ML_RETRAIN_CHECK_SECONDS", "21600"))
 )
@@ -1923,6 +2004,15 @@ def log_feature_flags() -> None:
         WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_INTERVAL_SECONDS,
         WIDE_RESEARCH_RARE_PRECISION_DB_FILE,
         WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE,
+    )
+    logger.info(
+        "[WIDE_RESEARCH_FROZEN_PORTFOLIO_CONFIG] enabled=%s "
+        "portfolio_count=%s terminal_horizon=%s db=%s "
+        "shadow_only=true production_apply=false",
+        ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS,
+        20,
+        WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+        WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE,
     )
     logger.info(
         "[ROLLING_DYNAMICS_CONFIG] enabled=%s shadow_only=true production_apply=false schema=%s windows=5,10 max_extra_minutes=%s seed_minutes=36,39,41,44 seed_max_fetch_attempts=%s seed_workers=%s",
@@ -23579,6 +23669,9 @@ _wide_research_rare_precision_store: Optional[WideResearchStore] = None
 _wide_research_rare_precision_layer: Optional[WideShadowLayer] = None
 _wide_research_rare_precision_controller: Optional[WideResearchController] = None
 _wide_research_rare_precision_signature: Tuple[Any, ...] = ()
+_wide_research_frozen_portfolio_store: Optional[WideResearchStore] = None
+_wide_research_frozen_portfolio_layer: Optional[FrozenPortfolioLayer] = None
+_wide_research_frozen_portfolio_signature: Tuple[Any, ...] = ()
 _wide_research_stop = threading.Event()
 _wide_research_wakeup = threading.Event()
 _wide_research_thread: Optional[threading.Thread] = None
@@ -23700,6 +23793,10 @@ def _research_retry_tick() -> Dict[str, Any]:
         (ENABLE_WIDE_RESEARCH_FOUR_FACTOR, _get_wide_research_four_factor_layer),
         (ENABLE_WIDE_RESEARCH_PRECISION, _get_wide_research_precision_layer),
         (ENABLE_WIDE_RESEARCH_RARE_PRECISION, _get_wide_research_rare_precision_layer),
+        (
+            ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS,
+            _get_wide_research_frozen_portfolio_layer,
+        ),
     ):
         if not enabled:
             continue
@@ -23846,10 +23943,16 @@ def _assert_wide_research_runtime_paths() -> None:
         normalize(WIDE_RESEARCH_RARE_PRECISION_ACTIVE_MANIFEST_FILE),
         normalize(WIDE_RESEARCH_RARE_PRECISION_DISCOVERY_FILE),
     ]
+    frozen_portfolio_output_files = [
+        normalize(WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE),
+        normalize(WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE + "-wal"),
+        normalize(WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE + "-shm"),
+    ]
     primary_outputs = set(primary_output_files)
     experimental_outputs = set(experimental_output_files)
     precision_outputs = set(precision_output_files)
     rare_precision_outputs = set(rare_precision_output_files)
+    frozen_portfolio_outputs = set(frozen_portfolio_output_files)
     primary_output_dir = normalize(WIDE_RESEARCH_OUTPUT_DIR)
     experimental_output_dir = normalize(WIDE_RESEARCH_FOUR_FACTOR_OUTPUT_DIR)
     precision_output_dir = normalize(WIDE_RESEARCH_PRECISION_OUTPUT_DIR)
@@ -23983,6 +24086,22 @@ def _assert_wide_research_runtime_paths() -> None:
                     raise ValueError(
                         "existing output is inside rare precision artifact directory"
                     )
+    if ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS:
+        if len(frozen_portfolio_output_files) != len(frozen_portfolio_outputs):
+            raise ValueError("frozen portfolio outputs overlap each other")
+        existing_outputs = set(primary_outputs)
+        if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+            existing_outputs.update(experimental_outputs)
+        if ENABLE_WIDE_RESEARCH_PRECISION:
+            existing_outputs.update(precision_outputs)
+        if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+            existing_outputs.update(rare_precision_outputs)
+        overlap = sorted(existing_outputs & frozen_portfolio_outputs)
+        if overlap:
+            raise ValueError(
+                "frozen portfolio output overlaps another profile: "
+                + overlap[0]
+            )
     outputs = set(primary_outputs)
     if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
         outputs.update(experimental_outputs)
@@ -23990,6 +24109,8 @@ def _assert_wide_research_runtime_paths() -> None:
         outputs.update(precision_outputs)
     if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
         outputs.update(rare_precision_outputs)
+    if ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS:
+        outputs.update(frozen_portfolio_outputs)
     protected: set[str] = set()
     for name in (
         "OBSERVATION_HISTORY_FILE",
@@ -24314,6 +24435,241 @@ def _get_wide_research_rare_precision_layer() -> WideShadowLayer:
     return _get_wide_research_rare_precision_components()[1]
 
 
+def _resolve_frozen_portfolio_member(
+    store: WideResearchStore,
+    reference: Tuple[str, str, str],
+) -> FrozenPortfolioMember:
+    source_profile, rule_id, expected_store_hash = reference
+    row = next(
+        (
+            value
+            for value in store.list_manifests()
+            if str(value.get("rule_id") or "") == rule_id
+        ),
+        None,
+    )
+    if row is None:
+        raise KeyError(f"frozen portfolio source rule is missing: {rule_id}")
+    actual_store_hash = str(row.get("manifest_hash") or "")
+    if actual_store_hash != expected_store_hash:
+        raise ValueError(
+            "frozen portfolio source checksum mismatch: " + rule_id
+        )
+    manifest = rule_manifest_from_dict(
+        row.get("manifest") if isinstance(row.get("manifest"), Mapping) else {}
+    )
+    return FrozenPortfolioMember(
+        source_profile=source_profile,
+        source_store_hash=actual_store_hash,
+        manifest=manifest,
+    )
+
+
+def _get_wide_research_frozen_portfolio_components() -> Tuple[
+    WideResearchStore,
+    FrozenPortfolioLayer,
+]:
+    """Return the isolated, permanently shadow-only frozen portfolio stack."""
+
+    global _wide_research_frozen_portfolio_store
+    global _wide_research_frozen_portfolio_layer
+    global _wide_research_frozen_portfolio_signature
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE),
+        int(WIDE_RESEARCH_FROZEN_PORTFOLIO_MAX_DB_BYTES),
+        int(WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON),
+        tuple(sorted(WIDE_RESEARCH_FROZEN_MEMBER_REFS.items())),
+    )
+    with _wide_research_lock:
+        if (
+            _wide_research_frozen_portfolio_store is None
+            or _wide_research_frozen_portfolio_layer is None
+            or _wide_research_frozen_portfolio_signature != signature
+        ):
+            _assert_wide_research_runtime_paths()
+            four_factor_store = _get_wide_research_four_factor_components()[0]
+            rare_store = _get_wide_research_rare_precision_components()[0]
+            stores_by_profile = {
+                "exact_four_shadow": four_factor_store,
+                "rare_precision_shadow": rare_store,
+            }
+
+            def member(key: str) -> FrozenPortfolioMember:
+                reference = WIDE_RESEARCH_FROZEN_MEMBER_REFS[key]
+                return _resolve_frozen_portfolio_member(
+                    stores_by_profile[reference[0]],
+                    reference,
+                )
+
+            volume = member("four_factor_volume")
+            total_shots = member("four_factor_total_shots")
+            box_context = member("four_factor_box_context")
+            sot_volume = member("four_factor_sot_volume")
+            strict_box_context = member("four_factor_strict_box_context")
+            game_state_box_context = member(
+                "four_factor_game_state_box_context"
+            )
+            asymmetry = member("rare_asymmetry")
+            market_pressure = member("rare_market_pressure")
+            market_season_pace = member("rare_market_season_pace")
+            compact_volume = member("rare_compact_volume")
+            specs = (
+                FrozenPortfolioSpec(
+                    portfolio_id="balanced-two-rule",
+                    version="v1",
+                    members=(asymmetry, market_pressure),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="broad-three-rule",
+                    version="v1",
+                    members=(volume, asymmetry, market_pressure),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-plus-volume",
+                    version="v1",
+                    members=(market_pressure, volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-plus-compact-volume",
+                    version="v1",
+                    members=(market_pressure, compact_volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="balanced-plus-compact-volume",
+                    version="v1",
+                    members=(market_pressure, asymmetry, compact_volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="asymmetry-plus-volume",
+                    version="v1",
+                    members=(asymmetry, volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-compact-volume-four",
+                    version="v1",
+                    members=(market_pressure, compact_volume, volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="balanced-plus-total-shots",
+                    version="v1",
+                    members=(market_pressure, asymmetry, total_shots),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-compact-box-context",
+                    version="v1",
+                    members=(market_pressure, compact_volume, box_context),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-season-compact-box-context",
+                    version="v1",
+                    members=(market_season_pace, compact_volume, box_context),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="balanced-plus-sot-volume",
+                    version="v1",
+                    members=(market_pressure, asymmetry, sot_volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-season-plus-total-shots",
+                    version="v1",
+                    members=(market_season_pace, total_shots),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-season-plus-sot-portfolio",
+                    version="v1",
+                    members=(market_season_pace, volume, sot_volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-season-plus-volume",
+                    version="v1",
+                    members=(market_season_pace, volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-plus-total-shots",
+                    version="v1",
+                    members=(market_pressure, total_shots),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-plus-sot-portfolio",
+                    version="v1",
+                    members=(market_pressure, volume, sot_volume),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-plus-box-context",
+                    version="v1",
+                    members=(market_pressure, box_context),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-box-context-strict",
+                    version="v1",
+                    members=(
+                        market_pressure,
+                        box_context,
+                        strict_box_context,
+                    ),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-pressure-box-context-game-state",
+                    version="v1",
+                    members=(
+                        market_pressure,
+                        box_context,
+                        game_state_box_context,
+                    ),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="market-season-plus-box-context",
+                    version="v1",
+                    members=(market_season_pace, box_context),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+            )
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            store = WideResearchStore(
+                WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE,
+                allowed_root=project_root,
+                max_db_bytes=WIDE_RESEARCH_FROZEN_PORTFOLIO_MAX_DB_BYTES,
+            )
+            store.bind_profile("frozen_portfolio_shadow")
+            layer = FrozenPortfolioLayer(
+                store,
+                specs,
+                max_prediction_lag_seconds=(
+                    SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+                ),
+            )
+            _wide_research_frozen_portfolio_store = store
+            _wide_research_frozen_portfolio_layer = layer
+            _wide_research_frozen_portfolio_signature = signature
+        return (
+            _wide_research_frozen_portfolio_store,
+            _wide_research_frozen_portfolio_layer,
+        )
+
+
+def _get_wide_research_frozen_portfolio_layer() -> FrozenPortfolioLayer:
+    return _get_wide_research_frozen_portfolio_components()[1]
+
+
 def _wide_research_retry_gate(
     layer: WideShadowLayer,
     *,
@@ -24346,6 +24702,7 @@ def evaluate_and_store_wide_research(
             or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
             or ENABLE_WIDE_RESEARCH_PRECISION
             or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+            or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
         )
         or not isinstance(observation, Mapping)
         or str(observation.get("record_type") or "") != "observation"
@@ -24520,6 +24877,45 @@ def evaluate_and_store_wide_research(
                 "shadow_only=true production_unchanged=true",
                 observation_id,
             )
+    if ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS:
+        try:
+            result_portfolios = (
+                _get_wide_research_frozen_portfolio_layer().process_snapshot(
+                    observation,
+                    static_prediction=static_prediction,
+                    rolling_prediction=rolling_prediction,
+                )
+            )
+            claimed_portfolios = (
+                result_portfolios.get("claimed")
+                if isinstance(result_portfolios, dict)
+                else []
+            )
+            if claimed_portfolios:
+                logger.info(
+                    "[WIDE_RESEARCH_FROZEN_PORTFOLIO_TRIGGER] "
+                    "observation_id=%s fixture_id=%s minute=%s claimed=%s "
+                    "prospective_only=true shadow_only=true "
+                    "production_apply=false",
+                    observation_id,
+                    observation.get("fixture_id"),
+                    observation.get("minute"),
+                    [
+                        {
+                            "portfolio_id": item.get("portfolio_id"),
+                            "phase_id": item.get("phase_id"),
+                            "passed_members": item.get("passed_members"),
+                        }
+                        for item in claimed_portfolios
+                        if isinstance(item, dict)
+                    ],
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_FROZEN_PORTFOLIO_ERROR] observation_id=%s "
+                "shadow_only=true production_unchanged=true",
+                observation_id,
+            )
     return primary_pass
 
 
@@ -24532,6 +24928,7 @@ def append_wide_research_outcomes(
             or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
             or ENABLE_WIDE_RESEARCH_PRECISION
             or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+            or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
         )
         or not outcomes
     ):
@@ -24629,6 +25026,31 @@ def append_wide_research_outcomes(
         except Exception:
             logger.exception(
                 "[WIDE_RESEARCH_RARE_PRECISION_OUTCOME_ERROR] records=%s "
+                "shadow_only=true production_unchanged=true",
+                len(outcomes),
+            )
+    if ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS:
+        try:
+            result_portfolios = (
+                _get_wide_research_frozen_portfolio_layer().process_outcomes(
+                    outcomes
+                )
+            )
+            updated_portfolios = _safe_int(
+                result_portfolios.get("updated_triggers"), 0
+            )
+            if updated_portfolios:
+                logger.info(
+                    "[WIDE_RESEARCH_FROZEN_PORTFOLIO_OUTCOME] inserted=%s "
+                    "updated_triggers=%s ignored_unmatched=%s "
+                    "shadow_only=true production_apply=false",
+                    result_portfolios.get("inserted"),
+                    updated_portfolios,
+                    result_portfolios.get("ignored_unmatched"),
+                )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_FROZEN_PORTFOLIO_OUTCOME_ERROR] records=%s "
                 "shadow_only=true production_unchanged=true",
                 len(outcomes),
             )
@@ -24881,6 +25303,7 @@ def persist_wide_monitor_snapshot(
             or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
             or ENABLE_WIDE_RESEARCH_PRECISION
             or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+            or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
         )
         or not ENABLE_OBSERVATION_HISTORY
         or int(minute) < int(REGULAR_SIGNAL_MIN_MINUTE)
@@ -26089,7 +26512,9 @@ def wide_research_daemon() -> None:
         "precision_hard_shadow_only=true rare_precision_enabled=%s "
         "rare_precision_auto_discovery=%s "
         "rare_precision_auto_lifecycle=%s "
-        "rare_precision_hard_shadow_only=true",
+        "rare_precision_hard_shadow_only=true "
+        "frozen_portfolios_enabled=%s "
+        "frozen_portfolios_hard_shadow_only=true",
         ENABLE_WIDE_RESEARCH,
         WIDE_RESEARCH_AUTO_DISCOVERY,
         WIDE_RESEARCH_AUTO_LIFECYCLE,
@@ -26102,7 +26527,23 @@ def wide_research_daemon() -> None:
         ENABLE_WIDE_RESEARCH_RARE_PRECISION,
         WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY,
         WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE,
+        ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS,
     )
+    if ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS:
+        try:
+            portfolio_store, _portfolio_layer = (
+                _get_wide_research_frozen_portfolio_components()
+            )
+            recovery = portfolio_store.recover()
+            logger.info(
+                "[WIDE_RESEARCH_FROZEN_PORTFOLIO_RECOVERY] %s",
+                recovery,
+            )
+        except Exception:
+            logger.exception(
+                "[WIDE_RESEARCH_FROZEN_PORTFOLIO_ERROR] "
+                "action=startup production_unchanged=true"
+            )
     initial_delay_primary = (
         _wide_research_initial_discovery_delay_seconds()
         if ENABLE_WIDE_RESEARCH and WIDE_RESEARCH_AUTO_DISCOVERY
@@ -26607,6 +27048,7 @@ def start_wide_research_daemon() -> None:
         or ENABLE_WIDE_RESEARCH_FOUR_FACTOR
         or ENABLE_WIDE_RESEARCH_PRECISION
         or ENABLE_WIDE_RESEARCH_RARE_PRECISION
+        or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
     ):
         logger.info("[WIDE_RESEARCH_DAEMON] disabled")
         return
