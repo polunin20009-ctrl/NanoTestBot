@@ -234,7 +234,7 @@ def _parse_env_int_tuple(
 # -------------------------
 # Configuration (embedded per user request)
 # -------------------------
-API_FOOTBALL_KEY = "fc7e650f8109ac4ad77e446b26a363b9"
+API_FOOTBALL_KEY = _parse_env_str("API_FOOTBALL_KEY") or ""
 TELEGRAM_TOKEN = _parse_env_str("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = None
 TELEGRAM_CHAT_ID_RAW = _parse_env_str("TELEGRAM_CHAT_ID")
