@@ -14708,124 +14708,6 @@ def handle_callback_query(callback_query: Dict[str, Any]):
             )
             return
         
-        # Handle REVIEW mode callbacks (review_send:<fixture_id> or review_skip:<fixture_id>)
-        if callback_data.startswith("review_"):
-            try:
-                action, fixture_id_str = callback_data.split(":", 1)
-                fixture_id = int(fixture_id_str)
-                
-                with state_lock:
-                    review_queue = state.get("review_queue", {})
-                    review_info = review_queue.get(str(fixture_id))
-                
-                if not review_info:
-                    logger.warning(f"[REVIEW] No review info for fixture_id={fixture_id}")
-                    answer_payload = {"callback_query_id": callback_id, "text": "Сигнал не найден", "show_alert": True}
-                    requests.post(answer_url, data=answer_payload, timeout=5)
-                    return
-                
-                # Check if already decided
-                if review_info.get("review_decision"):
-                    logger.info(f"[REVIEW] Already decided for fixture_id={fixture_id}: {review_info['review_decision']}")
-                    answer_payload = {"callback_query_id": callback_id, "text": "Уже обработано", "show_alert": True}
-                    requests.post(answer_url, data=answer_payload, timeout=5)
-                    return
-                
-                if action == "review_send":
-                    # SEND TO CHANNEL
-                    logger.info(f"[REVIEW] Admin approved fixture_id={fixture_id}")
-                    
-                    # Mark as approved by admin BEFORE publishing
-                    with state_lock:
-                        review_queue[str(fixture_id)]["approved_by_admin"] = True
-                        mark_state_dirty()
-                    
-                    # Publish signal to channel
-                    success = publish_signal_to_channel(fixture_id)
-                    
-                    if success:
-                        # Update review decision and mark as resolved
-                        with state_lock:
-                            review_queue[str(fixture_id)]["review_decision"] = "sent"
-                            review_queue[str(fixture_id)]["review_decision_ts"] = time.time()
-                            review_queue[str(fixture_id)]["review_by"] = "admin"
-                            review_queue[str(fixture_id)]["resolved"] = True
-                            
-                            # Also mark in admin_reviews to stop daemon updates
-                            admin_reviews = state.get("admin_reviews", {})
-                            if str(fixture_id) in admin_reviews:
-                                admin_reviews[str(fixture_id)]["finished"] = True
-                            
-                            mark_state_dirty()
-                        
-                        # Edit message to remove keyboard
-                        message = callback_query.get("message", {})
-                        message_id = message.get("message_id")
-                        chat_id = message.get("chat", {}).get("id")
-                        
-                        if message_id and chat_id:
-                            edit_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup"
-                            edit_payload = {
-                                "chat_id": chat_id,
-                                "message_id": message_id,
-                                "reply_markup": json.dumps({"inline_keyboard": []})
-                            }
-                            requests.post(edit_url, data=edit_payload, timeout=5)
-                            logger.info(f"[REVIEW] Removed keyboard for fixture={fixture_id} after admin decision")
-                        
-                        answer_payload = {"callback_query_id": callback_id, "text": "✅ Сигнал отправлен в канал", "show_alert": False}
-                        requests.post(answer_url, data=answer_payload, timeout=5)
-                        logger.info(f"[REVIEW] Signal published for fixture_id={fixture_id}, marked as resolved")
-                    else:
-                        answer_payload = {"callback_query_id": callback_id, "text": "❌ Ошибка отправки", "show_alert": True}
-                        requests.post(answer_url, data=answer_payload, timeout=5)
-                        logger.error(f"[REVIEW] Failed to publish signal for fixture_id={fixture_id}")
-                    
-                    return
-                
-                elif action == "review_skip":
-                    # SKIP (IGNORE)
-                    logger.info(f"[REVIEW] Admin skipped fixture_id={fixture_id}")
-                    
-                    # Update review decision and mark as resolved
-                    with state_lock:
-                        review_queue[str(fixture_id)]["review_decision"] = "skipped"
-                        review_queue[str(fixture_id)]["review_decision_ts"] = time.time()
-                        review_queue[str(fixture_id)]["resolved"] = True
-                        
-                        # Also mark in admin_reviews to stop daemon updates
-                        admin_reviews = state.get("admin_reviews", {})
-                        if str(fixture_id) in admin_reviews:
-                            admin_reviews[str(fixture_id)]["finished"] = True
-                        
-                        mark_state_dirty()
-                    
-                    # Edit message to remove keyboard
-                    message = callback_query.get("message", {})
-                    message_id = message.get("message_id")
-                    chat_id = message.get("chat", {}).get("id")
-                    
-                    if message_id and chat_id:
-                        edit_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup"
-                        edit_payload = {
-                            "chat_id": chat_id,
-                            "message_id": message_id,
-                            "reply_markup": json.dumps({"inline_keyboard": []})
-                        }
-                        requests.post(edit_url, data=edit_payload, timeout=5)
-                        logger.info(f"[REVIEW] Removed keyboard for fixture={fixture_id} after admin decision")
-                    
-                    answer_payload = {"callback_query_id": callback_id, "text": "❌ Сигнал пропущен", "show_alert": False}
-                    requests.post(answer_url, data=answer_payload, timeout=5)
-                    logger.info(f"[REVIEW] Signal skipped for fixture_id={fixture_id}, marked as resolved")
-                    return
-            
-            except Exception:
-                logger.exception(f"[REVIEW] Error handling review callback: {callback_data}")
-                answer_payload = {"callback_query_id": callback_id, "text": "Ошибка обработки", "show_alert": True}
-                requests.post(answer_url, data=answer_payload, timeout=5)
-                return
-        
         # Check if user has started the bot before processing callback
         with persistent_state_lock:
             user_started = persistent_state.get("started_users", {})
@@ -31181,12 +31063,6 @@ def main_loop():
     start_research_health_monitor()
     start_monitor_daemon(client)
     start_callback_handler_daemon()  # Start callback handler for inline buttons
-    if ENABLE_ADMIN_REVIEW_SIGNALS:
-        start_review_timeout_daemon()  # Start review timeout checker for auto-skip after 10 minutes
-    else:
-        logger.info("[REVIEW_DISABLED] Review timeout daemon disabled - admin/review signals are turned off")
-    # DISABLED: admin_review_daemon no longer needed - review messages sent once and never edited
-    # start_admin_review_daemon(client)  # Start admin review updater for DM messages
     start_daily_stats_checker_daemon()  # Start daily stats checker for 23:59 rule
     start_gsheets_labeler_daemon(client)  # Start Google Sheets labeler daemon for goal_next_15 backfill
     start_daily_cleanup_daemon(client)  # Start maintenance daemon (04:00 MSK smart cleanup)
@@ -31322,7 +31198,7 @@ def main_loop():
                             continue
 
                         # Skip ordinary detailed processing for matches before the regular ordinary-signal window
-                        if minute_i < REGULAR_SIGNAL_MIN_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
+                        if minute_i < REGULAR_SIGNAL_MIN_MINUTE:
                             schedule_rolling_dynamics_seed(
                                 rolling_seed_executor,
                                 client,
@@ -31344,8 +31220,7 @@ def main_loop():
                             )
                             continue
 
-                        # Avoid extra fetches for post-window ordinary signals when review mode is disabled.
-                        if minute_i > REGULAR_SIGNAL_MAX_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
+                        if minute_i > REGULAR_SIGNAL_MAX_MINUTE:
                             logger.info(
                                 f"[BLOCK_POST_60] fixture_id={fixture_id} minute={minute_i} "
                                 f"reason=ordinary_signals_stop_after_{REGULAR_SIGNAL_MAX_MINUTE}"
@@ -31427,20 +31302,6 @@ def main_loop():
                                 continue
 
                         minute = int((fixture_metrics.get("elapsed") or {}).get("value") or minute_i or 0)
-                        # Preserve existing review/admin flow; ordinary-window blocks are enforced later.
-                        if minute > REGULAR_SIGNAL_MAX_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
-                            logger.info(
-                                f"[BLOCK_POST_60] fixture_id={fixture_id} minute={minute} "
-                                f"reason=ordinary_signals_stop_after_{REGULAR_SIGNAL_MAX_MINUTE}"
-                            )
-                            continue
-
-                        if minute < REGULAR_SIGNAL_MIN_MINUTE and not ENABLE_ADMIN_REVIEW_SIGNALS:
-                            logger.info(
-                                f"[BLOCK_PRE_46] fixture_id={fixture_id} minute={minute} "
-                                f"reason=ordinary_signals_start_from_{REGULAR_SIGNAL_MIN_MINUTE}"
-                            )
-                            continue
 
                         # Skip the first regular 46+ evaluation if the transitional metrics are not stable yet
                         if minute == REGULAR_SIGNAL_MIN_MINUTE:
@@ -31468,20 +31329,6 @@ def main_loop():
                         eval_mode = "MID_STRICT" if 25 <= minute <= 30 else "NORMAL"
                         logger.info(f"[EVAL] mode={eval_mode} minute={minute}")
                         logger.info(f"[EVAL] match={fixture_id} minute={minute} prob={prob_actual}%")
-                        
-                        # REVIEW MODE: Check if probability is in review range (50-79.999%)
-                        if minute >= REVIEW_PIPELINE_MIN_MINUTE and REVIEW_MIN_THRESHOLD <= prob_actual < PROB_SEND_THRESHOLD:
-                            if ENABLE_ADMIN_REVIEW_SIGNALS:
-                                logger.info(f"[REVIEW] match={fixture_id} prob={prob_actual:.1f}% -> REVIEW mode (queuing for admin)")
-                                # Early strict mode filter still applies to REVIEW
-                                if not check_early_strict_mode(fixture_metrics, minute):
-                                    logger.info(f"[REVIEW] match={fixture_id} BLOCKED by early strict mode at minute {minute}")
-                                    continue
-                                # Send to admin for review
-                                send_review_to_admin(fixture_id, data, prob_actual, minute)
-                                continue  # Don't auto-send, wait for admin decision
-                            else:
-                                logger.info(f"[REVIEW_DISABLED] match={fixture_id} prob={prob_actual:.1f}% -> REVIEW mode disabled, skipping to 45+ logic")
 
                         # NEW 45+ LOGIC: ordinary signals work only inside the new 46-60 window
                         if minute < REGULAR_SIGNAL_MIN_MINUTE:
