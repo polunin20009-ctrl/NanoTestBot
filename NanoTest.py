@@ -8885,6 +8885,98 @@ def add_tracked_match(
     logger.info("[TRACK] added fixture=%s msg_id=%s", int(fixture_id), int(message_id))
 
 
+def _persisted_signal_sent_at_ts(fixture_key: str) -> Optional[float]:
+    """Return the canonical send timestamp persisted across restarts."""
+    with state_lock:
+        raw_sent_at = (state.get("match_sent_at") or {}).get(fixture_key)
+        if raw_sent_at is not None:
+            try:
+                sent_at = float(raw_sent_at)
+                if math.isfinite(sent_at) and sent_at > 0.0:
+                    return sent_at
+            except (TypeError, ValueError):
+                pass
+        signal_info = (state.get("match_signal_info") or {}).get(fixture_key) or {}
+        raw_signal_ts = signal_info.get("signal_timestamp")
+        if raw_signal_ts is not None:
+            try:
+                sent_at = float(raw_signal_ts)
+                if math.isfinite(sent_at) and sent_at > 0.0:
+                    return sent_at
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _record_ordinary_signal_delivery_state(
+    *,
+    match_id: int,
+    message_id: int,
+    text: str,
+    signal_minute: int,
+    score_home: int,
+    score_away: int,
+    sent_at_ts: Optional[float] = None,
+) -> float:
+    """Atomically persist sent_matches, message id, and send timestamp for restart-safe tracking."""
+    sent_ts = float(sent_at_ts if sent_at_ts is not None else time.time())
+    fixture_key = str(int(match_id))
+    signal_date = get_msk_date()
+    msk_time = get_msk_datetime().strftime("%H:%M:%S")
+    add_tracked_match(
+        fixture_id=int(match_id),
+        message_id=int(message_id),
+        chat_id=int(TELEGRAM_CHAT_ID),
+        score_home=int(score_home),
+        score_away=int(score_away),
+        status="LIVE",
+        sent_at_ts=sent_ts,
+        signal_minute=int(signal_minute or 0),
+    )
+    with state_lock:
+        state.setdefault("sent_matches", {})[fixture_key] = int(message_id)
+        state.setdefault("last_message_texts", {})[fixture_key] = text
+        state.setdefault("match_sent_at", {})[fixture_key] = sent_ts
+        snapshot_meta = state.setdefault("signal_snapshot_meta", {}).get(fixture_key)
+        if isinstance(snapshot_meta, dict):
+            snapshot_meta["message_id"] = int(message_id)
+            snapshot_meta["chat_id"] = int(TELEGRAM_CHAT_ID)
+        if int(signal_minute or 0) > 0:
+            state.setdefault("match_initial_minute", {})[fixture_key] = int(signal_minute)
+        state.setdefault("match_signal_info", {})[fixture_key] = {
+            "signal_timestamp": sent_ts,
+            "signal_date": signal_date,
+            "is_finished": False,
+        }
+        if int(match_id) not in state.setdefault("monitored_matches", []):
+            state["monitored_matches"].append(int(match_id))
+    mark_state_dirty()
+    logger.info(
+        f"[STATS] Match {match_id}: signal sent at {msk_time} MSK, assigned to date {signal_date}"
+    )
+    return sent_ts
+
+
+def _merge_post_send_signal_info(
+    fixture_id: int,
+    *,
+    signal_date: str,
+    is_finished: bool = False,
+) -> None:
+    """Extend post-send bookkeeping without overwriting canonical send timestamps."""
+    fixture_key = str(int(fixture_id))
+    sent_ts = _persisted_signal_sent_at_ts(fixture_key)
+    with state_lock:
+        if sent_ts is None:
+            sent_ts = time.time()
+            state.setdefault("match_sent_at", {})[fixture_key] = sent_ts
+        info = dict(state.get("match_signal_info", {}).get(fixture_key) or {})
+        info.setdefault("signal_timestamp", float(sent_ts))
+        info["signal_date"] = signal_date
+        info["is_finished"] = bool(is_finished)
+        state.setdefault("match_signal_info", {})[fixture_key] = info
+
+
 def mark_tracked_match_update(fixture_id: int, score_home: int, score_away: int, edited: bool = False, status: str = "LIVE") -> None:
     fixture_key = str(int(fixture_id))
     with state_lock:
@@ -9030,6 +9122,10 @@ def bootstrap_tracking_from_state() -> None:
                 home_sc = 0
                 away_sc = 0
 
+        sent_at_ts = _persisted_signal_sent_at_ts(str(fixture_id))
+        if sent_at_ts is None:
+            sent_at_ts = time.time()
+
         add_tracked_match(
             fixture_id=fixture_id,
             message_id=msg_id,
@@ -9037,7 +9133,7 @@ def bootstrap_tracking_from_state() -> None:
             score_home=home_sc,
             score_away=away_sc,
             status=status,
-            sent_at_ts=time.time(),
+            sent_at_ts=sent_at_ts,
             signal_minute=int(state.get("match_initial_minute", {}).get(str(fixture_id), 0) or 0),
         )
 
@@ -9950,6 +10046,44 @@ def send_to_telegram(
         logger.warning("[TG] Telegram send skipped: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not configured.")
         return None
 
+    claim_key: Optional[str] = None
+    if match_id is not None:
+        fixture_key = str(int(match_id))
+        with state_lock:
+            sent_matches = state.setdefault("sent_matches", {})
+            if not isinstance(sent_matches, dict):
+                sent_matches = {}
+                state["sent_matches"] = sent_matches
+            existing = sent_matches.get(fixture_key)
+            if existing is not None:
+                existing_mid = int(existing or 0)
+                if existing_mid > 0:
+                    logger.info(
+                        "[TG] Duplicate ordinary send suppressed for match_id=%s "
+                        "existing_message_id=%s action=skip_http",
+                        match_id,
+                        existing_mid,
+                    )
+                    return existing_mid
+                logger.info(
+                    "[TG] Duplicate ordinary send suppressed for match_id=%s "
+                    "reason=send_in_progress action=skip_http",
+                    match_id,
+                )
+                return None
+            sent_matches[fixture_key] = 0
+            claim_key = fixture_key
+            mark_state_dirty()
+
+    def _release_send_claim() -> None:
+        if not claim_key:
+            return
+        with state_lock:
+            sent_matches = state.get("sent_matches", {})
+            if isinstance(sent_matches, dict) and sent_matches.get(claim_key) == 0:
+                sent_matches.pop(claim_key, None)
+                mark_state_dirty()
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     if isinstance(reply_markup, dict):
@@ -9993,49 +10127,27 @@ def send_to_telegram(
                     except Exception:
                         score_home, score_away = 0, 0
 
-                add_tracked_match(
-                    fixture_id=int(match_id),
+                _record_ordinary_signal_delivery_state(
+                    match_id=int(match_id),
                     message_id=int(mid),
-                    chat_id=int(TELEGRAM_CHAT_ID),
+                    text=text,
+                    signal_minute=int(signal_minute or 0),
                     score_home=score_home,
                     score_away=score_away,
-                    status="LIVE",
-                    sent_at_ts=time.time(),
-                    signal_minute=int(signal_minute or 0),
                 )
-
-                with state_lock:
-                    state.setdefault("sent_matches", {})[str(match_id)] = int(mid)
-                    state.setdefault("last_message_texts", {})[str(match_id)] = text
-                    snapshot_meta = state.setdefault("signal_snapshot_meta", {}).get(str(match_id))
-                    if isinstance(snapshot_meta, dict):
-                        snapshot_meta["message_id"] = int(mid)
-                        snapshot_meta["chat_id"] = int(TELEGRAM_CHAT_ID)
-                    # Save signal timestamp (UTC timezone-aware) and date
-                    # Date is determined ONLY by signal send time, regardless of match start time
-                    signal_timestamp = datetime.now(timezone.utc).timestamp()
-                    signal_date = get_msk_date()
-                    msk_time = get_msk_datetime().strftime("%H:%M:%S")
-                    signal_minute_value = int(signal_minute or 0)
-                    if signal_minute_value > 0:
-                        state.setdefault("match_initial_minute", {})[str(match_id)] = signal_minute_value
-                    state.setdefault("match_signal_info", {})[str(match_id)] = {
-                        "signal_timestamp": signal_timestamp,
-                        "signal_date": signal_date,
-                        "is_finished": False
-                    }
-                    logger.info(f"[STATS] Match {match_id}: signal sent at {msk_time} MSK, assigned to date {signal_date}")
-                    if match_id not in state.setdefault("monitored_matches", []):
-                        state["monitored_matches"].append(match_id)
-                mark_state_dirty()
                 update_persistent_fixture_text_hash(match_id, text)
+                claim_key = None
+            else:
+                _release_send_claim()
             logger.info(f"[TG] Sent message id={mid} for match {match_id}")
             return int(mid) if mid else None
         else:
             logger.warning(f"[TG] send failed: {body}")
+            _release_send_claim()
             return None
     except Exception:
         logger.exception("[TG] send exception")
+        _release_send_claim()
         return None
 
 
@@ -12742,16 +12854,16 @@ def publish_signal_to_channel(fixture_id: int, review_info: Optional[Dict[str, A
                     "approved_by_admin": is_admin_approved
                 }
                 state.setdefault("match_processed_event_ids", {})[str(fixture_id)] = []
-                state.setdefault("match_sent_at", {})[str(fixture_id)] = time.time()
                 state.setdefault("match_prob_status", {})[str(fixture_id)] = prob
                 
                 # Save signal date
                 signal_date = get_msk_date()
                 msk_time = get_msk_datetime().strftime("%H:%M:%S")
-                state.setdefault("match_signal_info", {})[str(fixture_id)] = {
-                    "signal_date": signal_date,
-                    "is_finished": False
-                }
+                _merge_post_send_signal_info(
+                    fixture_id,
+                    signal_date=signal_date,
+                    is_finished=False,
+                )
                 logger.info(f"[STATS] Match {fixture_id}: signal sent at {msk_time} MSK, assigned to date {signal_date}")
                 
                 if fixture_id not in state.setdefault("monitored_matches", []):
@@ -17236,6 +17348,48 @@ def _decision_snapshot_id(
         f"{int(fixture_id)}:{int(minute)}:{normalized_window}:"
         f"{decision_state}:v{schema}"
     )
+
+
+def resolve_final_decision_after_telegram_delivery(
+    message_id: Optional[int],
+) -> Tuple[str, Optional[str]]:
+    """Persist BLOCK when Telegram did not deliver, without erasing gate eligibility."""
+    if message_id:
+        return "ALLOW", None
+    return "BLOCK", "telegram-send-failed"
+
+
+def _attach_telegram_delivery_audit(
+    snapshot: Dict[str, Any],
+    telegram_result: Optional[Mapping[str, Any]],
+) -> None:
+    telegram_payload = (
+        dict(telegram_result)
+        if isinstance(telegram_result, Mapping)
+        else {
+            "send_attempted": False,
+            "send_ok": False,
+            "message_id": None,
+            "send_error_code": None,
+            "send_error_description": None,
+        }
+    )
+    send_ok = bool(telegram_payload.get("send_ok"))
+    telegram_payload["publication_delivered"] = send_ok
+    snapshot["telegram"] = telegram_payload
+    decision = snapshot.setdefault("decision", {})
+    if not isinstance(decision, dict):
+        return
+    eligibility = bool(decision.get("active_publication_allow"))
+    decision["publication_eligibility_allow"] = eligibility
+    publication_policy = snapshot.get("publication_policy")
+    if isinstance(publication_policy, dict):
+        publication_policy["publication_eligibility_allow"] = eligibility
+        publication_policy["publication_delivered"] = send_ok
+    gates = snapshot.get("gates")
+    if isinstance(gates, dict):
+        gates["publication_eligibility_allow"] = eligibility
+        gates["publication_delivered"] = send_ok
 
 
 def build_decision_snapshot(
@@ -30611,6 +30765,8 @@ def main_loop():
                                 continue
                             if fixture_id in state.get("excluded_matches", []):
                                 continue
+                            if str(fixture_id) in state.get("sent_matches", {}):
+                                continue
 
                         minute_i = _fixture_minute_from_raw(fixture)
                         if minute_i < MATCH_MIN_MINUTE:
@@ -31069,13 +31225,7 @@ def main_loop():
                                 created_at_utc=frozen_observation_time,
                                 decision_created_at_utc=frozen_decision_time,
                             )
-                            snapshot["telegram"] = dict(telegram_result) if isinstance(telegram_result, dict) else {
-                                "send_attempted": False,
-                                "send_ok": False,
-                                "message_id": None,
-                                "send_error_code": None,
-                                "send_error_description": None,
-                            }
+                            _attach_telegram_delivery_audit(snapshot, telegram_result)
                             attach_shadow_reputation(snapshot)
                             if not _persist:
                                 return snapshot
@@ -31546,9 +31696,15 @@ def main_loop():
                                     telegram_snapshot,
                                     durable=False,
                                 )
+                        delivery_message_id = int(mid_msg) if mid_msg else None
+                        final_decision, final_block_reason = (
+                            resolve_final_decision_after_telegram_delivery(
+                                delivery_message_id
+                            )
+                        )
                         final_decision_snapshot = record_current_decision(
-                            "ALLOW",
-                            None,
+                            final_decision,
+                            final_block_reason,
                             current_rule_path=rule_path,
                             telegram_result=telegram_snapshot,
                             observation_created_at_utc=(
@@ -31693,19 +31849,15 @@ def main_loop():
                                     "shootout_events_excluded": 0,
                                  }
                                 state.setdefault("match_processed_event_ids", {})[str(fixture_id)] = []
-                                state.setdefault("match_sent_at", {})[str(fixture_id)] = time.time()
                                 state.setdefault("match_prob_status", {})[str(fixture_id)] = prob_actual
-                                # Save signal date (Moscow time) and set is_finished flag
-                                # Date is determined ONLY by signal send time, regardless of match start time
                                 signal_date = get_msk_date()
                                 msk_time = get_msk_datetime().strftime("%H:%M:%S")
-                                state.setdefault("match_signal_info", {})[str(fixture_id)] = {
-                                    "signal_date": signal_date,
-                                    "is_finished": False
-                                }
+                                _merge_post_send_signal_info(
+                                    fixture_id,
+                                    signal_date=signal_date,
+                                    is_finished=False,
+                                )
                                 logger.info(f"[STATS] Match {fixture_id}: signal sent at {msk_time} MSK, assigned to date {signal_date}")
-                                if fixture_id not in state.setdefault("monitored_matches", []):
-                                    state["monitored_matches"].append(fixture_id)
                             mark_state_dirty()
                             update_persistent_fixture_tracking(fixture_id, fixture_metrics, sent_text=msg)
                     except Exception:

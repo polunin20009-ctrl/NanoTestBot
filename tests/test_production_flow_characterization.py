@@ -869,8 +869,269 @@ def test_send_to_telegram_records_sent_matches_on_success(monkeypatch) -> None:
             return {"ok": True, "result": {"message_id": 5555}}
 
     monkeypatch.setattr(bot.requests, "post", lambda *args, **kwargs: posted.append(kwargs) or _Response())
-    monkeypatch.setattr(bot, "add_tracked_match", lambda **kwargs: None)
+    tracked_calls: list[dict] = []
+    monkeypatch.setattr(
+        bot,
+        "add_tracked_match",
+        lambda **kwargs: tracked_calls.append(dict(kwargs)),
+    )
     mid = bot.send_to_telegram("signal text", match_id=8080, score_at_signal=(1, 0), signal_minute=50)
     assert mid == 5555
     with bot.state_lock:
         assert bot.state["sent_matches"]["8080"] == 5555
+        assert bot.state["match_sent_at"]["8080"] == bot.state["match_signal_info"]["8080"][
+            "signal_timestamp"
+        ]
+    assert tracked_calls[0]["sent_at_ts"] == bot.state["match_sent_at"]["8080"]
+
+
+def test_send_to_telegram_suppresses_second_post_after_partial_restart_state(
+    monkeypatch,
+) -> None:
+    """sent_matches restored without monitored_matches must not issue a second HTTP send."""
+    fixture_id = 909090
+    monkeypatch.setattr(bot, "TELEGRAM_TOKEN", "test-token")
+    monkeypatch.setattr(bot, "TELEGRAM_CHAT_ID", -1001)
+    monkeypatch.setattr(bot, "add_tracked_match", lambda **kwargs: None)
+    posts: list[dict] = []
+
+    class _Response:
+        ok = True
+
+        @staticmethod
+        def json():
+            return {"ok": True, "result": {"message_id": 42}}
+
+    monkeypatch.setattr(
+        bot.requests,
+        "post",
+        lambda *args, **kwargs: posts.append(kwargs) or _Response(),
+    )
+    with bot.state_lock:
+        bot.state["sent_matches"] = {str(fixture_id): 7777}
+        bot.state["monitored_matches"] = []
+
+    first = bot.send_to_telegram(
+        "first",
+        match_id=fixture_id,
+        score_at_signal=(1, 0),
+        signal_minute=50,
+    )
+    second = bot.send_to_telegram(
+        "second",
+        match_id=fixture_id,
+        score_at_signal=(1, 0),
+        signal_minute=51,
+    )
+    assert first == 7777
+    assert second == 7777
+    assert posts == []
+
+
+def test_send_to_telegram_claim_prevents_duplicate_post_on_success_path(monkeypatch) -> None:
+    monkeypatch.setattr(bot, "TELEGRAM_TOKEN", "test-token")
+    monkeypatch.setattr(bot, "TELEGRAM_CHAT_ID", -1001)
+    monkeypatch.setattr(bot, "add_tracked_match", lambda **kwargs: None)
+    posts: list[int] = []
+
+    class _Response:
+        ok = True
+
+        @staticmethod
+        def json():
+            return {"ok": True, "result": {"message_id": 9001}}
+
+    monkeypatch.setattr(
+        bot.requests,
+        "post",
+        lambda *args, **kwargs: posts.append(1) or _Response(),
+    )
+    with bot.state_lock:
+        bot.state["sent_matches"] = {}
+        bot.state["monitored_matches"] = []
+
+    first = bot.send_to_telegram("once", match_id=7070, score_at_signal=(0, 0), signal_minute=48)
+    second = bot.send_to_telegram("twice", match_id=7070, score_at_signal=(0, 0), signal_minute=49)
+    assert first == 9001
+    assert second == 9001
+    assert posts == [1]
+
+
+def test_resolve_final_decision_after_telegram_delivery() -> None:
+    assert bot.resolve_final_decision_after_telegram_delivery(555) == ("ALLOW", None)
+    assert bot.resolve_final_decision_after_telegram_delivery(None) == (
+        "BLOCK",
+        "telegram-send-failed",
+    )
+
+
+def test_telegram_delivery_failure_preserves_eligibility_separate_from_publication(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    channel_filter = bot.evaluate_channel_signal_filter(
+        80.0,
+        1,
+        1,
+        reputation_base_prob_to90=78.0,
+        reputation_adjusted_prob_to90=80.0,
+        adjusted_intensity=0.55,
+        season_context_factor=1.02,
+    )
+    final_decision, block_reason = bot.resolve_final_decision_after_telegram_delivery(
+        None
+    )
+    snapshot = bot.build_decision_snapshot(
+        fixture_id=6060,
+        minute=50,
+        window_name="WINDOW_1",
+        match_identity={},
+        score_home=1,
+        score_away=1,
+        probability_result={
+            "prob_next_15": 40.0,
+            "prob_to90": 80.0,
+            "channel_signal_filter": channel_filter,
+        },
+        threshold_result={"threshold": 82.0, "fallback_threshold": 75.0},
+        threshold_next15=32.0,
+        readiness_result={"passed": True},
+        live_gate_result={"required": False},
+        anti_garbage_passed=True,
+        final_decision=final_decision,
+        block_reason=block_reason,
+        factor_context={},
+    )
+    bot._attach_telegram_delivery_audit(
+        snapshot,
+        {
+            "send_attempted": True,
+            "send_ok": False,
+            "message_id": None,
+            "send_error_code": "telegram_send_failed",
+            "send_error_description": "send_to_telegram returned no message_id",
+        },
+    )
+    assert snapshot["decision"]["final_decision"] == "BLOCK"
+    assert snapshot["decision"]["block_reason"] == "telegram-send-failed"
+    assert snapshot["decision"]["active_publication_allow"] is True
+    assert snapshot["decision"]["publication_eligibility_allow"] is True
+    assert snapshot["telegram"]["publication_delivered"] is False
+    assert snapshot["publication_policy"]["publication_delivered"] is False
+    assert snapshot["publication_policy"]["publication_eligibility_allow"] is True
+
+    monkeypatch.setattr(bot, "DECISION_SNAPSHOTS_FILE", str(tmp_path / "decisions.jsonl"))
+    monkeypatch.setattr(bot, "ENABLE_DECISION_SNAPSHOTS", True)
+    bot._decision_snapshot_keys = None
+    assert bot.append_decision_snapshot(snapshot) is True
+    persisted = bot.load_joined_decision_snapshots()[0]
+    assert persisted["decision"]["final_decision"] == "BLOCK"
+    assert persisted["decision"]["publication_eligibility_allow"] is True
+    assert persisted["telegram"]["publication_delivered"] is False
+
+
+def test_telegram_delivery_success_records_allow_and_delivered() -> None:
+    channel_filter = bot.evaluate_channel_signal_filter(
+        80.0,
+        1,
+        1,
+        reputation_base_prob_to90=78.0,
+        reputation_adjusted_prob_to90=80.0,
+        adjusted_intensity=0.55,
+        season_context_factor=1.02,
+    )
+    final_decision, block_reason = bot.resolve_final_decision_after_telegram_delivery(
+        9001
+    )
+    snapshot = bot.build_decision_snapshot(
+        fixture_id=6061,
+        minute=51,
+        window_name="WINDOW_1",
+        match_identity={},
+        score_home=0,
+        score_away=1,
+        probability_result={
+            "prob_next_15": 40.0,
+            "prob_to90": 80.0,
+            "channel_signal_filter": channel_filter,
+        },
+        threshold_result={"threshold": 82.0, "fallback_threshold": 75.0},
+        threshold_next15=32.0,
+        readiness_result={"passed": True},
+        live_gate_result={"required": False},
+        anti_garbage_passed=True,
+        final_decision=final_decision,
+        block_reason=block_reason,
+        factor_context={},
+    )
+    bot._attach_telegram_delivery_audit(
+        snapshot,
+        {
+            "send_attempted": True,
+            "send_ok": True,
+            "message_id": 9001,
+            "send_error_code": None,
+            "send_error_description": None,
+        },
+    )
+    assert snapshot["decision"]["final_decision"] == "ALLOW"
+    assert snapshot["decision"]["publication_eligibility_allow"] is True
+    assert snapshot["telegram"]["publication_delivered"] is True
+
+
+def test_bootstrap_tracking_restores_persisted_sent_at_after_restart(monkeypatch) -> None:
+    fixture_id = 505050
+    persisted_ts = 1_700_000_000.0
+    captured: list[dict] = []
+    monkeypatch.setattr(bot, "TELEGRAM_CHAT_ID", -1001)
+    monkeypatch.setattr(
+        bot,
+        "add_tracked_match",
+        lambda **kwargs: captured.append(dict(kwargs)),
+    )
+    with bot.state_lock:
+        bot.state["sent_matches"] = {str(fixture_id): 9999}
+        bot.state["match_sent_at"] = {str(fixture_id): persisted_ts}
+        bot.state["match_signal_info"] = {
+            str(fixture_id): {
+                "signal_timestamp": persisted_ts,
+                "signal_date": "2026-01-01",
+                "is_finished": False,
+            }
+        }
+        bot.state["match_initial_score"] = {str(fixture_id): (1, 0)}
+        bot.state["match_initial_minute"] = {str(fixture_id): 50}
+        bot.state["tracked_matches"] = {}
+
+    bot.bootstrap_tracking_from_state()
+
+    assert len(captured) == 1
+    assert captured[0]["fixture_id"] == fixture_id
+    assert captured[0]["message_id"] == 9999
+    assert captured[0]["sent_at_ts"] == persisted_ts
+
+
+def test_merge_post_send_signal_info_preserves_existing_sent_timestamp() -> None:
+    fixture_id = 606062
+    persisted_ts = 1_650_000_000.0
+    with bot.state_lock:
+        bot.state["match_sent_at"] = {str(fixture_id): persisted_ts}
+        bot.state["match_signal_info"] = {
+            str(fixture_id): {
+                "signal_timestamp": persisted_ts,
+                "signal_date": "2026-01-01",
+                "is_finished": False,
+            }
+        }
+    bot._merge_post_send_signal_info(
+        fixture_id,
+        signal_date="2026-02-02",
+        is_finished=False,
+    )
+    with bot.state_lock:
+        assert bot.state["match_sent_at"][str(fixture_id)] == persisted_ts
+        assert (
+            bot.state["match_signal_info"][str(fixture_id)]["signal_timestamp"]
+            == persisted_ts
+        )
+        assert bot.state["match_signal_info"][str(fixture_id)]["signal_date"] == "2026-02-02"
