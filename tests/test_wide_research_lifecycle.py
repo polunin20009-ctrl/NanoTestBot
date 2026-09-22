@@ -95,32 +95,85 @@ def test_degradation_uses_hysteresis_and_tenure():
     assert severe.target_state == "DEGRADED"
 
 
-def test_active_manifest_checksum_atomic_and_last_known_good(tmp_path):
-    path = tmp_path / "active.json"
-    first = build_active_manifest(
-        generation=1,
-        rule={"rule_id": "rule:one", "conditions": []},
+def _production_manifest(*, generation: int = 1, rule=None) -> dict:
+    return build_active_manifest(
+        generation=generation,
+        rule=rule if rule is not None else {"rule_id": "rule:one", "conditions": []},
         effective_from_utc="2026-08-27T00:00:00+00:00",
         previous_rule_id=None,
-        production_enabled=False,
+        production_enabled=True,
     )
+
+
+def test_active_manifest_checksum_atomic_write(tmp_path):
+    path = tmp_path / "active.json"
+    first = _production_manifest()
     assert validate_active_manifest(first)
     write_active_manifest_atomic(path, first)
     cache = ActiveManifestCache(path)
+    loaded = cache.load()
+    assert loaded["generation"] == 1
+    assert loaded["checksum"] == first["checksum"]
+    assert loaded["production_enabled"] is True
+
+    newer = _production_manifest(generation=2)
+    write_active_manifest_atomic(path, newer)
+    assert cache.load(force=True)["generation"] == 2
+
+
+def test_deleted_active_manifest_does_not_keep_cached_champion(tmp_path):
+    path = tmp_path / "active.json"
+    write_active_manifest_atomic(path, _production_manifest())
+    cache = ActiveManifestCache(path)
+    assert cache.load()["production_enabled"] is True
+
+    path.unlink()
+    assert cache.load() is None
+    assert cache.load(force=True) is None
+
+
+def test_corrupt_active_manifest_does_not_keep_cached_champion(tmp_path):
+    path = tmp_path / "active.json"
+    write_active_manifest_atomic(path, _production_manifest())
+    cache = ActiveManifestCache(path)
     assert cache.load()["generation"] == 1
 
-    path.write_text('{"schema_version":1,"generation":2}', encoding="utf-8")
-    assert cache.load(force=True)["generation"] == 1
+    path.write_text("{not-json", encoding="utf-8")
+    assert cache.load(force=True) is None
+    assert cache.load() is None
 
+    path.write_text(
+        '{"schema_version":1,"generation":2,"fallback":"current_filter"}',
+        encoding="utf-8",
+    )
+    assert cache.load(force=True) is None
+
+
+def test_checksum_mismatch_does_not_keep_cached_champion(tmp_path):
+    path = tmp_path / "active.json"
+    first = _production_manifest()
+    write_active_manifest_atomic(path, first)
+    cache = ActiveManifestCache(path)
+    assert cache.load()["checksum"] == first["checksum"]
+
+    tampered = dict(first)
+    tampered["checksum"] = "0" * 64
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    assert cache.load(force=True) is None
+
+    write_active_manifest_atomic(path, first)
+    assert cache.load(force=True)["generation"] == 1
     same_generation_mutation = build_active_manifest(
         generation=1,
         rule=None,
         effective_from_utc="2026-08-27T01:00:00+00:00",
         previous_rule_id="rule:one",
-        production_enabled=False,
+        production_enabled=True,
     )
+    assert validate_active_manifest(same_generation_mutation)
+    assert same_generation_mutation["checksum"] != first["checksum"]
     path.write_text(json.dumps(same_generation_mutation), encoding="utf-8")
-    assert cache.load(force=True)["generation"] == 1
+    assert cache.load(force=True) is None
 
 
 def test_manifest_generation_is_strict_and_validation_fails_closed():

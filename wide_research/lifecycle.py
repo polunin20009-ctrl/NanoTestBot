@@ -432,39 +432,47 @@ def write_active_manifest_atomic(path: os.PathLike[str] | str, payload: Mapping[
 
 
 class ActiveManifestCache:
-    """Fail closed while retaining a previously validated manifest in memory."""
+    """Load only the checksummed on-disk pointer; fail closed when it is gone or invalid."""
 
     def __init__(self, path: os.PathLike[str] | str) -> None:
         self.path = Path(path).expanduser().resolve()
         self._signature: Optional[tuple[int, int]] = None
         self._last_good: Optional[dict[str, Any]] = None
 
+    def _forget_cached_manifest(self) -> None:
+        self._signature = None
+        self._last_good = None
+
     def load(self, *, force: bool = False) -> Optional[dict[str, Any]]:
         try:
             stat = self.path.stat()
             signature = (int(stat.st_mtime_ns), int(stat.st_size))
         except OSError:
-            return self._last_good
+            self._forget_cached_manifest()
+            return None
         if not force and signature == self._signature:
-            return self._last_good
+            return dict(self._last_good) if self._last_good is not None else None
         try:
             with self.path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, ValueError, TypeError):
-            return self._last_good
+            self._forget_cached_manifest()
+            return None
         if not validate_active_manifest(payload):
-            return self._last_good
+            self._forget_cached_manifest()
+            return None
         current_raw = (self._last_good or {}).get("generation")
         current_generation = -1 if current_raw is None else int(current_raw)
         incoming_generation = int(payload.get("generation"))
         if incoming_generation < current_generation:
-            return self._last_good
+            return dict(self._last_good) if self._last_good is not None else None
         if (
             incoming_generation == current_generation
             and self._last_good is not None
             and payload.get("checksum") != self._last_good.get("checksum")
         ):
-            return self._last_good
+            self._forget_cached_manifest()
+            return None
         self._signature = signature
         self._last_good = dict(payload)
         return dict(self._last_good)

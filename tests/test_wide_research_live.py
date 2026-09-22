@@ -139,6 +139,13 @@ def test_router_applies_valid_champion_and_missing_rejects(tmp_path) -> None:
     assert decision["applied"] is True
     assert decision["allow"] is False
 
+    path.unlink()
+    fallback = router.route(_snapshot(), current_filter_allow=True)
+    assert fallback["applied"] is False
+    assert fallback["allow"] is True
+    assert fallback["source"] == "current_filter"
+    assert fallback["reason"] == "no_active_production_rule"
+
 
 def test_router_falls_back_for_incompatible_feature_schema(tmp_path) -> None:
     manifest = RuleManifest(
