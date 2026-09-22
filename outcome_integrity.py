@@ -22,6 +22,26 @@ class OutcomeIntegrityResult:
         return asdict(self)
 
 
+def is_previously_confirmed_win(payload: Optional[Mapping[str, Any]]) -> bool:
+    """Read the existing confirmed-WIN flag from a stored outcome or record."""
+    if not isinstance(payload, Mapping):
+        return False
+    nested = payload.get("outcome")
+    outcome = nested if isinstance(nested, Mapping) else payload
+    if not isinstance(outcome, Mapping):
+        return False
+    status = str(outcome.get("status") or "").strip().lower()
+    if status in {"void", "quarantine", "pending"}:
+        return False
+    if str(
+        outcome.get("normal_time_result") or payload.get("normal_time_result") or ""
+    ).upper() == "WIN":
+        return True
+    if outcome.get("goal_to90_normal_time") is True:
+        return True
+    return payload.get("goal_to90_normal_time") is True
+
+
 def resolve_normal_time_outcome(
     signal_score: Score,
     normal_time_final_score: Optional[Score],

@@ -390,6 +390,40 @@ def test_resolver_uses_score_delta_when_events_are_missing(monkeypatch, tmp_path
     assert outcome["first_goal_minute_after_snapshot"] is None
 
 
+def test_correction_does_not_downgrade_confirmed_win(monkeypatch, tmp_path: Path) -> None:
+    path = _configure_store(monkeypatch, tmp_path)
+    decision = _decision("101:46:WINDOW_1:v2", score=(0, 0))
+    assert nanotest.append_decision_snapshot(decision) is True
+
+    first = nanotest.resolve_decision_snapshot_outcomes(
+        101,
+        [],
+        {"status_short": "FT"},
+        (1, 0),
+        "2026-07-21T03:00:00+00:00",
+    )
+    assert first == 1
+    joined = nanotest.load_joined_decision_snapshots(str(path))
+    assert joined[0]["outcome"]["normal_time_result"] == "WIN"
+    assert joined[0]["outcome"]["goal_to90_normal_time"] is True
+
+    correction = nanotest.resolve_decision_snapshot_outcomes(
+        101,
+        [],
+        {"status_short": "FT"},
+        (0, 0),
+        "2026-07-21T04:00:00+00:00",
+        include_terminal_records=True,
+    )
+    joined = nanotest.load_joined_decision_snapshots(str(path))
+    outcome = joined[0]["outcome"]
+
+    assert correction == 1
+    assert outcome["normal_time_result"] == "WIN"
+    assert outcome["goal_to90_normal_time"] is True
+    assert outcome["goal_result_source"] == "previously_confirmed_win"
+
+
 def test_reconciler_resolves_blocked_fixture(monkeypatch, tmp_path: Path) -> None:
     _configure_store(monkeypatch, tmp_path)
     assert nanotest.append_decision_snapshot(_decision("101:46:WINDOW_1:v2")) is True

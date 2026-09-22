@@ -18,7 +18,11 @@ def test_removed_training_label_notifies_both_ml_trainers(
         "match": {"score_home": 0, "score_away": 0},
         "outcome_schema_version": bot.OBSERVATION_OUTCOME_SCHEMA_VERSION,
         "outcome_revision": 1,
-        "outcome": {"status": "resolved", "goal_to90_normal_time": True},
+        "outcome": {
+            "status": "resolved",
+            "goal_to90_normal_time": False,
+            "normal_time_result": "LOSS",
+        },
         "rolling_dynamics": {
             "schema_version": bot.ROLLING_DYNAMICS_SCHEMA_VERSION,
             "mode": "shadow_collection",

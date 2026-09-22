@@ -143,7 +143,7 @@ from match_period import (
     is_shootout_active,
     normalize_score_blocks,
 )
-from outcome_integrity import resolve_normal_time_outcome
+from outcome_integrity import is_previously_confirmed_win, resolve_normal_time_outcome
 from outcome_revision import (
     next_outcome_revision,
     outcome_rank as outcome_record_rank,
@@ -3721,6 +3721,7 @@ def process_match_outcomes_for_jsonl(match_id: int, client):
             signal_score=signal_score,
             normal_time_score=normal_time_score_tuple,
             normal_time_event_count=len(normal_goals),
+            previously_confirmed_win=is_previously_confirmed_win(record),
         )
         has_normal_time_goal = integrity.goal_to90_normal_time is True
         goals_after_signal_count = int(
@@ -3839,6 +3840,7 @@ def process_normal_time_outcomes_for_jsonl(
             signal_score=signal_score,
             normal_time_score=normal_time_score,
             normal_time_event_count=len(normal),
+            previously_confirmed_win=is_previously_confirmed_win(record),
         )
         has_normal_time_goal = integrity.goal_to90_normal_time is True
         normal_goal_count = int(
@@ -20133,6 +20135,7 @@ def resolve_observation_history_outcomes(
             signal_score=snapshot_score,
             normal_time_score=normal_time_score,
             normal_time_event_count=len(normal),
+            previously_confirmed_win=is_previously_confirmed_win(observation),
         )
         has_normal_time_goal = integrity.goal_to90_normal_time is True
         score_delta = int(integrity.score_delta or 0)
@@ -27923,6 +27926,7 @@ def resolve_decision_snapshot_outcomes(
             signal_score=snapshot_score,
             normal_time_score=normal_time_score,
             normal_time_event_count=len(normal),
+            previously_confirmed_win=is_previously_confirmed_win(decision),
         )
         has_normal_time_goal = integrity.goal_to90_normal_time is True
         score_delta = int(integrity.score_delta or 0)

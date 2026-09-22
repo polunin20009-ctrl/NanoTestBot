@@ -172,34 +172,36 @@ def test_resolver_is_idempotent_and_appends_a_real_label_correction(
 
     assert bot.resolve_observation_history_outcomes(
         88,
-        [goal],
+        [],
         {"status_short": "FT"},
-        (1, 0),
+        (0, 0),
         "2026-09-12T01:00:00+00:00",
         observations=[observation],
     ) == 1
     latest = bot.load_joined_observation_history(str(history))[0]
     assert latest["outcome_revision"] == 1
+    assert latest["outcome"]["goal_to90_normal_time"] is False
     assert bot.resolve_observation_history_outcomes(
         88,
-        [goal],
+        [],
         {"status_short": "FT"},
-        (1, 0),
+        (0, 0),
         "2026-09-12T02:00:00+00:00",
         observations=[latest],
     ) == 0
 
     assert bot.resolve_observation_history_outcomes(
         88,
-        [],
+        [goal],
         {"status_short": "FT"},
-        (0, 0),
+        (1, 0),
         "2026-09-12T03:00:00+00:00",
         observations=[latest],
     ) == 1
     corrected = bot.load_joined_observation_history(str(history))[0]
     assert corrected["outcome_revision"] == 2
-    assert corrected["outcome"]["goal_to90_normal_time"] is False
+    assert corrected["outcome"]["goal_to90_normal_time"] is True
+    assert corrected["outcome"]["normal_time_result"] == "WIN"
 
 
 def test_reconciler_rechecks_recent_terminal_observations(
@@ -276,8 +278,9 @@ def test_reconciler_rechecks_recent_terminal_observations(
 
     assert summary["checked"] == 1
     latest = bot.load_joined_observation_history(str(history))[0]
-    assert latest["outcome_revision"] == 2
-    assert latest["outcome"]["goal_to90_normal_time"] is False
+    assert latest["outcome"]["goal_to90_normal_time"] is True
+    assert latest["outcome"]["normal_time_result"] == "WIN"
+    assert latest["outcome"]["goal_result_source"] == "previously_confirmed_win"
 
 
 def test_correction_recheck_defers_when_event_evidence_is_unavailable(

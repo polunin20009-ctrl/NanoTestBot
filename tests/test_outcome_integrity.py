@@ -41,6 +41,18 @@ def test_event_score_conflict_uses_trustworthy_score_and_records_conflict() -> N
     assert result.conflict_details
 
 
+def test_previously_confirmed_win_is_not_downgraded_by_flat_score() -> None:
+    result = resolve_normal_time_outcome(
+        (0, 0),
+        (0, 0),
+        normal_time_event_count=0,
+        previously_confirmed_win=True,
+    )
+    assert result.normal_time_result == "WIN"
+    assert result.goal_to90_normal_time is True
+    assert result.goal_result_source == "previously_confirmed_win"
+
+
 def test_unreliable_score_is_quarantined() -> None:
     result = resolve_normal_time_outcome((2, 0), (1, 0))
     assert result.status == "quarantine"
