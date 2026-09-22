@@ -14,12 +14,10 @@ PRODUCTION_FLOW_KNOWN_GAPS (document only — do not fix here):
 - API_FOOTBALL_KEY is hardcoded in NanoTest.py (security), not validated here.
 - Google Sheets paths remain in code but GSHEETS_AVAILABLE=false.
 - reconcile 2H retry/backoff: ``store_second_half_history_payload`` returning
-  ``False`` does not schedule a retry (only ``IncompleteSecondHalfDataError``
-  does). After an observation outcome is terminal, the fixture leaves the
-  ``collectable_2h`` cohort, so a later reconcile may not revisit 2H storage.
-- ``_prune_second_half_incomplete_retries`` drops in-memory 2H backoff when the
-  fixture is no longer in ``missing_second_half_ids`` (often because
-  ``collectable_2h`` is empty while history is still missing).
+  ``False`` schedules the same durable retry as IncompleteSecondHalfDataError.
+  Fixtures stay collectable until 2H history is stored, including after the
+  observation outcome is terminal. Retry/backoff survives process restart via
+  STATE_FILE.
 """
 
 from __future__ import annotations

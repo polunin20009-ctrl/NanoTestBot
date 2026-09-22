@@ -40,11 +40,14 @@ def _configure_store(monkeypatch, tmp_path: Path, *, rotate_bytes: int = 0) -> P
     monkeypatch.setattr(nanotest, "DECISION_SNAPSHOT_ROTATE_MAX_BYTES", rotate_bytes)
     monkeypatch.setattr(nanotest, "DECISION_SNAPSHOT_DEDUPE_MAX_KEYS", 0)
     monkeypatch.setattr(nanotest, "DECISION_OUTCOME_RECHECK_SECONDS", 30)
+    monkeypatch.setattr(nanotest, "STATE_FILE", str(tmp_path / "bot_state.json"))
     nanotest._decision_snapshot_keys_by_file.clear()
     nanotest._decision_snapshot_order_by_file.clear()
     nanotest._decision_snapshot_indexes_by_file.clear()
     nanotest._decision_outcome_last_checked.clear()
     nanotest._second_half_incomplete_retry.clear()
+    nanotest.state["second_half_incomplete_retry"] = {}
+    nanotest.state["decision_outcome_last_checked"] = {}
     nanotest._observation_history_keys = None
     nanotest._shadow_ml_model_cache = {}
     nanotest._shadow_ml_model_cache_path = ""
@@ -74,6 +77,13 @@ def _decision(decision_id: str, fixture_id: int = 101, score=(0, 0), minute: int
         "probabilities": {},
         "outcome": {"status": "pending"},
     }
+
+
+def _simulate_reliability_restart() -> None:
+    nanotest.save_state_to_disk()
+    nanotest._decision_outcome_last_checked.clear()
+    nanotest._second_half_incomplete_retry.clear()
+    nanotest.load_state()
 
 
 def _goal(elapsed: int, extra: int = 0) -> dict:
@@ -536,6 +546,12 @@ def test_second_half_collection_failure_is_retried_after_observation_resolves(
     monkeypatch.setattr(nanotest, "ENABLE_OBSERVATION_HISTORY", True)
     monkeypatch.setattr(nanotest, "ENABLE_2H_COLLECTION", True)
     monkeypatch.setattr(nanotest, "SECOND_HALF_HISTORY_PATH", str(history_path))
+    monkeypatch.setattr(
+        nanotest, "SECOND_HALF_INCOMPLETE_RETRY_BASE_SECONDS", 100
+    )
+    monkeypatch.setattr(
+        nanotest, "SECOND_HALF_INCOMPLETE_RETRY_MAX_SECONDS", 400
+    )
     second_half_storage.reset_second_half_history_cache(str(history_path))
     assert nanotest.append_observation_history(
         nanotest.build_prefilter_observation(
@@ -575,18 +591,16 @@ def test_second_half_collection_failure_is_retried_after_observation_resolves(
     assert first["resolved_fixtures"] == 1
     assert len(attempts) == 1
     assert nanotest.load_joined_observation_history()[0]["outcome"]["status"] == "resolved"
+    assert nanotest._second_half_incomplete_retry[203] == (1, 1_100.0)
 
-    # Simulate a process restart: production does not schedule a 2H retry when
-    # store_second_half_history_payload returns False (only IncompleteSecondHalfDataError
-    # defers). After the observation outcome is terminal the fixture also leaves the
-    # collectable_2h cohort, so a later reconcile will not call the store again.
     nanotest._decision_outcome_last_checked.clear()
     second = nanotest.reconcile_pending_decision_outcomes(
-        Client(), set(), now_ts=2_000.0
+        Client(), set(), now_ts=1_100.0
     )
-    assert second["resolved_fixtures"] == 0
-    assert second["checked"] == 0
-    assert len(attempts) == 1
+    assert second["checked"] == 1
+    assert len(attempts) == 2
+    assert nanotest._second_half_incomplete_retry[203][0] == 2
+    assert second_half_storage.load_second_half_history_records(str(history_path)) == []
 
 
 def test_incomplete_second_half_data_uses_backoff_without_blocking_outcomes(
@@ -663,22 +677,18 @@ def test_incomplete_second_half_data_uses_backoff_without_blocking_outcomes(
     )
     assert during_backoff["resolved_fixtures"] == 1
     assert nanotest.load_joined_decision_snapshots()[0]["outcome"]["status"] == "resolved"
-    # When the prefilter observation is already terminal, collectable_2h is empty and
-    # _prune_second_half_incomplete_retries drops the backoff entry even though 2H
-    # history was never stored (see tests/test_production_flow_characterization.py gaps).
-    assert 205 not in nanotest._second_half_incomplete_retry
+    assert nanotest._second_half_incomplete_retry[205] == (1, 1_100.0)
 
-    # Re-enter the 2H cohort with fresh pending evidence (production does not restore
-    # backoff from JSONL after prune). Halftime data becomes available on the next pass.
-    assert nanotest.append_observation_history(
-        nanotest.build_prefilter_observation(
-            fixture_id=205,
-            minute=47,
-            reason="candidate_recollect",
-            raw_fixture={"fixture": {"id": 205}, "goals": {"home": 0, "away": 0}},
-        )
-    ) is True
-    nanotest._decision_outcome_last_checked.pop(205, None)
+    second = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_100.0
+    )
+    assert second["resolved_fixtures"] == 1
+    assert nanotest._second_half_incomplete_retry[205] == (2, 1_300.0)
+
+    before_second_deadline = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_250.0
+    )
+    assert before_second_deadline["checked"] == 0
 
     complete_halftime = True
     recovered = nanotest.reconcile_pending_decision_outcomes(
@@ -691,7 +701,169 @@ def test_incomplete_second_half_data_uses_backoff_without_blocking_outcomes(
     assert records[0]["fixture_id"] == 205
     assert records[0]["ht_home"] == 0
     assert records[0]["ht_away"] == 0
-    assert len(fetches) == 3
+    assert len(fetches) == 4
+
+
+def test_second_half_false_store_survives_crash_restart_until_written(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _configure_store(monkeypatch, tmp_path)
+    history_path = tmp_path / "second_half_history.jsonl"
+    monkeypatch.setattr(nanotest, "ENABLE_OBSERVATION_HISTORY", True)
+    monkeypatch.setattr(nanotest, "ENABLE_2H_COLLECTION", True)
+    monkeypatch.setattr(nanotest, "AUTO_AGGREGATE_2H_STATS", False)
+    monkeypatch.setattr(nanotest, "SECOND_HALF_HISTORY_PATH", str(history_path))
+    monkeypatch.setattr(nanotest, "SECOND_HALF_INCOMPLETE_RETRY_BASE_SECONDS", 100)
+    monkeypatch.setattr(nanotest, "SECOND_HALF_INCOMPLETE_RETRY_MAX_SECONDS", 400)
+    second_half_storage.reset_second_half_history_cache(str(history_path))
+    assert nanotest.append_observation_history(
+        nanotest.build_prefilter_observation(
+            fixture_id=208,
+            minute=46,
+            reason="candidate",
+            raw_fixture={"fixture": {"id": 208}, "goals": {"home": 0, "away": 0}},
+        )
+    ) is True
+
+    fixture = {
+        "fixture": {
+            "id": 208,
+            "date": "2026-08-14T10:00:00+00:00",
+            "status": {"short": "FT"},
+        },
+        "league": {
+            "id": 218,
+            "name": "Bundesliga",
+            "type": "League",
+            "season": 2026,
+        },
+        "teams": {
+            "home": {"id": 571, "name": "Home"},
+            "away": {"id": 601, "name": "Away"},
+        },
+        "goals": {"home": 1, "away": 0},
+        "score": {
+            "halftime": {"home": 0, "away": 0},
+            "fulltime": {"home": 1, "away": 0},
+        },
+    }
+    attempts: list[int] = []
+    fail_until = {"n": 1}
+    real_store = nanotest.store_second_half_history_payload
+
+    def flaky_store(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) <= fail_until["n"]:
+            return False
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(nanotest, "store_second_half_history_payload", flaky_store)
+
+    class Client:
+        def fetch_fixture(self, fixture_id: int) -> dict:
+            return fixture
+
+        def fetch_fixture_events(self, fixture_id: int) -> list[dict]:
+            return [_goal(70)]
+
+    first = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_000.0
+    )
+    assert first["resolved_fixtures"] == 1
+    assert len(attempts) == 1
+    assert nanotest._second_half_incomplete_retry[208] == (1, 1_100.0)
+
+    _simulate_reliability_restart()
+    assert nanotest._second_half_incomplete_retry[208] == (1, 1_100.0)
+    assert nanotest._decision_outcome_last_checked.get(208) == 1_000.0
+
+    recovered = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_100.0
+    )
+    assert recovered["checked"] == 1
+    assert len(attempts) == 2
+    assert 208 not in nanotest._second_half_incomplete_retry
+    records = second_half_storage.load_second_half_history_records(str(history_path))
+    assert len(records) == 1
+    assert records[0]["fixture_id"] == 208
+
+
+def test_incomplete_second_half_backoff_survives_crash_restart(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _configure_store(monkeypatch, tmp_path)
+    history_path = tmp_path / "second_half_history.jsonl"
+    monkeypatch.setattr(nanotest, "ENABLE_OBSERVATION_HISTORY", True)
+    monkeypatch.setattr(nanotest, "ENABLE_2H_COLLECTION", True)
+    monkeypatch.setattr(nanotest, "AUTO_AGGREGATE_2H_STATS", False)
+    monkeypatch.setattr(nanotest, "SECOND_HALF_HISTORY_PATH", str(history_path))
+    monkeypatch.setattr(nanotest, "SECOND_HALF_INCOMPLETE_RETRY_BASE_SECONDS", 100)
+    monkeypatch.setattr(nanotest, "SECOND_HALF_INCOMPLETE_RETRY_MAX_SECONDS", 400)
+    second_half_storage.reset_second_half_history_cache(str(history_path))
+    assert nanotest.append_observation_history(
+        nanotest.build_prefilter_observation(
+            fixture_id=209,
+            minute=46,
+            reason="candidate",
+            raw_fixture={"fixture": {"id": 209}, "goals": {"home": 0, "away": 0}},
+        )
+    ) is True
+
+    complete_halftime = False
+
+    class Client:
+        def fetch_fixture(self, fixture_id: int) -> dict:
+            score = {"fulltime": {"home": 1, "away": 1}}
+            if complete_halftime:
+                score["halftime"] = {"home": 0, "away": 0}
+            return {
+                "fixture": {
+                    "id": fixture_id,
+                    "date": "2026-08-14T10:00:00+00:00",
+                    "status": {"short": "FT"},
+                },
+                "league": {
+                    "id": 218,
+                    "name": "Bundesliga",
+                    "type": "League",
+                    "season": 2026,
+                },
+                "teams": {
+                    "home": {"id": 571, "name": "Home"},
+                    "away": {"id": 601, "name": "Away"},
+                },
+                "goals": {"home": 1, "away": 1},
+                "score": score,
+            }
+
+        def fetch_fixture_events(self, fixture_id: int) -> list[dict]:
+            return []
+
+    first = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_000.0
+    )
+    assert first["resolved_fixtures"] == 1
+    assert nanotest._second_half_incomplete_retry[209] == (1, 1_100.0)
+    assert second_half_storage.load_second_half_history_records(str(history_path)) == []
+
+    _simulate_reliability_restart()
+    assert nanotest._second_half_incomplete_retry[209] == (1, 1_100.0)
+
+    during_backoff = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_050.0
+    )
+    assert during_backoff["checked"] == 0
+    assert nanotest._second_half_incomplete_retry[209] == (1, 1_100.0)
+
+    complete_halftime = True
+    recovered = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_100.0
+    )
+    assert recovered["checked"] == 1
+    assert 209 not in nanotest._second_half_incomplete_retry
+    records = second_half_storage.load_second_half_history_records(str(history_path))
+    assert len(records) == 1
+    assert records[0]["fixture_id"] == 209
 
 
 def test_reconciler_reuses_events_response_and_preserves_unavailable_quality(

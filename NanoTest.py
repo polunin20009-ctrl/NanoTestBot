@@ -8721,7 +8721,9 @@ state: Dict[str, Any] = {
     "admin_auto_posted": {},            # fixture_id -> bool, dedupe guard for auto "Сигнал от админа"
     "review_queue": {},                 # fixture_id -> {"review_sent": bool, "review_decision": str, "review_ts": float, "data": {...}}
     "review_tracking": {},              # fixture_id -> {"chat_id": int, "message_id": int, "signal_minute": int, "score_home_at_signal": int, "score_away_at_signal": int, "base_text": str, "created_ts": float, "done": bool}
-    "admin_reviews": {}                 # fixture_id -> {"message_id": int, "chat_id": int, "created_ts": float, "last_edit_ts": float, "signal_minute": int, "score_home_at_signal": int, "score_away_at_signal": int, "sent_payload": dict, "finished": bool}
+    "admin_reviews": {},                 # fixture_id -> {"message_id": int, "chat_id": int, "created_ts": float, "last_edit_ts": float, "signal_minute": int, "score_home_at_signal": int, "score_away_at_signal": int, "sent_payload": dict, "finished": bool}
+    "second_half_incomplete_retry": {},  # fixture_id -> [attempts, next_retry_epoch]
+    "decision_outcome_last_checked": {}, # fixture_id -> last reconcile epoch
 }
 
 def load_state():
@@ -8749,9 +8751,21 @@ def load_state():
                         state.setdefault("score_timelines", state.get("score_timelines", {}))
                         state.setdefault("training_signal_records", state.get("training_signal_records", {}))
                         state.setdefault("training_fixture_index", state.get("training_fixture_index", {}))
+                        state.setdefault(
+                            "second_half_incomplete_retry",
+                            state.get("second_half_incomplete_retry", {}),
+                        )
+                        state.setdefault(
+                            "decision_outcome_last_checked",
+                            state.get("decision_outcome_last_checked", {}),
+                        )
                         logger.info(f"[STATE] Loaded state from {STATE_FILE}")
         except Exception:
             logger.exception("Failed to load state")
+        try:
+            _restore_reliability_schedulers_from_state()
+        except NameError:
+            pass
 
 
 def record_score_timeline_observation(
@@ -9140,6 +9154,10 @@ def bootstrap_tracking_from_state() -> None:
 def save_state_to_disk():
     with state_lock:
         try:
+            try:
+                _copy_reliability_schedulers_into_state()
+            except NameError:
+                pass
             _write_json_atomic(STATE_FILE, state)
             logger.info("[STATE] Saved")
         except Exception:
@@ -18730,7 +18748,7 @@ def _populate_observation_reconcile_summaries(
             WHERE has_observation = 1
               AND fixture_id >= 0
               AND stage != 'rolling_seed'
-              AND effective_status NOT IN ('resolved', 'void', 'quarantine')
+              AND effective_status NOT IN ('void', 'quarantine')
         """
         params: Tuple[Any, ...] = ()
     else:
@@ -18808,7 +18826,7 @@ def _refresh_observation_reconcile_fixture(
     cutoff_ts = index.get("second_half_cutoff_ts")
     if cutoff_ts is None:
         collectable_clause = (
-            "effective_status NOT IN ('resolved', 'void', 'quarantine')"
+            "effective_status NOT IN ('void', 'quarantine')"
         )
         collectable_params: Tuple[Any, ...] = (fixture_id,)
     else:
@@ -19913,7 +19931,7 @@ def _stream_observation_fixture_reconcile_sets(
                 recent_terminal.add(fixture_id)
         observation_created_at = _parse_iso_utc(created_at_utc)
         in_second_half_cohort = (
-            status not in terminal_statuses
+            True
             if second_half_cutoff is None
             else (
                 observation_created_at is not None
@@ -28254,8 +28272,61 @@ _outcome_correction_last_checked: Dict[int, float] = {}
 _outcome_correction_next_sweep_ts = 0.0
 _outcome_correction_sweep_lock = threading.Lock()
 _second_half_incomplete_retry_lock = threading.Lock()
-# fixture_id -> (consecutive incomplete responses, next retry epoch)
+# fixture_id -> (consecutive incomplete/failed stores, next retry epoch)
 _second_half_incomplete_retry: Dict[int, Tuple[int, float]] = {}
+
+
+def _copy_reliability_schedulers_into_state() -> None:
+    with _second_half_incomplete_retry_lock:
+        retry_payload = {
+            str(fixture_id): [int(attempts), float(next_ts)]
+            for fixture_id, (attempts, next_ts) in _second_half_incomplete_retry.items()
+        }
+    last_payload = {
+        str(fixture_id): float(checked_at)
+        for fixture_id, checked_at in _decision_outcome_last_checked.items()
+    }
+    with state_lock:
+        state["second_half_incomplete_retry"] = retry_payload
+        state["decision_outcome_last_checked"] = last_payload
+
+
+def _restore_reliability_schedulers_from_state() -> None:
+    with state_lock:
+        retry_raw = state.get("second_half_incomplete_retry") or {}
+        last_raw = state.get("decision_outcome_last_checked") or {}
+    restored_retry: Dict[int, Tuple[int, float]] = {}
+    if isinstance(retry_raw, dict):
+        for raw_id, raw_value in retry_raw.items():
+            try:
+                fixture_id = int(raw_id)
+                if isinstance(raw_value, (list, tuple)) and len(raw_value) >= 2:
+                    restored_retry[fixture_id] = (
+                        max(1, int(raw_value[0])),
+                        float(raw_value[1]),
+                    )
+            except (TypeError, ValueError):
+                continue
+    restored_last: Dict[int, float] = {}
+    if isinstance(last_raw, dict):
+        for raw_id, raw_value in last_raw.items():
+            try:
+                restored_last[int(raw_id)] = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+    with _second_half_incomplete_retry_lock:
+        _second_half_incomplete_retry.clear()
+        _second_half_incomplete_retry.update(restored_retry)
+    _decision_outcome_last_checked.clear()
+    _decision_outcome_last_checked.update(restored_last)
+
+
+_restore_reliability_schedulers_from_state()
+
+
+def _mark_reliability_schedulers_dirty() -> None:
+    _copy_reliability_schedulers_into_state()
+    mark_state_dirty()
 
 
 def _second_half_incomplete_retry_is_due(fixture_id: int, current_ts: float) -> bool:
@@ -28281,20 +28352,24 @@ def _defer_second_half_incomplete_retry(
             attempts,
             float(current_ts) + float(delay_seconds),
         )
+    _mark_reliability_schedulers_dirty()
     return attempts, int(delay_seconds)
 
 
 def _clear_second_half_incomplete_retry(fixture_id: int) -> None:
     with _second_half_incomplete_retry_lock:
         _second_half_incomplete_retry.pop(int(fixture_id), None)
+    _mark_reliability_schedulers_dirty()
 
 
-def _prune_second_half_incomplete_retries(missing_fixture_ids: Set[int]) -> None:
-    missing = {int(value) for value in missing_fixture_ids}
+def _prune_second_half_incomplete_retries(stored_fixture_ids: Set[int]) -> None:
+    stored = {int(value) for value in stored_fixture_ids}
     with _second_half_incomplete_retry_lock:
-        stale = set(_second_half_incomplete_retry) - missing
+        stale = set(_second_half_incomplete_retry) & stored
         for fixture_id in stale:
             _second_half_incomplete_retry.pop(fixture_id, None)
+    if stale:
+        _mark_reliability_schedulers_dirty()
 
 
 def pending_decision_snapshot_fixture_ids() -> List[int]:
@@ -28419,12 +28494,21 @@ def reconcile_pending_decision_outcomes(
         else (set(), set(), set())
     )
     pending_fixture_ids.update(pending_observation_ids)
-    missing_second_half_ids = (
-        collectable_2h_ids - load_second_half_fixture_ids(SECOND_HALF_HISTORY_PATH)
+    stored_second_half_ids = (
+        load_second_half_fixture_ids(SECOND_HALF_HISTORY_PATH)
         if ENABLE_2H_COLLECTION
         else set()
     )
-    _prune_second_half_incomplete_retries(missing_second_half_ids)
+    missing_second_half_ids = (
+        collectable_2h_ids - stored_second_half_ids
+        if ENABLE_2H_COLLECTION
+        else set()
+    )
+    if ENABLE_2H_COLLECTION:
+        with _second_half_incomplete_retry_lock:
+            retry_ids = set(_second_half_incomplete_retry)
+        missing_second_half_ids.update(retry_ids - stored_second_half_ids)
+        _prune_second_half_incomplete_retries(stored_second_half_ids)
     prioritized_fixture_ids = [
         *sorted(pending_fixture_ids),
         *sorted(missing_second_half_ids - pending_fixture_ids),
@@ -28432,14 +28516,22 @@ def reconcile_pending_decision_outcomes(
     for fixture_id in prioritized_fixture_ids:
         if fixture_id in live_ids:
             continue
+        retry_due = _second_half_incomplete_retry_is_due(fixture_id, current_ts)
         if (
             fixture_id not in pending_fixture_ids
             and fixture_id in missing_second_half_ids
-            and not _second_half_incomplete_retry_is_due(fixture_id, current_ts)
+            and not retry_due
         ):
             continue
         last_checked = float(_decision_outcome_last_checked.get(fixture_id, 0.0) or 0.0)
-        if current_ts - last_checked < DECISION_OUTCOME_RECHECK_SECONDS:
+        if (
+            current_ts - last_checked < DECISION_OUTCOME_RECHECK_SECONDS
+            and not (
+                fixture_id in missing_second_half_ids
+                and retry_due
+                and fixture_id not in pending_fixture_ids
+            )
+        ):
             continue
         candidates.append(fixture_id)
         if len(candidates) >= max_fixtures:
@@ -28669,6 +28761,18 @@ def reconcile_pending_decision_outcomes(
                     second_half_stored += int(stored_second_half)
                     if stored_second_half:
                         _clear_second_half_incomplete_retry(fixture_id)
+                    else:
+                        attempts, retry_seconds = _defer_second_half_incomplete_retry(
+                            fixture_id,
+                            current_ts,
+                        )
+                        logger.warning(
+                            "[2H_DATA_DEFER] fixture_id=%s source=observation_reconcile "
+                            "reason=store_returned_false attempts=%s retry_seconds=%s",
+                            fixture_id,
+                            attempts,
+                            retry_seconds,
+                        )
                 except IncompleteSecondHalfDataError as exc:
                     attempts, retry_seconds = _defer_second_half_incomplete_retry(
                         fixture_id,
@@ -28698,6 +28802,8 @@ def reconcile_pending_decision_outcomes(
             summary["checked"], summary["resolved_fixtures"], summary["void_fixtures"], summary["records_written"], second_half_stored, len(missing_second_half_ids),
             len(correction_candidates),
         )
+    if summary["checked"]:
+        _mark_reliability_schedulers_dirty()
     return summary
 
 
