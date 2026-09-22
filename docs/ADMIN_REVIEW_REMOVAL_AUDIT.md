@@ -1,14 +1,14 @@
 # Аудит полного удаления Admin Review
 
-**Статус:** продуктовое решение — feature снимается целиком; **C1 не исправлять**.
+**Статус:** Admin Review снят с production (PR-1 `07b3ab8`, PR-2 `8186156`); PR-3 — docs.
 
 **Журнал реализации (всегда в файлах):**
 
 | PR | Документ | Статус |
 |----|----------|--------|
-| PR-1 | [ADMIN_REVIEW_REMOVAL_PR1.md](./ADMIN_REVIEW_REMOVAL_PR1.md) | реализовано, не закоммичено |
-| PR-2 | *(план ниже)* | не начато |
-| PR-3 | docs contract/findings | не начато |
+| PR-1 | [ADMIN_REVIEW_REMOVAL_PR1.md](./ADMIN_REVIEW_REMOVAL_PR1.md) | `07b3ab8` |
+| PR-2 | [ADMIN_REVIEW_REMOVAL_PR2.md](./ADMIN_REVIEW_REMOVAL_PR2.md) | `8186156` |
+| PR-3 | [ADMIN_REVIEW_REMOVAL_PR3.md](./ADMIN_REVIEW_REMOVAL_PR3.md) | см. `git log` (docs PR-3) |
 
 ---
 

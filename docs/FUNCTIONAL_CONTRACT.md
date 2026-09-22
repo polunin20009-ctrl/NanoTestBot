@@ -93,23 +93,19 @@ CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps colle
     - final badge when the match is fully finished (FT/AET/PEN/…);
     - pin rotation for the daily stats message; never unpin the permanent instruction message;
     - send a **permanent instruction** message once per channel lifetime.
-14. **Admin review path** (off unless `ENABLE_ADMIN_REVIEW_SIGNALS=true` exactly):
-    - for minutes ≥ 47 and a **legacy** to75 probability in a review band, DM a card to `ADMIN_USER_ID` with allow/skip buttons;
-    - auto-skip after `REVIEW_TIMEOUT_MINUTES` (10);
-    - admin-approved sends use title «Сигнал от админа» and still require pre-send context validation.
-15. **Monitor sent fixtures** every `MONITOR_INTERVAL`: refresh stats/events, edit channel text, record score timeline, collect 2H history on finish, resolve outcomes, write `wide_monitor` observations while still 46–60.
-16. **Resolve outcomes at the normal-time boundary** without waiting for AET (`process_normal_time_outcomes_for_jsonl` + `resolve_normal_time_outcome`). Recheck a bounded recent cohort for API corrections (`ENABLE_OUTCOME_CORRECTION_RECHECK`, default 30 min / 168 h lookback / 5 fixtures).
-17. **Persist** decision snapshots, observation history, training JSONL (if `_training_jsonl`), score timelines, sent/tracked maps. Periodic state save (`SAVE_INTERVAL` 30 s).
-18. **Daily MSK report** near 23:59: counts of sent signals and results for that Moscow date; pin as the stats message.
-19. **Maintenance** (if `ENABLE_CLEANUP`): 04:00 MSK bounded cleanup of expired no-stats / persist matches.
-20. **Memory telemetry** (RSS counters, no journal scans) on an interval.
-21. **League/team factor refresh** from API samples (TTL, cup heuristic, clamps).
+14. **Monitor sent fixtures** every `MONITOR_INTERVAL`: refresh stats/events, edit channel text, record score timeline, collect 2H history on finish, resolve outcomes, write `wide_monitor` observations while still 46–60. For fixtures already sent with `approved_by_admin` in persisted state, the frozen header may still display «Сигнал от админа» (historical admin-approved sends only; **Admin Review is not a live path**).
+15. **Resolve outcomes at the normal-time boundary** without waiting for AET (`process_normal_time_outcomes_for_jsonl` + `resolve_normal_time_outcome`). Recheck a bounded recent cohort for API corrections (`ENABLE_OUTCOME_CORRECTION_RECHECK`, default 30 min / 168 h lookback / 5 fixtures).
+16. **Persist** decision snapshots, observation history, training JSONL (if `_training_jsonl`), score timelines, sent/tracked maps. Periodic state save (`SAVE_INTERVAL` 30 s). Legacy keys such as `review_queue` / `admin_reviews` may remain in loaded state files and are tolerated on load; they are not written by current production logic.
+17. **Daily MSK report** near 23:59: counts of sent signals and results for that Moscow date; pin as the stats message.
+18. **Maintenance** (if `ENABLE_CLEANUP`): 04:00 MSK bounded cleanup of expired no-stats / persist matches.
+19. **Memory telemetry** (RSS counters, no journal scans) on an interval.
+20. **League/team factor refresh** from API samples (TTL, cup heuristic, clamps).
 
 ### 3.2 Production windows and skips
 
 | Situation | Production behavior |
 |-----------|---------------------|
-| Minute &lt; 46, review off | No ordinary send; may seed rolling dynamics; prefilter observation |
+| Minute &lt; 46 | No ordinary send; may seed rolling dynamics; prefilter observation |
 | Minute 46, coverage &lt; 0.85 | Skip this cycle (wait for stats) |
 | Minute 46–60, BASE fail | No send; **decision snapshot still written** |
 | Minute 46–60, BASE pass, champion off | Send |
@@ -310,7 +306,6 @@ CLI: `scripts/walk_forward_evaluation.py`.
 | Observation history | Input to all research | JSONL |
 | Outcome revisions | Labels only | All consumers |
 | Telegram send/edit/pin/daily | Yes | telegram block on snapshot |
-| Admin review | Optional second path | — |
 | Analysis UI | Optional display | — |
 | Google Sheets | Disabled | — |
 | Walk-forward | None | `reports/` |
@@ -331,7 +326,7 @@ On unless noted:
 - Research health
 - Reputation shadow + auto-apply; expanded **shadow on**, expanded **auto-apply off**
 - 2H collection, aggregate, factors, soft-apply
-- Dynamic to90 **logging** on; Rescue **off**; admin review **off**; analysis UI **off**; cleanup **off**
+- Dynamic to90 **logging** on; Rescue **off**; analysis UI **off**; cleanup **off**
 - Wide **production apply off**
 - 4f/precision/rare **hard shadow** regardless of env
 

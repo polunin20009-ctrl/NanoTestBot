@@ -20,44 +20,44 @@ Severity:
 
 ## Summary
 
-| ID | Severity | Topic | Fix without policy? |
-|----|----------|--------|---------------------|
-| C1 | critical | Admin-review band `80 ≤ p < 30` is unreachable | Yes |
-| H1 | high | Champion **replaces** BASE allow (armed risk) | No (documented policy) |
-| H2 | high | Champion/router errors **fail open** to BASE allow | Yes |
-| H3 | high | Active manifest cache stays on `_last_good` after delete/invalid | Yes |
-| H4 | high | Admin `publish_signal_to_channel` skips readiness, router, snapshots | Partial |
-| H5 | high | Decision snapshot records `ALLOW` even when Telegram send fails | Yes |
-| H6 | high | Ordinary send is not gated on `sent_matches` | Yes |
-| H7 | high | 2H store `False` / generic exception does not schedule retry | Yes |
-| H8 | high | `_prune_second_half_incomplete_retries` drops backoff when `collectable_2h` empties | Yes |
-| H9 | high | `previously_confirmed_win` never passed into integrity | Yes |
-| H10 | high | Hardcoded API-Football key | Yes |
-| M1 | medium | Dual probability models (lambda to75 vs 45+ to90) | Partial |
-| M2 | medium | `prob_second_half_remain` alias of `prob_next_25`, used as to90 fallback | Yes |
-| M3 | medium | Reputation Δ / season ≥1.02 starve send if reputation cold/off | No (relaxing = policy) |
-| M4 | medium | Expanded reputation silently falls back to telegram and still applies | Yes |
-| M5 | medium | Expanded blend stages on `all_decisions` fixture count | Yes |
-| M6 | medium | `match_sent_at` not written inside `send_to_telegram`; restart bootstrap | Yes |
-| M7 | medium | In-memory 2H/outcome schedulers not restored on restart | Yes |
-| M8 | medium | Outcome correction sweep max 5 fixtures / 30 min | Yes (ops) |
-| M9 | medium | `collectable_2h` pending_only vs cutoff asymmetry | Yes |
-| M10 | medium | Second-half parser missing FT → 0–0 | Yes |
-| M11 | medium | xG estimated fallback feeds BASE intensity | Partial |
-| M12 | medium | Coverage gate 0.85 vs `FALLBACK_MIN_COVERAGE` 0.35; incomplete key aliases | Yes |
-| M13 | medium | Premium badge still requires BASE pass after champion ALLOW | Partial |
-| M14 | medium | Shadow-ML load does not require `shadow_only is True` | Yes |
-| M15 | medium | Observation id fallback to `decision_id` | Yes |
-| M16 | medium | `ENABLE_RESCUE_SIGNALS` / dynamic to90 look live but do not publish | Partial (docs/warn) |
-| L1 | low | `MATCH_MAX_MINUTE` unused; `CHANNEL_ID` assigned twice | Yes |
-| L2 | low | `get_prob_to90_decision_threshold` / 45+ docstring call to90 “legacy” | Yes |
-| L3 | low | MID_STRICT 25–30 and `check_early_strict_mode` dead for ordinary send | Yes |
-| L4 | low | Readiness comment “minute 47” vs `REGULAR_SIGNAL_MIN_MINUTE` 46 | Yes |
-| L5 | low | Metric key aliases (`shots_inside_box` vs `shots_insidebox`) inconsistent | Yes |
-| L6 | low | UTC+3 timezone fallback; `_parse_env_bool` unknown values → default | Yes |
-| L7 | low | Duplicate outcome writers / 2H collect paths | Yes |
-| L8 | low | Google Sheets daemons still started; `GSHEETS_AVAILABLE=false` | Yes |
-| L9 | low | WINDOW remain 70/75 vs BASE 75 vs DYNAMIC 79–82 | Yes (log/docs) |
+| ID | Severity | Topic | Fix without policy? | Status |
+|----|----------|--------|---------------------|--------|
+| C1 | critical | Admin-review band `80 ≤ p < 30` is unreachable | Yes (band fix) | **Resolved** — Admin Review removed (`8186156`) |
+| H1 | high | Champion **replaces** BASE allow (armed risk) | No (documented policy) | Open |
+| H2 | high | Champion/router errors **fail open** to BASE allow | Yes | Open |
+| H3 | high | Active manifest cache stays on `_last_good` after delete/invalid | Yes | Open |
+| H4 | high | Admin `publish_signal_to_channel` skips readiness, router, snapshots | Partial (harden path) | **Resolved** — Admin Review removed (`8186156`) |
+| H5 | high | Decision snapshot records `ALLOW` even when Telegram send fails | Yes | Open |
+| H6 | high | Ordinary send is not gated on `sent_matches` | Yes | Open |
+| H7 | high | 2H store `False` / generic exception does not schedule retry | Yes | Open |
+| H8 | high | `_prune_second_half_incomplete_retries` drops backoff when `collectable_2h` empties | Yes | Open |
+| H9 | high | `previously_confirmed_win` never passed into integrity | Yes | Open |
+| H10 | high | Hardcoded API-Football key | Yes | Open |
+| M1 | medium | Dual probability models (lambda to75 vs 45+ to90) | Partial | Open |
+| M2 | medium | `prob_second_half_remain` alias of `prob_next_25`, used as to90 fallback | Yes | Open |
+| M3 | medium | Reputation Δ / season ≥1.02 starve send if reputation cold/off | No (relaxing = policy) | Open |
+| M4 | medium | Expanded reputation silently falls back to telegram and still applies | Yes | Open |
+| M5 | medium | Expanded blend stages on `all_decisions` fixture count | Yes | Open |
+| M6 | medium | `match_sent_at` not written inside `send_to_telegram`; restart bootstrap | Yes | Open |
+| M7 | medium | In-memory 2H/outcome schedulers not restored on restart | Yes | Open |
+| M8 | medium | Outcome correction sweep max 5 fixtures / 30 min | Yes (ops) | Open |
+| M9 | medium | `collectable_2h` pending_only vs cutoff asymmetry | Yes | Open |
+| M10 | medium | Second-half parser missing FT → 0–0 | Yes | Open |
+| M11 | medium | xG estimated fallback feeds BASE intensity | Partial | Open |
+| M12 | medium | Coverage gate 0.85 vs `FALLBACK_MIN_COVERAGE` 0.35; incomplete key aliases | Yes | Open |
+| M13 | medium | Premium badge still requires BASE pass after champion ALLOW | Partial | Open |
+| M14 | medium | Shadow-ML load does not require `shadow_only is True` | Yes | Open |
+| M15 | medium | Observation id fallback to `decision_id` | Yes | Open |
+| M16 | medium | `ENABLE_RESCUE_SIGNALS` / dynamic to90 look live but do not publish | Partial (docs/warn) | Open |
+| L1 | low | `MATCH_MAX_MINUTE` unused; `CHANNEL_ID` assigned twice | Yes | Open |
+| L2 | low | `get_prob_to90_decision_threshold` / 45+ docstring call to90 “legacy” | Yes | Open |
+| L3 | low | MID_STRICT 25–30 and `check_early_strict_mode` dead for ordinary send | Yes | Open |
+| L4 | low | Readiness comment “minute 47” vs `REGULAR_SIGNAL_MIN_MINUTE` 46 | Yes | Open |
+| L5 | low | Metric key aliases (`shots_inside_box` vs `shots_insidebox`) inconsistent | Yes | Open |
+| L6 | low | UTC+3 timezone fallback; `_parse_env_bool` unknown values → default | Yes | Open |
+| L7 | low | Duplicate outcome writers / 2H collect paths | Yes | Open |
+| L8 | low | Google Sheets daemons still started; `GSHEETS_AVAILABLE=false` | Yes | Open |
+| L9 | low | WINDOW remain 70/75 vs BASE 75 vs DYNAMIC 79–82 | Yes (log/docs) | Open |
 
 ---
 
@@ -65,11 +65,13 @@ Severity:
 
 ### C1. Admin-review inequality is unreachable
 
+- **Status (2026-09):** **Resolved** — Admin Review feature removed from production code (PR-1 `07b3ab8`, PR-2 `8186156` on branch `cleanup/remove-admin-review`). The unreachable band no longer exists in the running system. Historical audit text below describes retired code.
+
 - **Severity:** critical  
-- **Where:** `NanoTest.py` constants `461–463`; `main_loop` `30764–30774`  
-- **Actual:** `REVIEW_MIN_THRESHOLD = 80.0`, `PROB_SEND_THRESHOLD` default `30`, condition `REVIEW_MIN_THRESHOLD <= prob_actual < PROB_SEND_THRESHOLD` → `80 ≤ p < 30`. Always false. `REVIEW_MAX_THRESHOLD = 79.999` is unused. Comment says “50–79.999%”. `ENABLE_ADMIN_REVIEW_SIGNALS` therefore never queues a review card from this branch.  
-- **Risk:** Operators who enable admin review get a silent no-op; no DM, no `publish_signal_to_channel` from this gate.  
-- **Fix without product policy:** **Yes** — restore a coherent open interval matching the comment / unused `REVIEW_MAX_THRESHOLD`. That is a bugfix, not a new send rule. (Whether review should exist at all is already a flag.)
+- **Where (historical):** `NanoTest.py` constants `461–463`; `main_loop` review band (removed)  
+- **Actual (historical audit):** `REVIEW_MIN_THRESHOLD = 80.0`, `PROB_SEND_THRESHOLD` default `30`, condition `REVIEW_MIN_THRESHOLD <= prob_actual < PROB_SEND_THRESHOLD` → `80 ≤ p < 30`. Always false. `REVIEW_MAX_THRESHOLD = 79.999` is unused. Comment said “50–79.999%”. `ENABLE_ADMIN_REVIEW_SIGNALS` therefore never queued a review card from this branch.  
+- **Risk (historical):** Operators who enabled admin review got a silent no-op; no DM, no `publish_signal_to_channel` from this gate.  
+- **Fix without product policy (historical):** **Yes** — restore a coherent open interval matching the comment / unused `REVIEW_MAX_THRESHOLD`. Product chose **removal** instead of band fix.
 
 ---
 
@@ -105,11 +107,13 @@ Severity:
 
 ### H4. Admin publish path diverges from ordinary send
 
-- **Severity:** high (latent until C1 is fixed or review is triggered another way)  
-- **Where:** `publish_signal_to_channel` `12453–12769` vs `main_loop` `31100–31557`; callback `14512–14522`  
-- **Actual:** Admin path still runs BASE filter and Telegram, but **does not** call `is_first_signal_snapshot_ready`, `route_publication_with_wide_research`, or `record_current_decision`. Uses frozen `review_info["data"]`. Callback thread can race `main_loop`.  
-- **Risk:** Weaker quality than ordinary send; no decision JSONL; possible duplicate channel posts.  
-- **Fix without product policy:** **Partial** — sharing readiness/snapshots/idempotency is hardening. Whether admin must obey the champion is a product call.
+- **Status (2026-09):** **Resolved** — `publish_signal_to_channel`, review callbacks, and related daemons were removed (PR-1/PR-2). Only the **ordinary** send path (`main_loop` + BASE + optional champion) publishes new signals. Historical audit text below describes retired code.
+
+- **Severity:** high (was latent until C1 or alternate review trigger)  
+- **Where (historical):** `publish_signal_to_channel` vs `main_loop` ordinary send; callback `review_send` (all removed)  
+- **Actual (historical audit):** Admin path still ran BASE filter and Telegram, but **did not** call `is_first_signal_snapshot_ready`, `route_publication_with_wide_research`, or `record_current_decision`. Used frozen `review_info["data"]`. Callback thread could race `main_loop`.  
+- **Risk (historical):** Weaker quality than ordinary send; no decision JSONL; possible duplicate channel posts.  
+- **Fix without product policy (historical):** **Partial** — sharing readiness/snapshots/idempotency was hardening. Product chose **removal** of the second path.
 
 ---
 
@@ -176,9 +180,9 @@ Severity:
 ### M1. Dual probability models on the same loop
 
 - **Severity:** medium  
-- **Where:** `compute_lambda_and_probability` `16012+` vs `compute_probability_45_plus` `16473+`; `main_loop` `30756–30808`; admin `12496–12503`  
-- **Actual:** Review/eval logs use lambda **`prob_goal_either_to75`**. Publication uses 45+ **`prob_to90` / `prob_next_15`**. Admin recomputes both.  
-- **Risk:** Wrong review band (also C1); operators tune the wrong metric.  
+- **Where:** `compute_lambda_and_probability` vs `compute_probability_45_plus`; `main_loop` EVAL logging  
+- **Actual:** EVAL logs use lambda **`prob_goal_either_to75`**. Publication uses 45+ **`prob_to90` / `prob_next_15`**. (Retired Admin Review also recomputed both; that path is removed.)  
+- **Risk:** Operators may tune the wrong metric when reading EVAL logs; review band risk (C1) no longer applies.  
 - **Fix without product policy:** **Partial** — stop using lambda for review/logging without changing BASE. Unifying review onto 45+ is product.
 
 ---
@@ -342,10 +346,10 @@ These look contradictory in isolation but match the written contract:
 
 ## How this was audited
 
-- Read production send path (`main_loop`, BASE filter, router, Telegram, admin publish).  
+- Read production send path (`main_loop`, BASE filter, router, Telegram). Admin Review publish path was removed 2026-09.  
 - Read reconcile/2H retry, observation collectable index vs stream, `outcome_integrity`.  
 - Read reputation auto-apply, wide-research cache/router, second-half parser fallbacks.  
 - Cross-check contract + characterization `PRODUCTION_FLOW_KNOWN_GAPS` (2H False-store / prune).  
 - Did **not** run a live bot cycle; pytest was not re-run for this document.
 
-Highest-priority **bug-class** items (policy-stable): **C1**, **H2–H3**, **H5–H9**, **H10**. Highest-priority **policy-armed** item: **H1** (do not “fix” unless product wants AND-with-BASE).
+Highest-priority **bug-class** items (policy-stable): **H2–H3**, **H5–H9**, **H10** (C1/H4 resolved by Admin Review removal). Highest-priority **policy-armed** item: **H1** (do not “fix” unless product wants AND-with-BASE).

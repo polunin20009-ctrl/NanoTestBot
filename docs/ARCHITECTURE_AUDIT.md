@@ -89,22 +89,19 @@ On import as `__main__` (and not `GOALBOT_LIBRARY_MODE`), the process loads pers
 | `start_research_health_monitor` | Research ops |
 | `start_monitor_daemon` | Production: edit sent Telegram messages; wide_monitor snapshots |
 | `start_callback_handler_daemon` | Production: inline analysis UI |
-| `start_review_timeout_daemon` | Production only if `ENABLE_ADMIN_REVIEW_SIGNALS` |
 | `start_daily_stats_checker_daemon` | Production: 23:59 report |
 | `start_gsheets_labeler_daemon` | Dead: `GSHEETS_AVAILABLE = False` |
 | `start_daily_cleanup_daemon` | Ops: 04:00 MSK cleanup |
 | `start_state_saver_daemon` | Persist `test_zzz.json` / state |
 
-`start_admin_review_daemon` exists but is **not started** (commented as retired).
-
 ### 3.2 Live evaluation (main loop)
 
 1. `GET fixtures?live=all`.
 2. Skip ignored / excluded / no-stats / already monitored.
-3. Minutes **&lt; 46**: optional rolling-dynamics seed fetches; prefilter observation; no full 45+ send path (unless admin review is on).
-4. Minutes **&gt; 60**: skip ordinary evaluation (review can still run if enabled).
+3. Minutes **&lt; 46**: optional rolling-dynamics seed fetches; prefilter observation; no full 45+ send path.
+4. Minutes **&gt; 60**: skip ordinary evaluation (monitor-only if already sent).
 5. `collect_match_all` + normalize statistics. Coverage gate at minute 46 (`coverage &lt; 0.85` skip).
-6. Legacy `compute_lambda_and_probability` still runs for review-range logging (`prob_goal_either_to75`).
+6. Legacy `compute_lambda_and_probability` still runs for **EVAL logging** (`prob_goal_either_to75`); it is not a publication gate.
 7. Authoritative send path: `compute_probability_45_plus_with_reputation(..., application_context="send")`.
    - Poisson/intensity 45+ model (`lambda_2h`, pressure, shots, xG confidence, game-state).
    - Second-half team/league factors with **soft apply** (`ENABLE_2H_SOFT_APPLY`, capped delta).
@@ -312,10 +309,8 @@ Both are fed from monitor/event classification. Consumers must not mix ids casua
 **Dead or inert at runtime**
 
 - Google Sheets: `GSHEETS_AVAILABLE = False`; init/labeler/finalize still compiled and daemons still started.
-- `start_admin_review_daemon` / review message editing — commented unused.
 - Rescue publication and dynamic to90 **as send gates** — retired; functions remain for tests and shadow logs.
-- Early strict mode 25–30 — not on the ordinary 46–60 send path (review-only remnant).
-- Mid-loop `compute_lambda_and_probability` (to75) — not the 45+ send model.
+- Mid-loop `compute_lambda_and_probability` (to75) — EVAL logging only; not the 45+ send model.
 - `ENABLE_DYNAMIC_PROB_TO90_THRESHOLD` env still documented in `.env.example` though it cannot publish.
 
 **Alive but legacy-shaped**
@@ -412,7 +407,7 @@ These are recommendations only; nothing was implemented.
 2. Keep `WIDE_RESEARCH_PRODUCTION_APPLY` false until a champion actually passes lifecycle; treat “replace BASE” as an explicit product decision, or change the router to AND with BASE.
 3. Split `main_loop` send path from research glue (observation persist already almost is a facade).
 4. Deduplicate JSONL journals into one storage helper.
-5. Delete or isolate Google Sheets and unused review daemons.
+5. Delete or isolate Google Sheets integration.
 6. Cap report jobs so they never scan full gz history in-process (already a known OOM).
 7. Document env-vs-code defaults (`PRODUCTION_APPLY`, expanded reputation) in an operator runbook.
 
