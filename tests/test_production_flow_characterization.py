@@ -8,9 +8,8 @@ not be fixed inside this module.
 
 PRODUCTION_FLOW_KNOWN_GAPS (document only — do not fix here):
 - main_loop integration (live fixture poll → send) is not exercised end-to-end.
-- When a wide-research champion is applied, it fully replaces BASE allow/block
-  (champion PASS can publish even if BASE failed; champion FAIL blocks even if
-  BASE passed). This is current code, not necessarily desired product policy.
+- The historical wide-research champion router remains callable for research
+  compatibility but is no longer part of main_loop publication.
 - API_FOOTBALL_KEY is hardcoded in NanoTest.py (security), not validated here.
 - Google Sheets paths remain in code but GSHEETS_AVAILABLE=false.
 - reconcile 2H retry/backoff: ``store_second_half_history_payload`` returning
@@ -182,9 +181,8 @@ def run_production_publication_pipeline(
     minute: int,
     application_context: str = "send",
 ) -> Dict[str, Any]:
-    """Integration slice: 45+ reputation → BASE filter → wide router → ALLOW/BLOCK."""
+    """Integration slice: 45+ reputation → audit BASE → balanced rule → decision."""
     _patch_45_plus_helpers(monkeypatch)
-    monkeypatch.setattr(bot, "ENABLE_WIDE_RESEARCH", False)
 
     res_45 = bot.compute_probability_45_plus_with_reputation(
         fixture_metrics,
@@ -206,7 +204,7 @@ def run_production_publication_pipeline(
     )
     res_45["channel_signal_filter"] = channel_signal_filter
 
-    wide_router_decision = bot.route_publication_with_wide_research(
+    wide_router_decision = bot.route_publication_with_balanced_two_rule(
         fixture_id=fixture_id,
         minute=minute,
         fixture_metrics=fixture_metrics,
@@ -216,11 +214,7 @@ def run_production_publication_pipeline(
     effective_publication_allow = _effective_publication_allow(wide_router_decision)
     block_reason: Optional[str] = None
     if not effective_publication_allow:
-        block_reason = (
-            "wide-research-champion"
-            if wide_router_decision.get("applied") is True
-            else "channel-signal-filter"
-        )
+        block_reason = bot.BALANCED_TWO_RULE_PORTFOLIO_ID
 
     return {
         "res_45": res_45,
@@ -530,6 +524,118 @@ def test_wide_router_champion_can_allow_when_base_failed(monkeypatch) -> None:
     assert _effective_publication_allow(decision) is True
 
 
+# --- balanced-two-rule production gate --------------------------------------
+
+
+def _balanced_decision(*, allow: bool) -> dict[str, Any]:
+    return {
+        "applied": True,
+        "allow": allow,
+        "source": bot.BALANCED_TWO_RULE_PORTFOLIO_ID,
+        "reason": "pass" if allow else "no_member_passed",
+        "rule_id": "frozen-portfolio-balanced-two-rule-v1",
+        "phase_id": "frozen-portfolio-balanced-two-rule-v1:prospective",
+        "passed_members": ["member-a"] if allow else [],
+        "members": [],
+    }
+
+
+def test_balanced_two_rule_can_allow_when_base_filter_failed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: {
+            "observation_id": "1:50:WIDE_ROUTER:v3",
+            "created_at_utc": "2026-01-01T00:00:00+00:00",
+            "market_research": {},
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_build_shadow_candidate_prediction_record",
+        lambda observation, rolling: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "evaluate_frozen_portfolio",
+        lambda *args, **kwargs: {
+            "reason": "pass",
+            "portfolio_hash": "hash",
+            "passed_members": ["member-a"],
+            "members": [],
+        },
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={},
+        current_filter_allow=False,
+    )
+
+    assert decision["allow"] is True
+    assert decision["source"] == bot.BALANCED_TWO_RULE_PORTFOLIO_ID
+
+
+def test_balanced_two_rule_blocks_even_when_base_filter_passed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: {
+            "observation_id": "1:50:WIDE_ROUTER:v3",
+            "created_at_utc": "2026-01-01T00:00:00+00:00",
+            "market_research": {},
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_build_shadow_candidate_prediction_record",
+        lambda observation, rolling: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "evaluate_frozen_portfolio",
+        lambda *args, **kwargs: {
+            "reason": "no_member_passed",
+            "portfolio_hash": "hash",
+            "passed_members": [],
+            "members": [],
+        },
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={},
+        current_filter_allow=True,
+    )
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "no_member_passed"
+
+
+def test_balanced_two_rule_errors_block_fail_closed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        MagicMock(side_effect=RuntimeError("broken")),
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={},
+        current_filter_allow=True,
+    )
+
+    assert decision["applied"] is True
+    assert decision["allow"] is False
+    assert decision["reason"] == "evaluation_error"
+
+
 # --- first-snapshot readiness ------------------------------------------------
 
 
@@ -623,12 +729,17 @@ def test_validate_match_context_accepts_complete_identity(monkeypatch) -> None:
     assert bot.validate_match_context_before_send(_valid_send_data()) is True
 
 
-# --- integration: fixture → prob/rep → BASE/router → SEND/BLOCK --------------
+# --- integration: fixture → prob/rep → balanced rule → SEND/BLOCK ------------
 
 
 def test_production_pipeline_blocks_when_base_channel_filter_fails(monkeypatch) -> None:
     monkeypatch.setattr(bot, "ENABLE_2H_SOFT_APPLY", False)
     monkeypatch.setattr(bot, "ENABLE_SIGNAL_REPUTATION_AUTO_APPLY", False)
+    monkeypatch.setattr(
+        bot,
+        "route_publication_with_balanced_two_rule",
+        lambda **kwargs: _balanced_decision(allow=False),
+    )
     fixture = _base_fixture()
     result = run_production_publication_pipeline(
         monkeypatch,
@@ -637,10 +748,12 @@ def test_production_pipeline_blocks_when_base_channel_filter_fails(monkeypatch) 
         minute=58,
     )
     assert result["channel_signal_filter"]["passed"] is False
-    assert result["wide_router_decision"]["source"] == "current_filter"
+    assert result["wide_router_decision"]["source"] == (
+        bot.BALANCED_TWO_RULE_PORTFOLIO_ID
+    )
     assert result["effective_publication_allow"] is False
     assert result["final_decision"] == "BLOCK"
-    assert result["block_reason"] == "channel-signal-filter"
+    assert result["block_reason"] == bot.BALANCED_TWO_RULE_PORTFOLIO_ID
     assert result["res_45"]["decision_remain_metric"] == "prob_to90"
 
 
@@ -649,6 +762,11 @@ def test_production_pipeline_allow_reaches_telegram_send_when_base_passes(
 ) -> None:
     monkeypatch.setattr(bot, "ENABLE_2H_SOFT_APPLY", False)
     monkeypatch.setattr(bot, "ENABLE_SIGNAL_REPUTATION_AUTO_APPLY", True)
+    monkeypatch.setattr(
+        bot,
+        "route_publication_with_balanced_two_rule",
+        lambda **kwargs: _balanced_decision(allow=True),
+    )
     monkeypatch.setattr(
         bot,
         "apply_signal_reputation_auto",
