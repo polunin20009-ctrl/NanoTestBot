@@ -4,9 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 from wide_research import FEATURE_SCHEMA_VERSION, Clause, RuleManifest
 from wide_research.portfolio import (
+    BALANCED_TWO_RULE_PORTFOLIO_ID,
     FrozenPortfolioLayer,
     FrozenPortfolioMember,
     FrozenPortfolioSpec,
+    balanced_two_rule_spec,
+    evaluate_frozen_portfolio,
 )
 from wide_research.store import WideResearchStore
 
@@ -55,6 +58,40 @@ def _store(tmp_path) -> WideResearchStore:
     )
     store.bind_profile("frozen_portfolio_shadow")
     return store
+
+
+def test_balanced_two_rule_definition_is_source_controlled_and_immutable() -> None:
+    spec = balanced_two_rule_spec()
+
+    assert spec.portfolio_id == BALANCED_TWO_RULE_PORTFOLIO_ID
+    assert spec.rule_id == "frozen-portfolio-balanced-two-rule-v1"
+    assert [member.manifest.rule_id for member in spec.members] == [
+        "wide-1f89b379f5d04f3ceb3f",
+        "wide-0bed4a7f285d9f108840",
+    ]
+    assert [member.manifest.manifest_hash for member in spec.members] == [
+        "f1f25c7d0bee6e18ebfecf9f6432ab4d08877e96531b5a90805c3bb47bc57cef",
+        "52110b23e40659b02e4fd8971aebf54796f7bc529e6fd376ebc7ccb51b136a0b",
+    ]
+    assert (
+        spec.manifest()["portfolio_hash"]
+        == "d3439fe217409a364ee4d42f5ea3c241c8d771525c6de50447257ffc54b47257"
+    )
+
+
+def test_pure_portfolio_evaluation_uses_any_member_or_semantics() -> None:
+    high = _member("high", 90.0)
+    low = _member("low", 80.0)
+    spec = FrozenPortfolioSpec("test-or", "v1", (high, low))
+    observed = datetime.now(UTC) + timedelta(seconds=1)
+
+    result = evaluate_frozen_portfolio(
+        spec,
+        _snapshot(10, 85.0, observed),
+    )
+
+    assert result["status"] == "PASS"
+    assert result["passed_members"] == ["low"]
 
 
 def test_frozen_portfolios_claim_union_once_and_attach_outcome(tmp_path) -> None:

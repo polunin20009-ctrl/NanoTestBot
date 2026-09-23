@@ -14,8 +14,8 @@ from typing import Any, Mapping, Optional, Sequence
 
 from .features import FEATURE_SCHEMA_VERSION, evaluate_universe, extract_features
 from .live import WideShadowLayer
-from .rules import RuleManifest, evaluate_rule
-from .schema import PASS, canonical_hash
+from .rules import Clause, RuleManifest, evaluate_rule, evaluate_snapshot
+from .schema import DEFAULT_UNIVERSE, FAIL, PASS, canonical_hash
 from .store import WideResearchStore
 
 
@@ -136,6 +136,126 @@ class FrozenPortfolioSpec:
             },
             "production_applied": False,
         }
+
+
+BALANCED_TWO_RULE_PORTFOLIO_ID = "balanced-two-rule"
+BALANCED_TWO_RULE_VERSION = "v1"
+
+
+def balanced_two_rule_spec(*, terminal_horizon: int = 200) -> FrozenPortfolioSpec:
+    """Return the immutable, source-controlled balanced-two-rule definition."""
+
+    asymmetry = FrozenPortfolioMember(
+        source_profile="rare_precision_shadow",
+        source_store_hash=(
+            "38e6666d98fd031af2989f4e7aebc3228e621312c58bde70ea4aed267289a359"
+        ),
+        manifest=RuleManifest(
+            rule_id="wide-1f89b379f5d04f3ceb3f",
+            version="wide_prospective_rule_v2",
+            clauses=(
+                Clause("bot.prob_to90", "<=", 79.0),
+                Clause("nonlinear.v1.away_share.corners", ">=", 0.5),
+                Clause(
+                    "nonlinear.v1.home_away_balance.total_shots",
+                    "<=",
+                    -0.076923,
+                ),
+                Clause(
+                    "nonlinear.v1.product.box_shots.static_p90",
+                    ">=",
+                    0.228077,
+                ),
+                Clause(
+                    "nonlinear.v1.trailing_share.shots_on_target",
+                    ">=",
+                    0.333333,
+                ),
+            ),
+            universe=DEFAULT_UNIVERSE,
+            schema_version=2,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        ),
+    )
+    market_pressure = FrozenPortfolioMember(
+        source_profile="rare_precision_shadow",
+        source_store_hash=(
+            "82139a90953630cfceaa7f02fec9a0e9613cc273c49e7f373f281a5d0da8c494"
+        ),
+        manifest=RuleManifest(
+            rule_id="wide-0bed4a7f285d9f108840",
+            version="wide_prospective_rule_v2",
+            clauses=(
+                Clause(
+                    "nonlinear.v1.product.market_p90.season",
+                    ">=",
+                    0.832204,
+                ),
+                Clause(
+                    "rolling.10m.delta.pressure_index",
+                    ">=",
+                    1.82,
+                ),
+            ),
+            universe=DEFAULT_UNIVERSE,
+            schema_version=2,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        ),
+    )
+    return FrozenPortfolioSpec(
+        portfolio_id=BALANCED_TWO_RULE_PORTFOLIO_ID,
+        version=BALANCED_TWO_RULE_VERSION,
+        members=(asymmetry, market_pressure),
+        terminal_horizon=terminal_horizon,
+    )
+
+
+def evaluate_frozen_portfolio(
+    spec: FrozenPortfolioSpec,
+    snapshot: Mapping[str, Any],
+    *,
+    static_prediction: Optional[Mapping[str, Any]] = None,
+    rolling_prediction: Optional[Mapping[str, Any]] = None,
+    max_prediction_lag_seconds: float = 300.0,
+) -> dict[str, Any]:
+    """Evaluate an immutable OR-portfolio without persistence side effects."""
+
+    member_results: list[dict[str, Any]] = []
+    passed_members: list[str] = []
+    for member in spec.members:
+        result = evaluate_snapshot(
+            member.manifest,
+            snapshot,
+            static_prediction=static_prediction,
+            rolling_prediction=rolling_prediction,
+            max_prediction_lag_seconds=max_prediction_lag_seconds,
+            include_extended=True,
+        )
+        member_results.append(
+            {
+                "source_profile": member.source_profile,
+                "rule_id": member.manifest.rule_id,
+                "manifest_hash": member.manifest.manifest_hash,
+                "status": result.get("status"),
+                "reason": result.get("reason"),
+                "unavailable_features": list(
+                    result.get("unavailable_features") or []
+                ),
+                "failed_features": list(result.get("failed_features") or []),
+            }
+        )
+        if result.get("status") == PASS:
+            passed_members.append(member.manifest.rule_id)
+
+    return {
+        "portfolio_id": spec.portfolio_id,
+        "rule_id": spec.rule_id,
+        "portfolio_hash": spec.manifest()["portfolio_hash"],
+        "status": PASS if passed_members else FAIL,
+        "reason": "pass" if passed_members else "no_member_passed",
+        "passed_members": passed_members,
+        "members": member_results,
+    }
 
 
 class FrozenPortfolioLayer(WideShadowLayer):
