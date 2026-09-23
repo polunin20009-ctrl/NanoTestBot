@@ -5,7 +5,7 @@ Source: live code and package docs. Application logic was not changed.
 
 This document is the **capability contract**: what production and research can do *now*, what they refuse to do, and which flags turn a capability on. It is not a design proposal.
 
-Convention: **Production** = anything that can change Telegram publication, live message text, or the probabilities used by the BASE gate. **Research** = observe, score, train, discover, report; default `production_applied=false` / `shadow_only=true`.
+Convention: **Production** = anything that can change Telegram publication, live message text, or the inputs used by `balanced-two-rule`. **Research** = observe, score, train, discover, report; default `production_applied=false` / `shadow_only=true`.
 
 ---
 
@@ -13,9 +13,9 @@ Convention: **Production** = anything that can change Telegram publication, live
 
 The running product is a **Goal Predictor Telegram Bot** (`NanoTest.py`).
 
-It watches **live football fixtures** from API-Football, computes a **second-half (minutes 46–60) probability that another goal arrives before the end of normal time**, and may **publish one ordinary channel signal per fixture** when the BASE rule passes.
+It watches **live football fixtures** from API-Football, computes a **second-half (minutes 46–60) probability that another goal arrives before the end of normal time**, and may **publish one ordinary channel signal per fixture** when the immutable `balanced-two-rule` portfolio passes.
 
-A parallel **research factory** records every technically eligible snapshot, residual ML, market quotes, hand-written candidate arms, and four wide-research rule profiles. Historical search never publishes. Only a **primary wide-research champion**, if one exists and `WIDE_RESEARCH_PRODUCTION_APPLY` is true, may replace the BASE allow/block.
+A parallel **research factory** records every technically eligible snapshot, residual ML, market quotes, hand-written candidate arms, and four wide-research rule profiles. Historical search and primary wide-research champions no longer publish. The BASE filter is retained as an audit/control feature but is not the Telegram gate.
 
 CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps collected metrics and exits.
 
@@ -74,7 +74,7 @@ CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps colle
    - expanded blend (`ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY`, **default false**) can mix telegram + other cohorts with configured weights; evaluation failure **falls back** to telegram cohort.
 9. **Gate first snapshot quality** (`is_first_signal_snapshot_ready`) only before the first ordinary send: reject HT/1H, not-yet-2H, empty 2H start, post-goal xG lag, all-zero mid-game stats, extreme probability with weak live metrics.
 10. **Require publication context** (`validate_match_context_before_send`): real team names, league name/id, team ids, non-default league/team factor source.
-11. **Evaluate the authoritative BASE filter** `base_rep15_int055_season102_p90_75_v1` (`evaluate_channel_signal_filter`):
+11. **Evaluate the legacy BASE control** `base_rep15_int055_season102_p90_75_v1` (`evaluate_channel_signal_filter`) for snapshots, comparison, and research:
 
     | Condition | Default threshold | Env override |
     |-----------|-------------------|--------------|
@@ -83,10 +83,12 @@ CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps colle
     | `adjusted_intensity` | ≥ 0.55 | `BASE_SIGNAL_MIN_ADJUSTED_INTENSITY` |
     | `season_context_factor` | ≥ 1.02 | `BASE_SIGNAL_MIN_SEASON_CONTEXT_FACTOR` |
 
-    All four must pass. Invalid/non-finite inputs → fail closed (`passed=false`). Current **score total is not a pass/fail input**.
-12. **Optionally route through a wide-research champion** (`route_publication_with_wide_research`) only if **all** of: `ENABLE_WIDE_RESEARCH`, `WIDE_RESEARCH_PRODUCTION_APPLY`, valid checksummed active manifest, `production_enabled=true`, feature schema match, observation time ≥ `effective_from_utc`. Then **champion PASS/FAIL replaces BASE allow**. If any of those fail: `allow = BASE passed`, `applied=false`.
+    Invalid/non-finite inputs fail closed (`passed=false`). Its result is recorded but does not allow or block Telegram publication.
+12. **Apply the only production gate: frozen `balanced-two-rule` v1.** It is an OR portfolio: at least one of its two immutable members must PASS. Missing features, prediction errors, market unavailability affecting a required member, or evaluation exceptions cannot create a signal; if neither member passes, publication is blocked. The rule ignores the BASE result.
+    - `wide-1f89b379f5d04f3ceb3f`: `prob_to90≤79`, away corner share `≥0.5`, home-away total-shot balance `≤-0.076923`, box-shots × causal static-ML p90 `≥0.228077`, trailing-team SOT share `≥0.333333`.
+    - `wide-0bed4a7f285d9f108840`: causal market p90 × season factor `≥0.832204` and 10-minute pressure delta `≥1.82`.
 13. **Publish to Telegram** (Markdown, rate-limited edits):
-    - ordinary signal: title «Сигнал» or **Premium** «Premium Сигнал» if BASE passed **and** goals at snapshot ≤ 2 (`PREMIUM_BADGE_RULE_VERSION=base_p90_75_goals_le2_v1`) — presentation only;
+    - every ordinary signal uses the title «Сигнал»; the Premium title/badge no longer exists;
     - live score, minute, `prob_to90` (and next-15 display), xG, shots, saves, box, corners, possession;
     - optional analysis UI (`ENABLE_SIGNAL_ANALYSIS_UI`, default **false**): private deeplink / snapshot screens (overview, live, teams, season, 2h, technical);
     - edit the same message as the match progresses; freeze the **header/title** at send;
@@ -107,9 +109,8 @@ CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps colle
 |-----------|---------------------|
 | Minute &lt; 46 | No ordinary send; may seed rolling dynamics; prefilter observation |
 | Minute 46, coverage &lt; 0.85 | Skip this cycle (wait for stats) |
-| Minute 46–60, BASE fail | No send; **decision snapshot still written** |
-| Minute 46–60, BASE pass, champion off | Send |
-| Minute 46–60, champion applied | Send iff champion rule PASS |
+| Minute 46–60, `balanced-two-rule` FAIL/UNAVAILABLE | No send; **decision snapshot still written** |
+| Minute 46–60, `balanced-two-rule` PASS | Send, regardless of BASE result |
 | Minute &gt; 60, already sent | Monitor updates only |
 | Duplicate fixture already in `sent_matches` | No second ordinary send |
 | Missing stats / unknown fixture id | Long no-stats block |
@@ -121,14 +122,14 @@ CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps colle
 - Publish from **WINDOW_1/WINDOW_2 next-15 + remain + live-gate + anti-garbage**. Shadow comparison only.
 - Publish from **Rescue** even if `ENABLE_RESCUE_SIGNALS=true`. Send path forces `rescue_publication_enabled=false`.
 - Copy **static or rolling ML** probabilities into `res_45`, thresholds, or Telegram text.
-- Use **market odds** for allow/block or displayed probability.
 - Use **shadow candidate arms** or **4f / precision / rare_precision** rules for publication.
+- Use a primary wide-research champion or BASE result for publication.
 - Promote a wide-research rule from **holdout hit rate** alone.
 - Send Google Sheets rows (`GSHEETS_AVAILABLE=false`).
 - Treat extra-time / shootout goals as `goal_to90_normal_time` (strict mode default).
 - Confirm goals with `GOAL_CONFIRM_ACTIVE` (hardcoded **false**; delay constant unused).
 
-Code default: `WIDE_RESEARCH_PRODUCTION_APPLY=false`. Live `.env` may set it true; without an active champion the router still falls back to BASE.
+`WIDE_RESEARCH_PRODUCTION_APPLY` and an active primary champion no longer affect Telegram publication.
 
 ---
 
@@ -177,7 +178,10 @@ Every research layer below is **fail-closed**: missing features, missing ML, or 
 - Train only on `decision_pipeline` 46–60 resolved rows; ALLOW and BLOCK both kept; no outcome/Telegram/league-id features.
 - Causal live predict: exact observation identity; model created before observation; append lag ≤ 300 s.
 
-**Cannot:** feed probabilities back into production. Missing model → skip predict, leave bot unchanged.
+**Production boundary:** static ML may affect publication only through the
+source-controlled `balanced-two-rule` member described in §3.1.12. It is never
+copied into displayed probabilities. Missing model data makes that member
+UNAVAILABLE and cannot create a pass.
 
 CLI: `scripts/train_shadow_ml.py`, `scripts/report_shadow_ml.py`.
 
@@ -233,9 +237,9 @@ All profiles: conjunction DSL (`>=`, `<=`, `==`) on an allowlisted numeric featu
 - Holdout: one-sided binomial vs 90% + Holm. Stored as diagnostics (`historical_metrics_are_evidence=false`) — **not READY**.
 - Optional temporal purge / embargo (`WIDE_RESEARCH_TEMPORAL_PURGE`).
 
-| Profile | Default role | Search character | Lifecycle looks | Can become champion |
+| Profile | Default role | Search character | Lifecycle looks | Can become lifecycle champion |
 |---------|--------------|------------------|-----------------|---------------------|
-| primary | `ENABLE_WIDE_RESEARCH` | up to 3 clauses typical; max 10 shadow rules | 50…1000 incl. 200 | **Yes**, if production_apply + gates |
+| primary | `ENABLE_WIDE_RESEARCH` | up to 3 clauses typical; max 10 shadow rules | 50…1000 incl. 200 | **Yes**, as research state only |
 | 4f | four-factor | exact depth 4; beam 32; budget 40k | same family | **No** (hard shadow) |
 | precision | high-precision | up to 8 clauses; portfolio; frequency bands | same | **No** |
 | rare_precision | rare high precision | extended/nonlinear + market features | **50, 100, 200** | **No** |
@@ -250,9 +254,9 @@ All profiles: conjunction DSL (`>=`, `<=`, `==`) on an allowlisted numeric featu
 - Holm α = 0.05
 - degradation: fast n=50 rate 0.80; slow n=150 vs null 0.90
 
-Phases: candidate → shadow → ready → active/champion; also paused/degraded. Empty `active` pointer = no production rule.
+Phases: candidate → shadow → ready → active/champion; also paused/degraded. This lifecycle state does not grant Telegram publication authority.
 
-**Champion router** (primary only): see §3.1.12.
+The historical primary champion router is not called by `main_loop`.
 
 CLI: `scripts/discover_wide_rules.py`, `scripts/run_wide_research_cycle.py`, `scripts/report_wide_research.py`.
 
@@ -294,13 +298,13 @@ CLI: `scripts/walk_forward_evaluation.py`.
 | 45+ Poisson/intensity + 2H soft-apply | Yes (probabilities) | Frozen on observations |
 | Reputation auto-apply (telegram) | Yes (probabilities) | Shadow journal |
 | Reputation expanded auto-apply | Optional (default off) | Shadow journal (default on) |
-| BASE `p90≥75` + Δrep + intensity + season | **Publication gate** | Copied into snapshots / control arm |
-| Premium badge goals≤2 | Title only | Filter fields on snapshot |
-| Wide primary champion | Optional replace-BASE | sqlite + manifest |
+| BASE `p90≥75` + Δrep + intensity + season | Audit/control only | Copied into snapshots / control arm |
+| Frozen `balanced-two-rule` | **Only publication gate** | Frozen portfolio sqlite |
+| Wide primary champion | None | sqlite + manifest |
 | Wide 4f / precision / rare | None | sqlite + reports |
-| Shadow ML static/rolling | None | artifacts + prediction JSONL |
+| Shadow ML static/rolling | Static p90 is one input to `balanced-two-rule`; rolling ML has no production effect | artifacts + prediction JSONL |
 | Shadow candidate arms | None | JSONL |
-| Market O/U +0.5 | None | JSONL |
+| Market O/U +0.5 | Causal market p90 is one input to `balanced-two-rule`; not displayed | JSONL |
 | Dynamic to90 / Rescue / live-gate | None | Snapshot `legacy_selection_gates` |
 | Decision snapshots | Audit (not a gate) | JSONL |
 | Observation history | Input to all research | JSONL |
@@ -327,7 +331,7 @@ On unless noted:
 - Reputation shadow + auto-apply; expanded **shadow on**, expanded **auto-apply off**
 - 2H collection, aggregate, factors, soft-apply
 - Dynamic to90 **logging** on; Rescue **off**; analysis UI **off**; cleanup **off**
-- Wide **production apply off**
+- Wide production-apply flag is ignored by Telegram routing
 - 4f/precision/rare **hard shadow** regardless of env
 
 ---
@@ -355,8 +359,8 @@ On unless noted:
 
 ## 8. Contract summary
 
-**Production is allowed to:** score 46–60 live matches with the 45+ model, nudge probabilities with capped 2H factors and staged telegram reputation, publish **at most one** channel signal per fixture when BASE (or an explicit primary champion) allows, update that message until full time, label normal-time outcomes, and emit a daily MSK digest.
+**Production is allowed to:** score 46–60 live matches with the 45+ model, nudge probabilities with capped 2H factors and staged telegram reputation, publish **at most one** channel signal per fixture only when frozen `balanced-two-rule` passes, update that message until full time, label normal-time outcomes, and emit a daily MSK digest.
 
-**Research is allowed to:** record the broader eligible universe, train shadow residuals, freeze candidate arms, store market quotes, search and prospectively validate four rule families, and report walk-forward/health/logloss. It may **not** publish except the documented primary-champion override.
+**Research is allowed to:** record the broader eligible universe, train shadow residuals, freeze candidate arms, store market quotes, search and prospectively validate four rule families, and report walk-forward/health/logloss. It does not publish.
 
 **Neither system is allowed to:** treat holdout 90% as production proof, use ET/PEN goals as to90 wins, impute missing ML/windows as passes, or let Sheets/Rescue/dynamic thresholds send to the channel.

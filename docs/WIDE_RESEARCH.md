@@ -2,8 +2,9 @@
 
 Wide research is the bot's autonomous rule-discovery and prospective-validation
 layer. It searches the broad technically eligible match universe, freezes a
-small set of candidate rules, measures those rules on future matches, and can
-route Telegram publication through a statistically qualified champion.
+small set of candidate rules, and measures those rules on future matches.
+Primary champions remain research artifacts and no longer route Telegram
+publication.
 
 It is deliberately separate from the existing publication filter and from ML
 training. Discovery does not edit an ML model, and historical performance can
@@ -193,10 +194,12 @@ filter; if another READY phase exists, the controller may promote it. Weekly
 discovery continues creating potential replacements, subject to the bounded
 shadow pool and the same prospective gates.
 
-## Production routing and fallback
+## Historical production router
 
-The active file is `stats/wide_research_active.json`. A production rule is used
-only when all of these conditions hold:
+The active file is `stats/wide_research_active.json`. The controller and router
+remain available for historical evidence and compatibility, but `main_loop`
+does not call this router for Telegram publication. `balanced-two-rule` is now
+the only publication gate.
 
 - wide research and production application are enabled;
 - the active manifest is structurally valid and its checksum is valid;
@@ -205,10 +208,8 @@ only when all of these conditions hold:
 - the snapshot is not earlier than the manifest's effective timestamp;
 - the immutable rule manifest can be parsed and checksum-verified.
 
-With a valid champion, that rule replaces the current signal filter for the
-publication decision: a PASS allows and a FAIL/UNAVAILABLE blocks. Without a
-champion, the existing current filter behaves exactly as before. Router
-exceptions also fall back to the current filter.
+The validation rules below describe how the dormant router verifies a manifest;
+they do not grant publication authority.
 
 The manifest cache never accepts a lower generation or a corrupt update. While
 the process is alive it also rejects different content under the same
@@ -233,7 +234,7 @@ of an already registered phase.
 | `WIDE_RESEARCH_PROSPECTIVE_START_UTC` | `2026-08-28T00:00:00+00:00` | Earliest allowed prospective trigger time |
 | `WIDE_RESEARCH_AUTO_DISCOVERY` | `true` | Run isolated discovery automatically |
 | `WIDE_RESEARCH_AUTO_LIFECYCLE` | `true` | Reconcile READY/ACTIVE/DEGRADED automatically |
-| `WIDE_RESEARCH_PRODUCTION_APPLY` | `false` | Permit a READY champion to control publication |
+| `WIDE_RESEARCH_PRODUCTION_APPLY` | `false` | Retained for lifecycle compatibility; ignored by Telegram routing |
 | `WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS` | `604800` | Discovery cadence; minimum 86400 seconds |
 | `WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS` | `900` | Lifecycle cadence; minimum 300 seconds |
 | `WIDE_RESEARCH_PHASE_REFRESH_SECONDS` | `60` | Live phase-cache refresh; minimum 5 seconds |
