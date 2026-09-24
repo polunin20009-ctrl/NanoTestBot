@@ -124,9 +124,12 @@ from wide_research.features import (
 from wide_research.live import ActiveRuleRouter, WideShadowLayer
 from wide_research.lifecycle import LifecyclePolicy
 from wide_research.portfolio import (
+    BALANCED_TWO_RULE_PORTFOLIO_ID,
     FrozenPortfolioLayer,
     FrozenPortfolioMember,
     FrozenPortfolioSpec,
+    balanced_two_rule_spec,
+    evaluate_frozen_portfolio,
 )
 from wide_research.rules import rule_manifest_from_dict
 from wide_research.store import WideResearchStore
@@ -414,9 +417,8 @@ WINDOW_2_NEXT_15_THRESHOLD = 35.0
 WINDOW_2_REMAIN_THRESHOLD = 70.0
 WINDOW_2_LIVE_GATE_MIN_PASSED = 2
 
-# Authoritative channel-publication rule.  The environment keys are new on
-# purpose: legacy CHANNEL_SIGNAL_* values described the retired p90/xG/SOT
-# filter and must not silently override this BASE contract.
+# BASE control retained for audit and research comparisons. Telegram publication
+# is gated only by the immutable balanced-two-rule portfolio.
 CHANNEL_SIGNAL_MIN_PROB_TO90 = float(
     os.environ.get("BASE_SIGNAL_MIN_PROB_TO90", "75.0")
 )
@@ -430,11 +432,6 @@ CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR = float(
     os.environ.get("BASE_SIGNAL_MIN_SEASON_CONTEXT_FACTOR", "1.02")
 )
 CHANNEL_SIGNAL_FILTER_VERSION = "base_rep15_int055_season102_p90_75_v1"
-
-# Presentation only.  Every sent signal already passed the BASE rule above;
-# Premium freezes the score state at publication and changes only the title.
-PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT = 2
-PREMIUM_BADGE_RULE_VERSION = "base_p90_75_goals_le2_v1"
 
 # Legacy minute-aware thresholds retained only for shadow comparison/audit.
 # They no longer gate Telegram publication and cannot activate Rescue.
@@ -963,7 +960,7 @@ WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS = max(
 WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES = max(
     1,
     min(
-        10,
+        32,
         int(os.environ.get("WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES", "10")),
     ),
 )
@@ -1761,15 +1758,13 @@ def log_feature_flags() -> None:
     logger.info(
         "[CHANNEL_SIGNAL_FILTER_CONFIG] version=%s min_prob_to90=%.2f "
         "min_reputation_delta_to90_pp=%.2f min_adjusted_intensity=%.3f "
-        "min_season_context_factor=%.3f premium_rule=%s "
-        "premium_max_goals_at_snapshot=%s legacy_rescue_publication=false",
+        "min_season_context_factor=%.3f "
+        "publication_rule=balanced-two-rule legacy_rescue_publication=false",
         CHANNEL_SIGNAL_FILTER_VERSION,
         CHANNEL_SIGNAL_MIN_PROB_TO90,
         CHANNEL_SIGNAL_MIN_REPUTATION_DELTA_TO90_PP,
         CHANNEL_SIGNAL_MIN_ADJUSTED_INTENSITY,
         CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR,
-        PREMIUM_BADGE_RULE_VERSION,
-        PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT,
     )
     logger.info(
         "[DECISION_SNAPSHOT_CONFIG] enabled=%s decision_schema=%s outcome_schema=%s rotate_max_bytes=%s dedupe_max_keys=%s reconcile_every_cycles=%s reconcile_limit=%s recheck_seconds=%s reschedule_min_shift_seconds=%s file=%s",
@@ -6415,12 +6410,6 @@ def _build_regular_signal_training_payload(
         "telegram": dict(telegram_snapshot) if isinstance(telegram_snapshot, dict) else None,
         "signal_model": "45_plus",
         "signal_route": str(res_45.get("signal_route") or "primary"),
-        "premium_badge": bool(res_45.get("premium_badge", False)),
-        "premium_badge_rule_version": (
-            str(res_45.get("premium_badge_rule_version"))
-            if res_45.get("premium_badge_rule_version")
-            else None
-        ),
         "channel_signal_filter": dict(
             res_45.get("channel_signal_filter") or {}
         ),
@@ -6453,10 +6442,6 @@ def _build_regular_signal_training_payload(
         "model_version": snapshot["model_version"],
         "signal_model": snapshot["signal_model"],
         "signal_route": snapshot["signal_route"],
-        "premium_badge": snapshot["premium_badge"],
-        "premium_badge_rule_version": snapshot[
-            "premium_badge_rule_version"
-        ],
         "telegram_message_id": telegram_message_value,
         "snapshot_saved": False,
         "outcome_saved": False,
@@ -9275,7 +9260,6 @@ def save_signal_snapshot_state(
     legacy_prob_second_half_remain: Optional[float] = None,
     signal_model: Optional[str] = None,
     signal_route: str = "primary",
-    premium_badge: bool = False,
     selected_prob_to90_threshold: Optional[float] = None,
     threshold_source: Optional[str] = None,
     minute_bucket: Optional[str] = None,
@@ -9314,10 +9298,6 @@ def save_signal_snapshot_state(
             ),
             "signal_model": str(signal_model) if signal_model is not None else None,
             "signal_route": "rescue" if str(signal_route).lower() == "rescue" else "primary",
-            "premium_badge": bool(premium_badge),
-            "premium_badge_rule_version": (
-                PREMIUM_BADGE_RULE_VERSION if premium_badge else None
-            ),
             "selected_prob_to90_threshold": float(selected_prob_to90_threshold) if selected_prob_to90_threshold is not None else None,
             "threshold_source": str(threshold_source) if threshold_source is not None else None,
             "minute_bucket": str(minute_bucket) if minute_bucket is not None else None,
@@ -16246,10 +16226,6 @@ def _observation_config_snapshot() -> Dict[str, Any]:
         "channel_signal_min_season_context_factor": float(
             CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR
         ),
-        "premium_badge_rule_version": str(PREMIUM_BADGE_RULE_VERSION),
-        "premium_badge_max_goals_at_snapshot": int(
-            PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT
-        ),
         "rescue_enabled": bool(ENABLE_RESCUE_SIGNALS),
         "rescue_max_shortfall_pp": float(RESCUE_MAX_THRESHOLD_SHORTFALL_PP),
         "rescue_min_score": float(RESCUE_MIN_CONTROLLER_SCORE),
@@ -16307,7 +16283,6 @@ def _observation_config_snapshot() -> Dict[str, Any]:
         "dynamic_threshold": "minute_bucket_v1",
         "rescue_controller": "v1_retired_from_publication",
         "channel_signal_filter": str(CHANNEL_SIGNAL_FILTER_VERSION),
-        "premium_badge": str(PREMIUM_BADGE_RULE_VERSION),
         "signal_reputation": "v1",
         "signal_reputation_expanded_blend": (
             "convex_v1_production"
@@ -21136,8 +21111,9 @@ def _persist_market_benchmark_payload(
     }
     results = target_journal.append_many([*accepted, poll_record])
     _market_cache_update(accepted, captured_at_utc=captured)
-    if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
-        _market_research_quote_cache.update(accepted, captured)
+    # balanced-two-rule is the production gate and its market-pressure member
+    # needs the same causal quote cache regardless of rare-discovery settings.
+    _market_research_quote_cache.update(accepted, captured)
     written_quotes = sum(bool(value) for value in results[: len(accepted)])
     result = {
         "status": "ok" if response_valid else "degraded",
@@ -22778,17 +22754,14 @@ def _get_wide_research_frozen_portfolio_components() -> Tuple[
             game_state_box_context = member(
                 "four_factor_game_state_box_context"
             )
-            asymmetry = member("rare_asymmetry")
-            market_pressure = member("rare_market_pressure")
+            balanced_two_rule = balanced_two_rule_spec(
+                terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON
+            )
+            asymmetry, market_pressure = balanced_two_rule.members
             market_season_pace = member("rare_market_season_pace")
             compact_volume = member("rare_compact_volume")
             specs = (
-                FrozenPortfolioSpec(
-                    portfolio_id="balanced-two-rule",
-                    version="v1",
-                    members=(asymmetry, market_pressure),
-                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
-                ),
+                balanced_two_rule,
                 FrozenPortfolioSpec(
                     portfolio_id="broad-three-rule",
                     version="v1",
@@ -23360,6 +23333,118 @@ def build_wide_router_observation(
         "router_preview": True,
     }
     return freeze_observation_rolling_dynamics(preview)
+
+
+def route_publication_with_balanced_two_rule(
+    *,
+    fixture_id: int,
+    minute: int,
+    fixture_metrics: Dict[str, Any],
+    probability_result: Dict[str, Any],
+    current_filter_allow: bool,
+    evidence_sink: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Use the immutable balanced-two-rule OR-portfolio as the only send gate."""
+
+    blocked = {
+        "applied": True,
+        "allow": False,
+        "source": BALANCED_TWO_RULE_PORTFOLIO_ID,
+        "reason": "evaluation_error",
+        "rule_id": f"frozen-portfolio-{BALANCED_TWO_RULE_PORTFOLIO_ID}-v1",
+        "phase_id": None,
+        "current_filter_allow": bool(current_filter_allow),
+        "passed_members": [],
+        "members": [],
+    }
+    try:
+        preview = build_wide_router_observation(
+            fixture_id=fixture_id,
+            minute=minute,
+            fixture_metrics=fixture_metrics,
+            probability_result=probability_result,
+        )
+        if "market_research" not in preview:
+            preview = {
+                **preview,
+                "market_research": _market_research_quote_cache.freeze(preview),
+            }
+
+        static_prediction = None
+        rolling_prediction = None
+        try:
+            static_prediction = _build_shadow_candidate_prediction_record(
+                preview,
+                rolling=False,
+            )
+        except Exception:
+            logger.exception(
+                "[BALANCED_TWO_RULE_PREDICTION_ERROR] fixture_id=%s "
+                "minute=%s source=static action=continue_unavailable",
+                fixture_id,
+                minute,
+            )
+        try:
+            rolling_prediction = _build_shadow_candidate_prediction_record(
+                preview,
+                rolling=True,
+            )
+        except Exception:
+            logger.exception(
+                "[BALANCED_TWO_RULE_PREDICTION_ERROR] fixture_id=%s "
+                "minute=%s source=rolling action=continue_unavailable",
+                fixture_id,
+                minute,
+            )
+
+        if isinstance(evidence_sink, dict):
+            evidence_sink.update(
+                {
+                    "observation": copy.deepcopy(preview),
+                    "observation_created_at_utc": preview.get(
+                        "created_at_utc"
+                    ),
+                    "prediction_input_observation_id": preview.get(
+                        "observation_id"
+                    ),
+                    "static_prediction": copy.deepcopy(static_prediction),
+                    "rolling_prediction": copy.deepcopy(rolling_prediction),
+                }
+            )
+
+        spec = balanced_two_rule_spec(
+            terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON
+        )
+        evaluation = evaluate_frozen_portfolio(
+            spec,
+            preview,
+            static_prediction=static_prediction,
+            rolling_prediction=rolling_prediction,
+            max_prediction_lag_seconds=(
+                SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+            ),
+        )
+        passed_members = list(evaluation.get("passed_members") or [])
+        return {
+            "applied": True,
+            "allow": bool(passed_members),
+            "source": BALANCED_TWO_RULE_PORTFOLIO_ID,
+            "reason": str(evaluation.get("reason") or "no_member_passed"),
+            "rule_id": spec.rule_id,
+            "phase_id": spec.phase_id,
+            "portfolio_hash": evaluation.get("portfolio_hash"),
+            "current_filter_allow": bool(current_filter_allow),
+            "passed_members": passed_members,
+            "members": list(evaluation.get("members") or []),
+        }
+    except Exception:
+        logger.exception(
+            "[BALANCED_TWO_RULE_ERROR] fixture_id=%s minute=%s "
+            "action=block_fail_closed",
+            fixture_id,
+            minute,
+        )
+        return blocked
 
 
 def route_publication_with_wide_research(
@@ -27817,11 +27902,6 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
             saved_signal_header = state.get("signal_header_texts", {}).get(str(match_id))
         signal_model = str(signal_meta.get("signal_model") or "")
         signal_route = "rescue" if str(signal_meta.get("signal_route") or "").lower() == "rescue" else "primary"
-        premium_badge = bool(
-            signal_meta.get("premium_badge", False)
-            and signal_meta.get("premium_badge_rule_version")
-            == PREMIUM_BADGE_RULE_VERSION
-        )
 
         prev_tracking = get_persistent_fixture_tracking(match_id)
         if not prev_tracking:
@@ -27856,7 +27936,6 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 prob_display_90=prob_snapshot_90,
                 is_admin_approved=False,
                 signal_route=signal_route,
-                premium_badge=premium_badge,
             )
             live_footer = build_live_footer(
                 current_data=data,
@@ -28102,7 +28181,6 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
             boundary_header = resolve_signal_header_title(
                 is_admin_approved=bool(st.get("approved_by_admin", False)),
                 signal_route=signal_route,
-                premium_badge=premium_badge,
                 saved_header_text=saved_signal_header,
             )
             boundary_text = render_normal_time_boundary_message(
@@ -28169,7 +28247,6 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 prob_display_90=prob_90,
                 is_admin_approved=is_admin_approved,
                 signal_route=signal_route,
-                premium_badge=premium_badge,
             )
             live_footer = build_live_footer(
                 current_data=data,
@@ -28232,7 +28309,6 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
             header_text = resolve_signal_header_title(
                 is_admin_approved=is_admin_approved,
                 signal_route=signal_route,
-                premium_badge=premium_badge,
                 saved_header_text=saved_signal_header,
             )
 
@@ -28585,7 +28661,7 @@ def evaluate_channel_signal_filter(
     adjusted_intensity: Any = None,
     season_context_factor: Any = None,
 ) -> Dict[str, Any]:
-    """Evaluate the authoritative BASE+p90 gate used before channel sends."""
+    """Evaluate the legacy BASE control retained for audit and research."""
     result: Dict[str, Any] = {
         "version": CHANNEL_SIGNAL_FILTER_VERSION,
         "passed": False,
@@ -28688,29 +28764,6 @@ def evaluate_channel_signal_filter(
     return result
 
 
-def qualifies_for_premium_badge(
-    channel_signal_filter: Mapping[str, Any],
-) -> bool:
-    """Freeze the presentation-only Premium decision at signal publication."""
-    if not isinstance(channel_signal_filter, Mapping):
-        return False
-    if (
-        channel_signal_filter.get("version") != CHANNEL_SIGNAL_FILTER_VERSION
-        or channel_signal_filter.get("passed") is not True
-    ):
-        return False
-    try:
-        goals = float(channel_signal_filter.get("goals_at_snapshot"))
-    except (TypeError, ValueError):
-        return False
-    return bool(
-        math.isfinite(goals)
-        and goals >= 0.0
-        and goals.is_integer()
-        and int(goals) <= PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT
-    )
-
-
 def _build_signal_snapshot_data(
     collected: Dict[str, Any],
     prob_display: float,
@@ -28719,13 +28772,11 @@ def _build_signal_snapshot_data(
     prob_display_90: Optional[float] = None,
     is_admin_approved: bool = False,
     signal_route: str = "primary",
-    premium_badge: bool = False,
 ) -> Dict[str, Any]:
     fields = _extract_signal_format_fields(collected)
     return {
         "is_admin_approved": bool(is_admin_approved),
         "signal_route": "rescue" if str(signal_route).lower() == "rescue" else "primary",
-        "premium_badge": bool(premium_badge),
         "home": fields["home"],
         "away": fields["away"],
         "league_country_line": fields["league_country_line"],
@@ -28765,12 +28816,9 @@ def resolve_signal_header_title(
     *,
     is_admin_approved: bool = False,
     signal_route: str = "primary",
-    premium_badge: bool = False,
     saved_header_text: Optional[str] = None,
 ) -> str:
     """Resolve the immutable signal title for live and final renderers."""
-    if premium_badge:
-        return "🚨 Premium Сигнал"
     if is_admin_approved:
         return "🚨 Сигнал от админа"
 
@@ -28786,7 +28834,6 @@ def build_signal_header(snapshot_data: Dict[str, Any]) -> str:
     header_title = resolve_signal_header_title(
         is_admin_approved=bool(snapshot_data.get("is_admin_approved")),
         signal_route=str(snapshot_data.get("signal_route") or "primary"),
-        premium_badge=bool(snapshot_data.get("premium_badge")),
     )
     home = snapshot_data.get("home") or "Home"
     away = snapshot_data.get("away") or "Away"
@@ -28844,7 +28891,6 @@ def render_live_message(
     prob_display_90: Optional[float] = None,
     is_admin_approved: bool = False,
     signal_route: str = "primary",
-    premium_badge: bool = False,
 ) -> str:
     fields = _extract_signal_format_fields(current_data)
     signal_home = int(signal_score[0])
@@ -28863,7 +28909,6 @@ def render_live_message(
     title = resolve_signal_header_title(
         is_admin_approved=is_admin_approved,
         signal_route=signal_route,
-        premium_badge=premium_badge,
     )
     parts.append(title)
     parts.append("")
@@ -29016,7 +29061,6 @@ def render_live_main_text(
     prob_display_90: Optional[float] = None,
     is_admin_approved: bool = False,
     signal_route: str = "primary",
-    premium_badge: bool = False,
 ) -> str:
     return render_live_message(
         current_data=current_data,
@@ -29025,7 +29069,6 @@ def render_live_main_text(
         prob_display_90=prob_display_90,
         is_admin_approved=is_admin_approved,
         signal_route=signal_route,
-        premium_badge=premium_badge,
     )
 
 
@@ -29068,7 +29111,7 @@ def compose_signal_message(header_text: str, live_footer: str) -> str:
     return f"{header}\n\n{footer}"
 
 
-def format_signal_report_from_metrics(collected: Dict[str,Any], prob_display: float, initial_score: Tuple[int,int], extra_text: str="", prob_display_90: Optional[float]=None, match_id: Optional[int]=None, is_admin_approved: bool=False, signal_route: str="primary", premium_badge: bool=False) -> str:
+def format_signal_report_from_metrics(collected: Dict[str,Any], prob_display: float, initial_score: Tuple[int,int], extra_text: str="", prob_display_90: Optional[float]=None, match_id: Optional[int]=None, is_admin_approved: bool=False, signal_route: str="primary") -> str:
     header_text = render_live_message(
         current_data=collected,
         signal_score=initial_score,
@@ -29076,7 +29119,6 @@ def format_signal_report_from_metrics(collected: Dict[str,Any], prob_display: fl
         prob_display_90=prob_display_90,
         is_admin_approved=is_admin_approved,
         signal_route=signal_route,
-        premium_badge=premium_badge,
     )
     if extra_text:
         return compose_signal_message(header_text, extra_text)
@@ -30183,15 +30225,17 @@ def main_loop():
                             CHANNEL_SIGNAL_MIN_SEASON_CONTEXT_FACTOR,
                             CHANNEL_SIGNAL_FILTER_VERSION,
                         )
-                        wide_router_decision = route_publication_with_wide_research(
-                            fixture_id=fixture_id,
-                            minute=minute,
-                            fixture_metrics=fixture_metrics,
-                            probability_result=res_45,
-                            current_filter_allow=bool(
-                                channel_signal_filter["passed"]
-                            ),
-                            evidence_sink=market_decision_evidence,
+                        wide_router_decision = (
+                            route_publication_with_balanced_two_rule(
+                                fixture_id=fixture_id,
+                                minute=minute,
+                                fixture_metrics=fixture_metrics,
+                                probability_result=res_45,
+                                current_filter_allow=bool(
+                                    channel_signal_filter["passed"]
+                                ),
+                                evidence_sink=market_decision_evidence,
+                            )
                         )
                         res_45["wide_research_router"] = dict(
                             wide_router_decision
@@ -30200,17 +30244,15 @@ def main_loop():
                             wide_router_decision.get("allow")
                         )
                         if wide_router_decision.get("applied") is True:
-                            rule_path = (
-                                "wide_research_champion:"
-                                + str(
-                                    wide_router_decision.get("rule_id")
-                                    or "unknown"
-                                )
+                            rule_path = str(
+                                wide_router_decision.get("source")
+                                or BALANCED_TWO_RULE_PORTFOLIO_ID
                             )
                         logger.info(
-                            "[WIDE_RESEARCH_ROUTER] fixture_id=%s minute=%s "
+                            "[BALANCED_TWO_RULE] fixture_id=%s minute=%s "
                             "applied=%s allow=%s source=%s reason=%s "
-                            "rule_id=%s phase_id=%s current_filter_allow=%s",
+                            "rule_id=%s phase_id=%s current_filter_allow=%s "
+                            "passed_members=%s",
                             fixture_id,
                             minute,
                             wide_router_decision.get("applied"),
@@ -30220,6 +30262,7 @@ def main_loop():
                             wide_router_decision.get("rule_id"),
                             wide_router_decision.get("phase_id"),
                             channel_signal_filter.get("passed"),
+                            wide_router_decision.get("passed_members"),
                         )
                         market_decision_evidence = (
                             prepare_market_benchmark_evidence(
@@ -30251,11 +30294,7 @@ def main_loop():
                                     mark_state_dirty()
                             record_current_decision(
                                 "BLOCK",
-                                (
-                                    "wide-research-champion"
-                                    if wide_router_decision.get("applied") is True
-                                    else "channel-signal-filter"
-                                ),
+                                BALANCED_TWO_RULE_PORTFOLIO_ID,
                                 current_rule_path=rule_path,
                                 observation_created_at_utc=(
                                     publication_observed_at_utc
@@ -30299,28 +30338,6 @@ def main_loop():
                         # Display the actual next-15 horizon; the decision remain gate uses prob_to90.
                         prob_display = prob_next_15_decision
                         prob_display_90 = prob_to90_45
-                        premium_badge = qualifies_for_premium_badge(
-                            channel_signal_filter
-                        )
-                        res_45["premium_badge"] = bool(premium_badge)
-                        res_45["premium_badge_rule_version"] = (
-                            PREMIUM_BADGE_RULE_VERSION
-                            if premium_badge
-                            else None
-                        )
-                        logger.info(
-                            "[PREMIUM_BADGE] fixture_id=%s minute=%s eligible=%s "
-                            "base_filter_passed=%s goals_at_snapshot=%s "
-                            "max_goals_at_snapshot=%s rule_version=%s "
-                            "presentation_only=true",
-                            fixture_id,
-                            minute,
-                            premium_badge,
-                            channel_signal_filter.get("passed"),
-                            channel_signal_filter.get("goals_at_snapshot"),
-                            PREMIUM_BADGE_MAX_GOALS_AT_SNAPSHOT,
-                            PREMIUM_BADGE_RULE_VERSION,
-                        )
                         snapshot_data = _build_signal_snapshot_data(
                             collected=data,
                             prob_display=prob_display,
@@ -30329,7 +30346,6 @@ def main_loop():
                             prob_display_90=prob_display_90,
                             is_admin_approved=False,
                             signal_route=signal_route,
-                            premium_badge=premium_badge,
                         )
                         header_text = build_signal_header(snapshot_data)
                         msg = render_live_message(
@@ -30339,7 +30355,6 @@ def main_loop():
                             prob_display_90=prob_display_90,
                             is_admin_approved=False,
                             signal_route=signal_route,
-                            premium_badge=premium_badge,
                         )
                         analysis_decision_id = _decision_snapshot_id(
                             fixture_id,
@@ -30547,7 +30562,6 @@ def main_loop():
                                 legacy_prob_second_half_remain=prob_second_half_remain,
                                 signal_model="45_plus",
                                 signal_route=signal_route,
-                                premium_badge=premium_badge,
                                 selected_prob_to90_threshold=threshold_remain,
                                 threshold_source=threshold_info["source"],
                                 minute_bucket=threshold_info["minute_bucket"],

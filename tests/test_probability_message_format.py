@@ -59,20 +59,6 @@ def test_signal_header_from_75_uses_only_end_of_normal_time() -> None:
     assert "Гол до конца основного времени: 31%" in message
 
 
-def test_premium_badge_qualification_includes_exact_boundaries() -> None:
-    channel_filter = nanotest.evaluate_channel_signal_filter(
-        75.0,
-        1,
-        1,
-        reputation_base_prob_to90=73.5,
-        reputation_adjusted_prob_to90=75.0,
-        adjusted_intensity=0.55,
-        season_context_factor=1.02,
-    )
-
-    assert nanotest.qualifies_for_premium_badge(channel_filter)
-
-
 def test_channel_signal_filter_includes_exact_boundaries() -> None:
     result = nanotest.evaluate_channel_signal_filter(
         75.0,
@@ -182,88 +168,32 @@ def test_channel_signal_filter_is_fail_closed_for_invalid_input() -> None:
     )["passed"] is False
 
 
-def test_premium_badge_qualification_is_fail_closed() -> None:
-    qualifying_filter = nanotest.evaluate_channel_signal_filter(
-        75.0, 2, 0,
-        reputation_base_prob_to90=73.5,
-        reputation_adjusted_prob_to90=75.0,
-        adjusted_intensity=0.55,
-        season_context_factor=1.02,
-    )
-
-    assert nanotest.qualifies_for_premium_badge(qualifying_filter)
-    assert not nanotest.qualifies_for_premium_badge(
-        {**qualifying_filter, "goals_at_snapshot": 3}
-    )
-    assert not nanotest.qualifies_for_premium_badge(
-        {**qualifying_filter, "passed": False}
-    )
-    assert not nanotest.qualifies_for_premium_badge(
-        {**qualifying_filter, "version": "legacy"}
-    )
-    assert not nanotest.qualifies_for_premium_badge(
-        {**qualifying_filter, "goals_at_snapshot": None}
-    )
-
-
-def test_premium_badge_changes_only_signal_title() -> None:
-    ordinary = nanotest.render_live_message(
-        _live_data(48),
-        signal_score=(1, 0),
-        prob_display=44.0,
-        prob_display_90=80.0,
-    )
-    premium = nanotest.render_live_message(
-        _live_data(48),
-        signal_score=(1, 0),
-        prob_display=44.0,
-        prob_display_90=80.0,
-        premium_badge=True,
-    )
-
-    assert ordinary.startswith("🚨 Сигнал\n")
-    assert premium.startswith("🚨 Premium Сигнал\n")
-    assert premium.removeprefix("🚨 Premium") == ordinary.removeprefix("🚨")
-
-
-def test_new_premium_badge_has_priority_on_admin_route() -> None:
+def test_saved_legacy_premium_title_is_rendered_as_ordinary_signal() -> None:
     assert nanotest.resolve_signal_header_title(
-        is_admin_approved=True,
-        premium_badge=True,
-    ) == "🚨 Premium Сигнал"
+        saved_header_text="🚨 Premium Сигнал\n\nHome — Away"
+    ) == "🚨 Сигнал"
 
 
-def test_new_premium_rule_version_is_persisted_for_message_updates() -> None:
+def test_premium_badge_runtime_api_and_new_state_fields_are_removed() -> None:
     fixture_id = 987654320
+    assert not hasattr(nanotest, "qualifies_for_premium_badge")
     try:
         nanotest.save_signal_snapshot_state(
             match_id=fixture_id,
-            header_text="🚨 Premium Сигнал\n\nHome — Away",
+            header_text="🚨 Сигнал\n\nHome — Away",
             signal_score_home=1,
             signal_score_away=1,
             signal_minute=50,
             message_id=123,
             chat_id=456,
             prob_to90=75.0,
-            premium_badge=True,
         )
         with nanotest.state_lock:
             meta = dict(
                 nanotest.state["signal_snapshot_meta"][str(fixture_id)]
             )
-
-        assert meta["premium_badge"] is True
-        assert (
-            meta["premium_badge_rule_version"]
-            == nanotest.PREMIUM_BADGE_RULE_VERSION
-        )
-        assert nanotest.resolve_signal_header_title(
-            premium_badge=bool(
-                meta["premium_badge"]
-                and meta["premium_badge_rule_version"]
-                == nanotest.PREMIUM_BADGE_RULE_VERSION
-            )
-        ) == "🚨 Premium Сигнал"
+        assert "premium_badge" not in meta
+        assert "premium_badge_rule_version" not in meta
     finally:
         with nanotest.state_lock:
             nanotest.state.get("signal_snapshot_meta", {}).pop(
@@ -272,9 +202,3 @@ def test_new_premium_rule_version_is_persisted_for_message_updates() -> None:
             nanotest.state.get("signal_header_texts", {}).pop(
                 str(fixture_id), None
             )
-
-
-def test_saved_legacy_premium_title_is_not_recovered_without_new_rule() -> None:
-    assert nanotest.resolve_signal_header_title(
-        saved_header_text="🚨 Premium Сигнал\n\nHome — Away"
-    ) == "🚨 Сигнал"
