@@ -247,8 +247,8 @@ class DiscoveryConfig:
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
-        if int(self.top_n) > 20:
-            raise ValueError("top_n cannot exceed 20")
+        if int(self.top_n) > 32:
+            raise ValueError("top_n cannot exceed 32")
         depth_budgets = tuple(int(value) for value in self.depth_evaluation_budgets)
         if depth_budgets:
             if len(depth_budgets) != int(self.max_conjunction_size):
