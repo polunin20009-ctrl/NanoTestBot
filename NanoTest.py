@@ -960,7 +960,7 @@ WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS = max(
 WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES = max(
     1,
     min(
-        10,
+        32,
         int(os.environ.get("WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES", "10")),
     ),
 )

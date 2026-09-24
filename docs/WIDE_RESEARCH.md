@@ -279,7 +279,7 @@ The safety boundary is deliberately stronger than an environment toggle:
 | `WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC` | `2026-09-03T17:05:31+00:00` | Earliest boundary; each phase actually starts no earlier than its import time |
 | `WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY` | `true` | Run the isolated search automatically |
 | `WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS` | `604800` | Independent discovery cadence |
-| `WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES` | `10` | Bounded prospective candidate pool |
+| `WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES` | `10` | Prospective candidate pool; default 10, hard maximum 32 |
 | `WIDE_RESEARCH_FOUR_FACTOR_BEAM_WIDTH` | `32` | Search beam used at depths one through four |
 | `WIDE_RESEARCH_FOUR_FACTOR_EVALUATION_BUDGET` | `40000` | Maximum rule evaluations per run |
 | `WIDE_RESEARCH_FOUR_FACTOR_MIN_TRAIN_SUPPORT` | `60` | Minimum historical train fixtures |
