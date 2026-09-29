@@ -130,6 +130,7 @@ from wide_research.portfolio import (
     FrozenPortfolioSpec,
     balanced_two_rule_spec,
     evaluate_frozen_portfolio,
+    with_level_score,
 )
 from wide_research.rules import rule_manifest_from_dict
 from wide_research.store import WideResearchStore
@@ -1288,6 +1289,8 @@ WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES = max(
 # Immutable, research-only OR portfolios selected on 2026-09-20/21.  Their own
 # evidence starts at first runtime registration; historical results are metadata
 # only and are never imported into the prospective verdict.
+# exact-four-level-score is a later walk-forward cohort: registration keeps
+# its own start and does not join the 2026-09-19 book.
 ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS = _parse_env_bool(
     "ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS", False
 )
@@ -22882,6 +22885,16 @@ def _get_wide_research_frozen_portfolio_components() -> Tuple[
                     portfolio_id="market-season-plus-box-context",
                     version="v1",
                     members=(market_season_pace, box_context),
+                    terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
+                ),
+                FrozenPortfolioSpec(
+                    portfolio_id="exact-four-level-score",
+                    version="v1",
+                    members=(
+                        with_level_score(volume),
+                        with_level_score(total_shots),
+                        with_level_score(sot_volume),
+                    ),
                     terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
                 ),
             )
