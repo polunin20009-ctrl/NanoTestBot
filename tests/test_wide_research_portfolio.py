@@ -10,6 +10,7 @@ from wide_research.portfolio import (
     FrozenPortfolioSpec,
     balanced_two_rule_spec,
     evaluate_frozen_portfolio,
+    with_level_score,
 )
 from wide_research.store import WideResearchStore
 
@@ -165,3 +166,46 @@ def test_frozen_portfolio_registration_is_idempotent_and_horizon_is_fixed(
     assert len(first["claimed"]) == 1
     assert second["claimed"] == []
     assert store.metrics_for_phase(spec.phase_id)["total"] == 1
+
+
+def test_level_score_member_rejects_a_one_goal_gap() -> None:
+    parent = _member("wide-shot", 70.0)
+    derived = with_level_score(parent)
+    observed = datetime.now(UTC) + timedelta(seconds=1)
+    level = _snapshot(10, 80.0, observed)
+    leading = _snapshot(11, 80.0, observed)
+    leading["match"] = {"score_home": 1, "score_away": 0, "league_id": 7}
+    spec = FrozenPortfolioSpec("level", "v1", (derived,))
+
+    assert derived.manifest.rule_id == "wide-shot-level-score"
+    assert any(
+        clause.feature == "score.goal_difference_abs" and clause.op == "=="
+        for clause in derived.manifest.clauses
+    )
+    assert evaluate_frozen_portfolio(spec, level)["status"] == "PASS"
+    assert evaluate_frozen_portfolio(spec, leading)["status"] == "FAIL"
+
+
+def test_later_portfolio_keeps_its_own_walk_forward_start(tmp_path) -> None:
+    first = FrozenPortfolioSpec("first", "v1", (_member("early", 70.0),))
+    store = _store(tmp_path)
+    FrozenPortfolioLayer(store, (first,))
+    first_phase = store.list_phases(rule_id=first.rule_id)[0]
+    before_second = datetime.now(UTC)
+
+    second = FrozenPortfolioSpec("second", "v1", (_member("late", 70.0),))
+    layer = FrozenPortfolioLayer(store, (first, second))
+    second_phase = store.list_phases(rule_id=second.rule_id)[0]
+
+    assert store.list_phases(rule_id=first.rule_id)[0]["starts_at_utc"] == (
+        first_phase["starts_at_utc"]
+    )
+    assert second_phase["starts_at_utc"] > first_phase["starts_at_utc"]
+
+    historical = _snapshot(3, 90.0, before_second)
+    claimed = layer.process_snapshot(historical)["claimed"]
+    assert [row["portfolio_id"] for row in claimed] == ["first"]
+
+    live = _snapshot(4, 90.0, datetime.now(UTC) + timedelta(seconds=1))
+    claimed = layer.process_snapshot(live)["claimed"]
+    assert {row["portfolio_id"] for row in claimed} == {"first", "second"}

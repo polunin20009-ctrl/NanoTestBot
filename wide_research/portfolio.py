@@ -140,6 +140,33 @@ class FrozenPortfolioSpec:
 
 BALANCED_TWO_RULE_PORTFOLIO_ID = "balanced-two-rule"
 BALANCED_TWO_RULE_VERSION = "v1"
+EXACT_FOUR_LEVEL_SCORE_PORTFOLIO_ID = "exact-four-level-score"
+EXACT_FOUR_LEVEL_SCORE_VERSION = "v1"
+LEVEL_SCORE_CLAUSE = Clause("score.goal_difference_abs", "==", 0.0)
+
+
+def with_level_score(member: FrozenPortfolioMember) -> FrozenPortfolioMember:
+    """Copy a frozen member and require a level score at the snapshot.
+
+    The derived manifest is a new rule.  The source store hash still names the
+    unmodified parent so the extra clause cannot be confused with that parent.
+    """
+
+    manifest = member.manifest
+    derived = RuleManifest(
+        rule_id=f"{manifest.rule_id}-level-score",
+        version=manifest.version,
+        clauses=(*manifest.clauses, LEVEL_SCORE_CLAUSE),
+        universe=manifest.universe,
+        schema_version=manifest.schema_version,
+        semantics=manifest.semantics,
+        feature_schema_version=manifest.feature_schema_version,
+    )
+    return FrozenPortfolioMember(
+        source_profile=member.source_profile,
+        source_store_hash=member.source_store_hash,
+        manifest=derived,
+    )
 
 
 def balanced_two_rule_spec(*, terminal_horizon: int = 200) -> FrozenPortfolioSpec:
@@ -274,20 +301,17 @@ class FrozenPortfolioLayer(WideShadowLayer):
         identities = [spec.rule_id for spec in normalized]
         if len(identities) != len(set(identities)):
             raise ValueError("duplicate frozen portfolio identities")
-        existing_starts = {
-            str(row.get("starts_at_utc") or "")
+        stored_starts = {
+            str(row.get("rule_id") or ""): str(row.get("starts_at_utc") or "")
             for row in store.list_phases()
             if str(row.get("rule_id") or "") in identities
         }
-        existing_starts.discard("")
-        if len(existing_starts) > 1:
-            raise ValueError("frozen portfolios do not share one cohort start")
-        cohort_start = (
-            next(iter(existing_starts))
-            if existing_starts
-            else datetime.now(timezone.utc).isoformat()
-        )
+        # Portfolios created together share one registration instant.  A
+        # portfolio added later keeps its own walk-forward start and does not
+        # pull older cohorts forward or backward.
+        fresh_start = datetime.now(timezone.utc).isoformat()
         for spec in normalized:
+            cohort_start = stored_starts.get(spec.rule_id) or fresh_start
             store.register_rule_and_phase(
                 rule_id=spec.rule_id,
                 manifest=spec.manifest(),
