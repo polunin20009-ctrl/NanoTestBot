@@ -610,11 +610,10 @@ def test_automatic_champion_routes_through_validated_active_spec(
         rule_id="frozen-portfolio-mature-challenger-v1",
         phase_id="frozen-portfolio-mature-challenger-v1:prospective",
     )
-    selection = MagicMock(
-        spec=active,
-        generation=7,
-        pointer_updated_at_utc="2026-01-01T00:00:00+00:00",
-    )
+    selection = MagicMock()
+    selection.spec = active
+    selection.generation = 7
+    selection.pointer_updated_at_utc = "2026-01-01T00:00:00+00:00"
     selector = MagicMock()
     selector.active_selection.return_value = selection
     monkeypatch.setattr(bot, "ENABLE_AUTOMATIC_PUBLICATION_CHAMPION", True)
@@ -674,11 +673,10 @@ def test_automatic_champion_pointer_change_blocks_publication(
         rule_id="frozen-portfolio-mature-challenger-v1",
         phase_id="frozen-portfolio-mature-challenger-v1:prospective",
     )
-    selection = MagicMock(
-        spec=active,
-        generation=7,
-        pointer_updated_at_utc="2026-01-01T00:00:00+00:00",
-    )
+    selection = MagicMock()
+    selection.spec = active
+    selection.generation = 7
+    selection.pointer_updated_at_utc = "2026-01-01T00:00:00+00:00"
     selector = MagicMock()
     selector.active_selection.return_value = selection
     selector.confirm_selection.side_effect = RuntimeError("pointer changed")
