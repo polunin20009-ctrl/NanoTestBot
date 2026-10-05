@@ -24,9 +24,24 @@ from .schema import canonical_hash
 from .store import WideResearchStore
 
 
-AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v1"
+AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v2"
 AUTOMATIC_CHAMPION_POINTER = "automatic_publication_champion"
 AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION = 1
+
+
+class AutomaticChampionUnavailable(RuntimeError):
+    """Raised when no contract-valid publication champion is available."""
+
+
+@dataclass(frozen=True)
+class ActiveChampionSelection:
+    """One checksummed pointer generation used for a publication decision."""
+
+    spec: FrozenPortfolioSpec
+    generation: int
+    rule_id: str
+    phase_id: str
+    pointer_updated_at_utc: str
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -70,6 +85,7 @@ class AutomaticChampionPolicy:
     champion_min_tenure_days: float = 14.0
     degradation_window: int = 40
     degradation_rate: float = 0.75
+    degradation_recovery_rate: float = 0.80
 
     def __post_init__(self) -> None:
         probabilities = (
@@ -80,6 +96,7 @@ class AutomaticChampionPolicy:
             self.superiority_margin,
             self.superiority_probability,
             self.degradation_rate,
+            self.degradation_recovery_rate,
         )
         if any(
             not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
@@ -90,6 +107,10 @@ class AutomaticChampionPolicy:
             raise ValueError("credible lower probability must be in (0, 0.5)")
         if not 0.5 < self.superiority_probability < 1.0:
             raise ValueError("superiority probability must be in (0.5, 1)")
+        if self.degradation_recovery_rate < self.degradation_rate:
+            raise ValueError(
+                "degradation recovery rate must be at least degradation rate"
+            )
         if (
             not math.isfinite(self.prior_strength)
             or self.prior_strength <= 0.0
@@ -296,6 +317,8 @@ class AutomaticChampionController:
         active_since_utc: str,
         previous_rule_id: Optional[str],
         decision: Optional[Mapping[str, Any]] = None,
+        publication_suspended: bool = False,
+        suspension_reason: Optional[str] = None,
     ) -> dict[str, Any]:
         return {
             "schema_version": 1,
@@ -307,6 +330,10 @@ class AutomaticChampionController:
             "catalog": self.catalog,
             "catalog_hash": self.catalog_hash,
             "production_enabled": self.production_enabled,
+            "publication_suspended": bool(publication_suspended),
+            "suspension_reason": (
+                str(suspension_reason) if suspension_reason else None
+            ),
             "last_switch_decision": dict(decision or {}),
         }
 
@@ -349,6 +376,8 @@ class AutomaticChampionController:
     ) -> tuple[Mapping[str, Any], list[str]]:
         payload = _mapping(pointer.get("payload"))
         reasons: list[str] = []
+        if payload.get("schema_version") != 1:
+            reasons.append("pointer_schema_mismatch")
         if payload.get("policy_hash") != self.policy_hash:
             reasons.append("policy_hash_mismatch")
         if payload.get("catalog_hash") != self.catalog_hash:
@@ -357,34 +386,126 @@ class AutomaticChampionController:
             reasons.append("policy_manifest_mismatch")
         if _mapping(payload.get("catalog")) != self.catalog:
             reasons.append("catalog_manifest_mismatch")
-        rule_id = str(pointer.get("rule_id") or "")
-        if rule_id not in self.spec_by_rule:
-            reasons.append("active_candidate_missing")
-        return payload, reasons
-
-    def active_spec(self) -> FrozenPortfolioSpec:
-        """Return the validated active candidate, falling back to the baseline."""
-
-        try:
-            pointer = self.store.get_active_pointer(self.pointer_name)
-        except Exception:
-            return self.baseline
-        if pointer is None:
-            return self.baseline
-        payload = _mapping(pointer.get("payload"))
-        if payload.get("policy_hash") != self.policy_hash:
-            return self.baseline
-        stored_catalog = _mapping(payload.get("catalog"))
+        if payload.get("production_enabled") is not self.production_enabled:
+            reasons.append("production_mode_mismatch")
+        for field in ("selector_started_at_utc", "active_since_utc"):
+            try:
+                _parse_utc(payload.get(field))
+            except (TypeError, ValueError):
+                reasons.append(f"{field}_invalid")
         rule_id = str(pointer.get("rule_id") or "")
         spec = self.spec_by_rule.get(rule_id)
-        stored = _mapping(stored_catalog.get(rule_id))
+        if spec is None:
+            reasons.append("active_candidate_missing")
+            return payload, reasons
+        if str(pointer.get("phase_id") or "") != spec.phase_id:
+            reasons.append("active_phase_identity_mismatch")
+        stored = _mapping(_mapping(payload.get("catalog")).get(rule_id))
+        if stored != self.catalog.get(rule_id):
+            reasons.append("active_catalog_entry_mismatch")
+        phase = self._phases().get(rule_id)
+        if phase is None:
+            reasons.append("active_phase_missing")
+        else:
+            if str(phase.get("phase_id") or "") != spec.phase_id:
+                reasons.append("registered_phase_identity_mismatch")
+            if str(phase.get("status") or "") != "active":
+                reasons.append("active_phase_not_active")
+        return payload, reasons
+
+    def active_selection(self) -> ActiveChampionSelection:
+        """Return one validated pointer generation or fail publication closed."""
+
+        pointer = self.store.get_active_pointer(self.pointer_name)
+        if pointer is None:
+            raise AutomaticChampionUnavailable(
+                "automatic champion pointer is missing"
+            )
+        payload, reasons = self._validate_pointer(pointer)
+        if reasons:
+            raise AutomaticChampionUnavailable(
+                "automatic champion pointer is invalid: " + ",".join(reasons)
+            )
+        if bool(payload.get("publication_suspended")):
+            reason = str(
+                payload.get("suspension_reason") or "champion_degraded"
+            )
+            raise AutomaticChampionUnavailable(
+                "automatic champion publication is suspended: " + reason
+            )
+        rule_id = str(pointer.get("rule_id") or "")
+        spec = self.spec_by_rule[rule_id]
+        return ActiveChampionSelection(
+            spec=spec,
+            generation=int(pointer["generation"]),
+            rule_id=rule_id,
+            phase_id=str(pointer["phase_id"]),
+            pointer_updated_at_utc=str(pointer["updated_at_utc"]),
+        )
+
+    def confirm_selection(
+        self, selection: ActiveChampionSelection
+    ) -> ActiveChampionSelection:
+        """Linearize evaluation against a still-current pointer generation."""
+
+        current = self.active_selection()
         if (
-            spec is None
-            or stored.get("portfolio_hash")
-            != spec.manifest()["portfolio_hash"]
+            current.generation != selection.generation
+            or current.rule_id != selection.rule_id
+            or current.phase_id != selection.phase_id
         ):
-            return self.baseline
-        return spec
+            raise AutomaticChampionUnavailable(
+                "automatic champion changed during publication evaluation"
+            )
+        return current
+
+    def active_spec(self) -> FrozenPortfolioSpec:
+        """Return the validated active candidate or fail publication closed."""
+
+        return self.active_selection().spec
+
+    def _refresh_production_mode(
+        self,
+        pointer: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> Mapping[str, Any]:
+        """Authorize a staged apply-mode change without resetting evidence."""
+
+        now_text = _utc_iso(now)
+        metadata = self._pointer_metadata(
+            selector_started_at_utc=_utc_iso(
+                _parse_utc(payload.get("selector_started_at_utc"))
+            ),
+            active_since_utc=_utc_iso(
+                _parse_utc(payload.get("active_since_utc"))
+            ),
+            previous_rule_id=(
+                str(payload.get("previous_rule_id"))
+                if payload.get("previous_rule_id")
+                else None
+            ),
+            decision={
+                "reason": "production_mode_changed",
+                "production_enabled": self.production_enabled,
+            },
+            publication_suspended=bool(
+                payload.get("publication_suspended")
+            ),
+            suspension_reason=(
+                str(payload.get("suspension_reason"))
+                if payload.get("suspension_reason")
+                else None
+            ),
+        )
+        return self.store.set_active_pointer(
+            self.pointer_name,
+            phase_id=str(pointer["phase_id"]),
+            expected_generation=int(pointer["generation"]),
+            metadata=metadata,
+            updated_at_utc=now_text,
+        )
 
     def _metrics(
         self,
@@ -490,6 +611,11 @@ class AutomaticChampionController:
         if pointer is None:
             pointer = self._initialize_pointer(now)
         payload, contract_reasons = self._validate_pointer(pointer)
+        if contract_reasons == ["production_mode_mismatch"]:
+            pointer = self._refresh_production_mode(
+                pointer, payload, now=now
+            )
+            payload, contract_reasons = self._validate_pointer(pointer)
         selector_started = _parse_utc(payload.get("selector_started_at_utc"))
         active_since = _parse_utc(payload.get("active_since_utc"))
         active_rule_id = str(pointer.get("rule_id") or "")
@@ -630,13 +756,63 @@ class AutomaticChampionController:
             )
         )
         recommended = eligible[0] if eligible else None
+        active_evaluation = next(
+            (
+                row
+                for row in evaluations
+                if row.get("rule_id") == active_rule_id
+            ),
+            {},
+        )
+        active_metrics_before = _mapping(active_evaluation.get("metrics"))
+        degradation_detected = bool(
+            active_metrics_before.get("degraded")
+        )
+        degradation_fallback = bool(
+            degradation_detected
+            and active_rule_id != self.baseline.rule_id
+            and not contract_reasons
+        )
+        if degradation_fallback:
+            baseline_evaluation = next(
+                (
+                    row
+                    for row in evaluations
+                    if row.get("rule_id") == self.baseline.rule_id
+                ),
+                None,
+            )
+            if baseline_evaluation is None:
+                contract_reasons.append("baseline_evaluation_missing")
+                recommended = None
+                degradation_fallback = False
+            else:
+                recommended = {
+                    **baseline_evaluation,
+                    "eligible": True,
+                    "reasons": ["degraded_champion_fallback"],
+                }
+
+        was_suspended = bool(payload.get("publication_suspended"))
+        active_recovered = bool(
+            int(active_metrics_before.get("recent_resolved") or 0)
+            >= self.policy.degradation_window
+            and float(active_metrics_before.get("recent_hit_rate") or 0.0)
+            >= self.policy.degradation_recovery_rate
+        )
         switched = False
+        switch_reason: Optional[str] = None
         previous_rule_id: Optional[str] = None
         if recommended is not None and self.production_enabled:
             previous_rule_id = active_rule_id
             now_text = _utc_iso(now)
+            switch_reason = (
+                "degraded_champion_fallback"
+                if degradation_fallback
+                else "prospective_challenger_superior"
+            )
             decision = {
-                "reason": "prospective_challenger_superior",
+                "reason": switch_reason,
                 "from_rule_id": active_rule_id,
                 "to_rule_id": recommended["rule_id"],
                 "comparison_started_at_utc": _mapping(
@@ -650,11 +826,22 @@ class AutomaticChampionController:
                 ),
                 "required_superiority_probability": adjusted_probability,
             }
+            target_degraded = bool(
+                _mapping(recommended.get("metrics")).get("degraded")
+            )
             metadata = self._pointer_metadata(
                 selector_started_at_utc=_utc_iso(selector_started),
                 active_since_utc=now_text,
                 previous_rule_id=active_rule_id,
                 decision=decision,
+                publication_suspended=bool(
+                    degradation_fallback and target_degraded
+                ),
+                suspension_reason=(
+                    "baseline_degraded"
+                    if degradation_fallback and target_degraded
+                    else None
+                ),
             )
             transaction = self.store.swap_active_pointer(
                 self.pointer_name,
@@ -668,30 +855,127 @@ class AutomaticChampionController:
             active_rule_id = str(pointer["rule_id"])
             switched = True
 
+        suspension_changed = False
+        if (
+            not switched
+            and self.production_enabled
+            and not contract_reasons
+            and active_rule_id == self.baseline.rule_id
+        ):
+            target_suspended = was_suspended
+            suspension_reason = (
+                str(payload.get("suspension_reason"))
+                if payload.get("suspension_reason")
+                else None
+            )
+            suspension_decision: Optional[dict[str, Any]] = None
+            if degradation_detected and not was_suspended:
+                target_suspended = True
+                suspension_reason = "baseline_degraded"
+                suspension_decision = {
+                    "reason": "baseline_degraded_publication_suspended",
+                    "rule_id": active_rule_id,
+                    "recent_resolved": active_metrics_before.get(
+                        "recent_resolved"
+                    ),
+                    "recent_hit_rate": active_metrics_before.get(
+                        "recent_hit_rate"
+                    ),
+                }
+            elif was_suspended and active_recovered:
+                target_suspended = False
+                suspension_reason = None
+                suspension_decision = {
+                    "reason": "baseline_recovered_publication_resumed",
+                    "rule_id": active_rule_id,
+                    "recent_resolved": active_metrics_before.get(
+                        "recent_resolved"
+                    ),
+                    "recent_hit_rate": active_metrics_before.get(
+                        "recent_hit_rate"
+                    ),
+                }
+            if suspension_decision is not None:
+                metadata = self._pointer_metadata(
+                    selector_started_at_utc=_utc_iso(selector_started),
+                    active_since_utc=_utc_iso(active_since),
+                    previous_rule_id=(
+                        str(payload.get("previous_rule_id"))
+                        if payload.get("previous_rule_id")
+                        else None
+                    ),
+                    decision=suspension_decision,
+                    publication_suspended=target_suspended,
+                    suspension_reason=suspension_reason,
+                )
+                pointer = self.store.set_active_pointer(
+                    self.pointer_name,
+                    phase_id=active_phase_id,
+                    expected_generation=int(pointer["generation"]),
+                    metadata=metadata,
+                    updated_at_utc=_utc_iso(now),
+                )
+                payload = _mapping(pointer.get("payload"))
+                suspension_changed = True
+
+        current_active_rule_id = str(pointer.get("rule_id") or "")
+        current_evaluation = next(
+            (
+                row
+                for row in evaluations
+                if row.get("rule_id") == current_active_rule_id
+            ),
+            {},
+        )
+        current_metrics = _mapping(current_evaluation.get("metrics"))
+        publication_suspended = bool(
+            _mapping(pointer.get("payload")).get("publication_suspended")
+        )
+        reported_active_since = _parse_utc(
+            _mapping(pointer.get("payload")).get("active_since_utc")
+        )
+        reported_tenure_days = max(
+            0.0, (now - reported_active_since).total_seconds() / 86400.0
+        )
+
         result = {
             "schema_version": AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION,
             "generated_at_utc": _utc_iso(now),
-            "status": "blocked" if contract_reasons else "ok",
+            "status": (
+                "blocked"
+                if contract_reasons
+                else "suspended"
+                if publication_suspended
+                else "degraded"
+                if bool(current_metrics.get("degraded"))
+                else "ok"
+            ),
             "production_enabled": self.production_enabled,
             "policy_hash": self.policy_hash,
             "catalog_hash": self.catalog_hash,
             "selector_started_at_utc": _utc_iso(selector_started),
-            "active_rule_id": active_rule_id,
+            "active_rule_id": current_active_rule_id,
             "active_portfolio_id": self.spec_by_rule.get(
-                active_rule_id, self.baseline
+                current_active_rule_id, self.baseline
             ).portfolio_id,
             "active_since_utc": (
                 str(_mapping(pointer.get("payload")).get("active_since_utc"))
             ),
-            "active_tenure_days": tenure_days,
-            "active_degraded": next(
-                (
-                    bool(_mapping(row.get("metrics")).get("degraded"))
-                    for row in evaluations
-                    if row.get("rule_id") == str(pointer.get("rule_id") or "")
-                ),
-                False,
+            "active_tenure_days": reported_tenure_days,
+            "active_degraded": bool(current_metrics.get("degraded")),
+            "degradation_detected_rule_id": (
+                str(active_evaluation.get("rule_id"))
+                if degradation_detected
+                else None
             ),
+            "degradation_fallback": bool(
+                switched and degradation_fallback
+            ),
+            "publication_suspended": publication_suspended,
+            "suspension_reason": _mapping(pointer.get("payload")).get(
+                "suspension_reason"
+            ),
+            "suspension_changed": suspension_changed,
             "contract_reasons": contract_reasons,
             "candidate_family_count": family_count,
             "recommended_rule_id": (
@@ -701,6 +985,7 @@ class AutomaticChampionController:
                 str(recommended["portfolio_id"]) if recommended else None
             ),
             "switched": switched,
+            "switch_reason": switch_reason,
             "previous_rule_id": previous_rule_id,
             "evaluations": evaluations,
         }
@@ -750,11 +1035,13 @@ def write_champion_report_atomic(
 
 
 __all__ = [
+    "ActiveChampionSelection",
     "AUTOMATIC_CHAMPION_POINTER",
     "AUTOMATIC_CHAMPION_POLICY_VERSION",
     "AutomaticChampionController",
     "AutomaticChampionLayer",
     "AutomaticChampionPolicy",
+    "AutomaticChampionUnavailable",
     "posterior_summary",
     "superiority_probability",
     "write_champion_report_atomic",

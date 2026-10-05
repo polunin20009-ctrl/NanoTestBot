@@ -610,8 +610,13 @@ def test_automatic_champion_routes_through_validated_active_spec(
         rule_id="frozen-portfolio-mature-challenger-v1",
         phase_id="frozen-portfolio-mature-challenger-v1:prospective",
     )
+    selection = MagicMock(
+        spec=active,
+        generation=7,
+        pointer_updated_at_utc="2026-01-01T00:00:00+00:00",
+    )
     selector = MagicMock()
-    selector.active_spec.return_value = active
+    selector.active_selection.return_value = selection
     monkeypatch.setattr(bot, "ENABLE_AUTOMATIC_PUBLICATION_CHAMPION", True)
     monkeypatch.setattr(
         bot, "AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY", True
@@ -633,6 +638,118 @@ def test_automatic_champion_routes_through_validated_active_spec(
     assert decision["allow"] is True
     assert decision["source"] == "mature-challenger"
     assert decision["automatic_champion_applied"] is True
+    assert decision["generation"] == 7
+    selector.confirm_selection.assert_called_once_with(selection)
+
+
+def test_automatic_champion_pointer_change_blocks_publication(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: {
+            "observation_id": "1:50:WIDE_ROUTER:v3",
+            "created_at_utc": "2026-01-01T00:00:00+00:00",
+            "market_research": {},
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_build_shadow_candidate_prediction_record",
+        lambda observation, rolling: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "evaluate_frozen_portfolio",
+        lambda *args, **kwargs: {
+            "reason": "pass",
+            "portfolio_hash": "challenger-hash",
+            "passed_members": ["challenger-member"],
+            "members": [],
+        },
+    )
+    active = MagicMock(
+        portfolio_id="mature-challenger",
+        rule_id="frozen-portfolio-mature-challenger-v1",
+        phase_id="frozen-portfolio-mature-challenger-v1:prospective",
+    )
+    selection = MagicMock(
+        spec=active,
+        generation=7,
+        pointer_updated_at_utc="2026-01-01T00:00:00+00:00",
+    )
+    selector = MagicMock()
+    selector.active_selection.return_value = selection
+    selector.confirm_selection.side_effect = RuntimeError("pointer changed")
+    monkeypatch.setattr(bot, "ENABLE_AUTOMATIC_PUBLICATION_CHAMPION", True)
+    monkeypatch.setattr(
+        bot, "AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY", True
+    )
+    monkeypatch.setattr(
+        bot,
+        "_get_automatic_publication_champion_components",
+        lambda: (MagicMock(), MagicMock(), selector),
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={},
+        current_filter_allow=True,
+    )
+
+    assert decision["applied"] is True
+    assert decision["allow"] is False
+    assert decision["reason"] == "evaluation_error"
+
+
+def test_report_only_automatic_champion_keeps_baseline_routing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: {
+            "observation_id": "1:50:WIDE_ROUTER:v3",
+            "created_at_utc": "2026-01-01T00:00:00+00:00",
+            "market_research": {},
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_build_shadow_candidate_prediction_record",
+        lambda observation, rolling: None,
+    )
+    evaluated = {}
+
+    def evaluate(spec, *args, **kwargs):
+        evaluated["portfolio_id"] = spec.portfolio_id
+        return {
+            "reason": "pass",
+            "portfolio_hash": "baseline-hash",
+            "passed_members": ["baseline-member"],
+            "members": [],
+        }
+
+    monkeypatch.setattr(bot, "evaluate_frozen_portfolio", evaluate)
+    monkeypatch.setattr(bot, "ENABLE_AUTOMATIC_PUBLICATION_CHAMPION", True)
+    monkeypatch.setattr(
+        bot, "AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY", False
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={},
+        current_filter_allow=False,
+    )
+
+    assert evaluated["portfolio_id"] == bot.BALANCED_TWO_RULE_PORTFOLIO_ID
+    assert decision["automatic_champion_applied"] is False
+    assert decision["generation"] is None
 
 
 def test_balanced_two_rule_blocks_even_when_base_filter_passed(monkeypatch) -> None:

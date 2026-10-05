@@ -1342,20 +1342,33 @@ AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES = max(
 )
 AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES = {
     "balanced-two-rule": "balanced-core",
-    "balanced-plus-total-shots": "balanced-shot-volume",
-    "balanced-plus-sot-volume": "balanced-shot-volume",
+    "broad-three-rule": "balanced-expanded-volume",
+    "balanced-plus-compact-volume": "balanced-expanded-volume",
+    "balanced-plus-total-shots": "balanced-expanded-volume",
+    "balanced-plus-sot-volume": "balanced-expanded-volume",
+    "market-pressure-plus-compact-volume": "market-pressure-shot-volume",
     "market-pressure-plus-volume": "market-pressure-shot-volume",
     "market-pressure-plus-total-shots": "market-pressure-shot-volume",
     "market-pressure-plus-sot-portfolio": "market-pressure-shot-volume",
+    "market-pressure-compact-volume-four": "market-pressure-shot-volume",
+    "asymmetry-plus-volume": "asymmetry-shot-volume",
+    "market-pressure-compact-box-context": "market-pressure-box-context",
     "market-season-plus-volume": "market-season-shot-volume",
     "market-season-plus-total-shots": "market-season-shot-volume",
     "market-season-plus-sot-portfolio": "market-season-shot-volume",
+    "market-season-compact-box-context": "market-season-box-context",
+    "market-season-plus-box-context": "market-season-box-context",
     "market-pressure-plus-box-context": "market-pressure-box-context",
     "market-pressure-box-context-strict": "market-pressure-box-context",
     "market-pressure-box-context-game-state": "market-pressure-box-context",
+    "exact-four-level-score": "exact-four-shot-tempo",
     "exact-four-volume-only": "exact-four-shot-tempo",
     "exact-four-total-shots-only": "exact-four-shot-tempo",
     "exact-four-sot-volume-only": "exact-four-shot-tempo",
+    "exact-four-box-context-only": "exact-four-box-context",
+    "market-pressure-only": "market-pressure-core",
+    "asymmetry-only": "asymmetry-core",
+    "market-season-pace-only": "market-season-core",
 }
 WIDE_RESEARCH_FROZEN_MEMBER_REFS = {
     "four_factor_volume": (
@@ -15892,7 +15905,21 @@ def build_decision_snapshot(
         wide_research_router.get("applied") is True
         and wide_research_router.get("source") == "wide_research_champion"
     )
-    if wide_research_applied:
+    automatic_champion_applied = bool(
+        wide_research_router.get("applied") is True
+        and wide_research_router.get("automatic_champion_applied") is True
+    )
+    balanced_two_rule_applied = bool(
+        wide_research_router.get("applied") is True
+        and wide_research_router.get("source")
+        == BALANCED_TWO_RULE_PORTFOLIO_ID
+    )
+    publication_champion_applied = bool(
+        wide_research_applied
+        or automatic_champion_applied
+        or balanced_two_rule_applied
+    )
+    if publication_champion_applied:
         active_publication_allow = bool(
             publication_context_passed
             and wide_research_router.get("allow") is True
@@ -15902,7 +15929,11 @@ def build_decision_snapshot(
     )
     publication_policy = {
         "name": (
-            "wide_research_champion"
+            "automatic_publication_champion"
+            if automatic_champion_applied
+            else "balanced_two_rule"
+            if balanced_two_rule_applied
+            else "wide_research_champion"
             if wide_research_applied
             else "base_p90_75_channel_gate"
         ),
@@ -15914,7 +15945,7 @@ def build_decision_snapshot(
         "publication_allow": active_publication_allow,
         "readiness_policy": "snapshot_integrity",
         "pre_send_validation_required": True,
-        "channel_signal_filter_required": not wide_research_applied,
+        "channel_signal_filter_required": not publication_champion_applied,
         "next15_probability_required": False,
         "dynamic_to90_threshold_required": False,
         "live_gate_required": False,
@@ -15923,7 +15954,7 @@ def build_decision_snapshot(
         "score_limit_required_for_send": False,
         "score_limit_presentation_only": True,
     }
-    if wide_research_applied:
+    if publication_champion_applied:
         publication_policy.update(
             {
                 "wide_research_router_applied": True,
@@ -15932,6 +15963,10 @@ def build_decision_snapshot(
                 "wide_research_generation": wide_research_router.get(
                     "generation"
                 ),
+                "publication_champion_source": wide_research_router.get(
+                    "source"
+                ),
+                "automatic_champion_applied": automatic_champion_applied,
             }
         )
 
@@ -16047,12 +16082,12 @@ def build_decision_snapshot(
             "other_hard_gates_passed": other_hard_gates_passed,
             "publication_context_passed": publication_context_passed,
             "active_publication_allow": active_publication_allow,
-            "channel_signal_filter_required": not wide_research_applied,
+            "channel_signal_filter_required": not publication_champion_applied,
             "channel_signal_filter_passed": channel_signal_filter_passed,
-            "wide_research_router_applied": wide_research_applied,
+            "wide_research_router_applied": publication_champion_applied,
             "wide_research_router_passed": (
                 bool(wide_research_router.get("allow"))
-                if wide_research_applied
+                if publication_champion_applied
                 else None
             ),
             "live_gate_required": live_gate_required,
@@ -23067,7 +23102,17 @@ def _automatic_publication_champion_specs() -> Tuple[
             members=(source("wide-024ee3811fbe580cac5e"),),
         ),
     )
-    return base_specs + singletons
+    specs = base_specs + singletons
+    portfolio_ids = {spec.portfolio_id for spec in specs}
+    configured_ids = set(AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES)
+    if portfolio_ids != configured_ids:
+        missing = sorted(portfolio_ids - configured_ids)
+        unknown = sorted(configured_ids - portfolio_ids)
+        raise ValueError(
+            "automatic champion family catalog mismatch: "
+            f"missing={missing} unknown={unknown}"
+        )
+    return specs
 
 
 def _get_automatic_publication_champion_components() -> Tuple[
@@ -23715,13 +23760,19 @@ def route_publication_with_balanced_two_rule(
             terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON
         )
         automatic_champion_applied = False
+        automatic_champion_selection = None
+        automatic_champion_controller = None
         if (
             ENABLE_AUTOMATIC_PUBLICATION_CHAMPION
             and AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY
         ):
-            spec = _get_automatic_publication_champion_components()[
-                2
-            ].active_spec()
+            automatic_champion_controller = (
+                _get_automatic_publication_champion_components()[2]
+            )
+            automatic_champion_selection = (
+                automatic_champion_controller.active_selection()
+            )
+            spec = automatic_champion_selection.spec
             automatic_champion_applied = True
         evaluation = evaluate_frozen_portfolio(
             spec,
@@ -23732,6 +23783,13 @@ def route_publication_with_balanced_two_rule(
                 SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
             ),
         )
+        if (
+            automatic_champion_controller is not None
+            and automatic_champion_selection is not None
+        ):
+            automatic_champion_controller.confirm_selection(
+                automatic_champion_selection
+            )
         passed_members = list(evaluation.get("passed_members") or [])
         return {
             "applied": True,
@@ -23740,6 +23798,16 @@ def route_publication_with_balanced_two_rule(
             "reason": str(evaluation.get("reason") or "no_member_passed"),
             "rule_id": spec.rule_id,
             "automatic_champion_applied": automatic_champion_applied,
+            "generation": (
+                automatic_champion_selection.generation
+                if automatic_champion_selection is not None
+                else None
+            ),
+            "pointer_updated_at_utc": (
+                automatic_champion_selection.pointer_updated_at_utc
+                if automatic_champion_selection is not None
+                else None
+            ),
             "phase_id": spec.phase_id,
             "portfolio_hash": evaluation.get("portfolio_hash"),
             "current_filter_allow": bool(current_filter_allow),

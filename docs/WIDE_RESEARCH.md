@@ -231,8 +231,17 @@ share one family and cannot cause threshold churn.
 recommendation report. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY`
 permits an eligible recommendation to swap the active pointer. Demotion,
 promotion, lifecycle audit events, and the checksummed pointer update happen
-in one SQLite transaction. A changed policy/catalog, invalid pointer, or
-evaluation error retains or falls back to `balanced-two-rule`.
+in one SQLite transaction. After a switch, a champion below 75% over its last
+40 resolved triggers is atomically returned to `balanced-two-rule`. If the
+baseline itself has the same sustained degradation, publication is suspended;
+it resumes only after its rolling rate reaches 80% or a fully eligible
+challenger replaces it.
+
+A changed policy/catalog, invalid or suspended pointer, pointer-generation
+change during evaluation, or evaluation error blocks publication. It never
+silently substitutes a different rule. Switching the staged production flag
+is the one contract change that is re-authorized automatically without
+discarding already prospective evidence.
 
 The manifest cache never accepts a lower generation or a corrupt update. While
 the process is alive it also rejects different content under the same

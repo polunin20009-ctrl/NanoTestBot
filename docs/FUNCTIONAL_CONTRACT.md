@@ -278,11 +278,16 @@ controller only writes recommendations.
   family-count-adjusted posterior probability (base 95%);
 - both rules are compared from the same later timestamp, and a champion has a
   14-day minimum tenure;
-- the SQLite phase swap and checksummed pointer update are one transaction.
+- the SQLite phase swap and checksummed pointer update are one transaction;
+- a non-baseline champion below 75% over its last 40 resolved triggers returns
+  atomically to `balanced-two-rule`;
+- the baseline at the same degradation level suspends publication until its
+  rolling rate reaches 80% or a fully eligible challenger takes over;
+- the router validates the same pointer generation before and after evaluation.
 
 The current decision is written atomically to
 `stats/automatic_publication_champion.json`. Contract or pointer corruption
-retains/falls back to `balanced-two-rule`; it cannot broaden publication.
+fails closed and blocks publication; it never silently evaluates another rule.
 
 ### 4.9 Research health
 

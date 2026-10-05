@@ -10,6 +10,7 @@ from wide_research.automatic_champion import (
     AutomaticChampionController,
     AutomaticChampionLayer,
     AutomaticChampionPolicy,
+    AutomaticChampionUnavailable,
 )
 from wide_research.portfolio import (
     FrozenPortfolioMember,
@@ -169,6 +170,62 @@ def test_short_perfect_run_cannot_replace_baseline(tmp_path) -> None:
     assert result["switched"] is False
 
 
+def test_default_policy_promotes_only_after_full_prospective_gates(
+    tmp_path,
+) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    layer = AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    controller = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+    )
+    controller.reconcile(now_utc=started.isoformat())
+
+    for day in range(20):
+        for slot, (probability, won) in enumerate(
+            (
+                (90.0, True),
+                (50.0, False),
+                (90.0, True),
+                (50.0, False),
+            )
+        ):
+            observed = started + timedelta(
+                days=day + 1,
+                hours=slot,
+            )
+            snapshot = _snapshot(
+                1000 + day * 4 + slot,
+                probability,
+                observed,
+                league_id=(day % 8) + 1,
+            )
+            layer.process_snapshot(snapshot)
+            _resolve(layer, snapshot, observed, won=won)
+
+    result = controller.reconcile(
+        now_utc=(started + timedelta(days=22)).isoformat()
+    )
+    challenger_row = next(
+        row
+        for row in result["evaluations"]
+        if row["portfolio_id"] == "challenger"
+    )
+
+    assert challenger_row["metrics"]["resolved"] == 40
+    assert challenger_row["eligible"] is True
+    assert result["switched"] is True
+    assert result["active_portfolio_id"] == "challenger"
+
+
 def test_strong_mature_challenger_swaps_pointer_atomically(tmp_path) -> None:
     baseline = _spec("baseline", 0.0)
     challenger = _spec("challenger", 80.0)
@@ -306,7 +363,8 @@ def test_policy_change_blocks_switch_but_keeps_last_valid_champion(tmp_path) -> 
 
     assert result["status"] == "blocked"
     assert "policy_hash_mismatch" in result["contract_reasons"]
-    assert changed.active_spec().portfolio_id == "baseline"
+    with pytest.raises(AutomaticChampionUnavailable):
+        changed.active_spec()
 
 
 def test_invalid_atomic_replacement_rolls_back_everything(tmp_path) -> None:
@@ -344,3 +402,219 @@ def test_invalid_atomic_replacement_rolls_back_everything(tmp_path) -> None:
     phases = {row["rule_id"]: row for row in store.list_phases()}
     assert phases[baseline.rule_id]["status"] == "active"
     assert phases[challenger.rule_id]["status"] == "retired"
+
+
+def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    layer = AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    controller = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+        policy=_permissive_policy(),
+    )
+    controller.reconcile(now_utc=started.isoformat())
+
+    for index, (probability, won) in enumerate(
+        (
+            (90.0, True),
+            (50.0, False),
+            (90.0, True),
+            (50.0, False),
+            (90.0, True),
+            (90.0, True),
+        )
+    ):
+        observed = started + timedelta(days=index + 1)
+        snapshot = _snapshot(
+            400 + index,
+            probability,
+            observed,
+            league_id=(index % 2) + 1,
+        )
+        layer.process_snapshot(snapshot)
+        _resolve(layer, snapshot, observed, won=won)
+
+    promoted = controller.reconcile(
+        now_utc=(started + timedelta(days=8)).isoformat()
+    )
+    assert promoted["active_portfolio_id"] == "challenger"
+
+    for index, won in enumerate((False, False, False, True)):
+        observed = started + timedelta(days=9 + index)
+        snapshot = _snapshot(
+            500 + index,
+            90.0,
+            observed,
+            league_id=(index % 2) + 1,
+        )
+        layer.process_snapshot(snapshot)
+        _resolve(layer, snapshot, observed, won=won)
+        baseline_only_observed = observed + timedelta(hours=1)
+        baseline_only = _snapshot(
+            550 + index,
+            50.0,
+            baseline_only_observed,
+            league_id=(index % 2) + 1,
+        )
+        layer.process_snapshot(baseline_only)
+        _resolve(
+            layer,
+            baseline_only,
+            baseline_only_observed,
+            won=True,
+        )
+
+    recovered = controller.reconcile(
+        now_utc=(started + timedelta(days=14)).isoformat()
+    )
+
+    assert recovered["switched"] is True
+    assert recovered["switch_reason"] == "degraded_champion_fallback"
+    assert recovered["degradation_fallback"] is True
+    assert recovered["active_portfolio_id"] == "baseline"
+    assert recovered["publication_suspended"] is False
+    pointer = store.get_active_pointer("automatic_publication_champion")
+    assert pointer["rule_id"] == baseline.rule_id
+    assert pointer["payload"]["publication_suspended"] is False
+    assert controller.active_selection().spec.portfolio_id == "baseline"
+
+
+def test_degraded_baseline_suspends_until_hysteresis_recovery(tmp_path) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    layer = AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    policy = AutomaticChampionPolicy(
+        **{
+            **_permissive_policy().manifest(),
+            "degradation_recovery_rate": 0.75,
+        }
+    )
+    controller = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+        policy=policy,
+    )
+    controller.reconcile(now_utc=started.isoformat())
+
+    for index, won in enumerate((False, False, False, True)):
+        observed = started + timedelta(days=index + 1)
+        snapshot = _snapshot(
+            600 + index,
+            50.0,
+            observed,
+            league_id=(index % 2) + 1,
+        )
+        layer.process_snapshot(snapshot)
+        _resolve(layer, snapshot, observed, won=won)
+
+    suspended = controller.reconcile(
+        now_utc=(started + timedelta(days=6)).isoformat()
+    )
+    assert suspended["status"] == "suspended"
+    assert suspended["publication_suspended"] is True
+    assert suspended["suspension_changed"] is True
+    with pytest.raises(AutomaticChampionUnavailable):
+        controller.active_spec()
+
+    for index in range(4):
+        observed = started + timedelta(days=7 + index)
+        snapshot = _snapshot(
+            700 + index,
+            50.0,
+            observed,
+            league_id=(index % 2) + 1,
+        )
+        layer.process_snapshot(snapshot)
+        _resolve(layer, snapshot, observed, won=True)
+
+    resumed = controller.reconcile(
+        now_utc=(started + timedelta(days=12)).isoformat()
+    )
+    assert resumed["status"] == "ok"
+    assert resumed["publication_suspended"] is False
+    assert resumed["suspension_changed"] is True
+    assert controller.active_spec().portfolio_id == "baseline"
+
+
+def test_selection_generation_change_fails_closed(tmp_path) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    controller = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+        policy=_permissive_policy(),
+    )
+    controller.reconcile(now_utc=started.isoformat())
+    selection = controller.active_selection()
+    pointer = store.get_active_pointer("automatic_publication_champion")
+    store.set_active_pointer(
+        "automatic_publication_champion",
+        phase_id=baseline.phase_id,
+        expected_generation=pointer["generation"],
+        metadata=pointer["payload"],
+        updated_at_utc=(started + timedelta(seconds=1)).isoformat(),
+    )
+
+    with pytest.raises(
+        AutomaticChampionUnavailable,
+        match="changed during publication evaluation",
+    ):
+        controller.confirm_selection(selection)
+
+
+def test_staged_production_mode_change_reauthorizes_pointer(tmp_path) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    report_only = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=False,
+        policy=_permissive_policy(),
+    )
+    first = report_only.reconcile(now_utc=started.isoformat())
+
+    live = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+        policy=_permissive_policy(),
+    )
+    second = live.reconcile(
+        now_utc=(started + timedelta(seconds=1)).isoformat()
+    )
+
+    assert second["status"] == "ok"
+    assert second["selector_started_at_utc"] == first["selector_started_at_utc"]
+    assert live.active_selection().generation == 2
