@@ -2426,6 +2426,148 @@ class WideResearchStore:
                 "pointer": self._decode_row(updated_pointer),
             }
 
+    def swap_active_pointer(
+        self,
+        pointer_name: str,
+        *,
+        from_phase_id: str,
+        to_phase_id: str,
+        expected_generation: int,
+        metadata: Optional[Mapping[str, Any]] = None,
+        changed_at_utc: Any = None,
+    ) -> Dict[str, Any]:
+        """Atomically demote one active phase and promote its replacement.
+
+        A selector must never expose a pointer to a non-active phase or leave
+        two phases active after a crash.  Both lifecycle transitions and the
+        pointer compare-and-swap therefore share one ``BEGIN IMMEDIATE``
+        transaction.
+        """
+
+        pointer = _required_text(pointer_name, "pointer_name")
+        source = _required_text(from_phase_id, "from_phase_id")
+        target = _required_text(to_phase_id, "to_phase_id")
+        if source == target:
+            raise ValueError("replacement phase must differ from active phase")
+        generation_expected = int(expected_generation)
+        changed = _utc_timestamp(
+            changed_at_utc or _utc_now(), "changed_at_utc"
+        )
+        metadata_value = dict(metadata or {})
+        payload_json = _canonical_json(metadata_value)
+        with self._write(projected_bytes=len(payload_json) + 4096) as connection:
+            pointer_row = connection.execute(
+                "SELECT * FROM active_pointer WHERE pointer_name=?", (pointer,)
+            ).fetchone()
+            if pointer_row is None:
+                raise ConcurrentUpdateError(
+                    f"pointer {pointer} does not exist"
+                )
+            current_generation = int(pointer_row["generation"])
+            if current_generation != generation_expected:
+                raise ConcurrentUpdateError(
+                    f"pointer {pointer} generation is {current_generation}, "
+                    f"expected {generation_expected}"
+                )
+            if str(pointer_row["phase_id"] or "") != source:
+                raise ConcurrentUpdateError(
+                    f"pointer {pointer} no longer references {source}"
+                )
+
+            source_row = connection.execute(
+                "SELECT rule_id, status FROM phases WHERE phase_id=?", (source,)
+            ).fetchone()
+            target_row = connection.execute(
+                "SELECT rule_id, status FROM phases WHERE phase_id=?", (target,)
+            ).fetchone()
+            if source_row is None or target_row is None:
+                raise KeyError("unknown source or replacement phase")
+            if str(source_row["status"]) != "active":
+                raise InvalidLifecycleTransition(
+                    "source pointer phase must be active"
+                )
+            target_status = str(target_row["status"])
+            if target_status not in {"candidate", "shadow", "ready"}:
+                raise InvalidLifecycleTransition(
+                    "replacement phase must be candidate, shadow, or ready"
+                )
+
+            connection.execute(
+                "UPDATE phases SET status='shadow', updated_at_utc=? "
+                "WHERE phase_id=?",
+                (changed, source),
+            )
+            self._insert_lifecycle_event(
+                connection,
+                phase_id=source,
+                from_status="active",
+                to_status="shadow",
+                reason="automatic_champion_replaced",
+                actor="automatic_champion",
+                metadata=metadata_value,
+                created_at_utc=changed,
+            )
+            connection.execute(
+                "UPDATE phases SET status='active', updated_at_utc=? "
+                "WHERE phase_id=?",
+                (changed, target),
+            )
+            self._insert_lifecycle_event(
+                connection,
+                phase_id=target,
+                from_status=target_status,
+                to_status="active",
+                reason="automatic_champion_promoted",
+                actor="automatic_champion",
+                metadata=metadata_value,
+                created_at_utc=changed,
+            )
+
+            generation = current_generation + 1
+            target_rule = str(target_row["rule_id"])
+            checksum = self._pointer_checksum(
+                pointer_name=pointer,
+                phase_id=target,
+                rule_id=target_rule,
+                generation=generation,
+                updated_at_utc=changed,
+                payload_json=payload_json,
+            )
+            connection.execute(
+                """
+                UPDATE active_pointer
+                SET phase_id=?, rule_id=?, generation=?, payload_json=?,
+                    checksum=?, updated_at_utc=?
+                WHERE pointer_name=?
+                """,
+                (
+                    target,
+                    target_rule,
+                    generation,
+                    payload_json,
+                    checksum,
+                    changed,
+                    pointer,
+                ),
+            )
+            updated_pointer = connection.execute(
+                "SELECT * FROM active_pointer WHERE pointer_name=?", (pointer,)
+            ).fetchone()
+            assert updated_pointer is not None
+            return {
+                "from_phase": self._decode_row(
+                    connection.execute(
+                        "SELECT * FROM phases WHERE phase_id=?", (source,)
+                    ).fetchone()
+                ),
+                "to_phase": self._decode_row(
+                    connection.execute(
+                        "SELECT * FROM phases WHERE phase_id=?", (target,)
+                    ).fetchone()
+                ),
+                "pointer": self._decode_row(updated_pointer),
+            }
+
     def get_active_pointer(self, pointer_name: str) -> Optional[Dict[str, Any]]:
         pointer = _required_text(pointer_name, "pointer_name")
         with self._read() as connection:

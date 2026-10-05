@@ -198,8 +198,8 @@ shadow pool and the same prospective gates.
 
 The active file is `stats/wide_research_active.json`. The controller and router
 remain available for historical evidence and compatibility, but `main_loop`
-does not call this router for Telegram publication. `balanced-two-rule` is now
-the only publication gate.
+does not call this router for Telegram publication. This historical primary
+champion is also not the automatic publication selector described below.
 
 - wide research and production application are enabled;
 - the active manifest is structurally valid and its checksum is valid;
@@ -210,6 +210,29 @@ the only publication gate.
 
 The validation rules below describe how the dormant router verifies a manifest;
 they do not grant publication authority.
+
+## Automatic publication Champion–Challenger
+
+The publication selector uses a separate
+`data/automatic_publication_champion.sqlite3` store and never imports outcomes
+from discovery or frozen-portfolio books. `balanced-two-rule` is registered as
+the initial champion. Every other source-controlled candidate begins a fresh
+prospective clock when first admitted.
+
+Automatic replacement requires 40 resolved outcomes over at least 14 days,
+10 trigger-days, 8 leagues, no league above 30%, and at least 2 triggers per
+week. A beta posterior (83% prior with strength 40) must have a lower 90% bound
+of at least 82%. On the same calendar window, the challenger must exceed the
+champion by at least 2 percentage points with a base posterior probability of
+95%, tightened for the number of candidate families. Near-duplicate rules
+share one family and cannot cause threshold churn.
+
+`ENABLE_AUTOMATIC_PUBLICATION_CHAMPION` enables the isolated evidence book and
+recommendation report. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY`
+permits an eligible recommendation to swap the active pointer. Demotion,
+promotion, lifecycle audit events, and the checksummed pointer update happen
+in one SQLite transaction. A changed policy/catalog, invalid pointer, or
+evaluation error retains or falls back to `balanced-two-rule`.
 
 The manifest cache never accepts a lower generation or a corrupt update. While
 the process is alive it also rejects different content under the same

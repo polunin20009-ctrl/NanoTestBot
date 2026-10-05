@@ -578,6 +578,63 @@ def test_balanced_two_rule_can_allow_when_base_filter_failed(monkeypatch) -> Non
     assert decision["source"] == bot.BALANCED_TWO_RULE_PORTFOLIO_ID
 
 
+def test_automatic_champion_routes_through_validated_active_spec(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: {
+            "observation_id": "1:50:WIDE_ROUTER:v3",
+            "created_at_utc": "2026-01-01T00:00:00+00:00",
+            "market_research": {},
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_build_shadow_candidate_prediction_record",
+        lambda observation, rolling: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "evaluate_frozen_portfolio",
+        lambda *args, **kwargs: {
+            "reason": "pass",
+            "portfolio_hash": "challenger-hash",
+            "passed_members": ["challenger-member"],
+            "members": [],
+        },
+    )
+    active = MagicMock(
+        portfolio_id="mature-challenger",
+        rule_id="frozen-portfolio-mature-challenger-v1",
+        phase_id="frozen-portfolio-mature-challenger-v1:prospective",
+    )
+    selector = MagicMock()
+    selector.active_spec.return_value = active
+    monkeypatch.setattr(bot, "ENABLE_AUTOMATIC_PUBLICATION_CHAMPION", True)
+    monkeypatch.setattr(
+        bot, "AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY", True
+    )
+    monkeypatch.setattr(
+        bot,
+        "_get_automatic_publication_champion_components",
+        lambda: (MagicMock(), MagicMock(), selector),
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={},
+        current_filter_allow=False,
+    )
+
+    assert decision["allow"] is True
+    assert decision["source"] == "mature-challenger"
+    assert decision["automatic_champion_applied"] is True
+
+
 def test_balanced_two_rule_blocks_even_when_base_filter_passed(monkeypatch) -> None:
     monkeypatch.setattr(
         bot,

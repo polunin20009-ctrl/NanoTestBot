@@ -13,7 +13,7 @@ Convention: **Production** = anything that can change Telegram publication, live
 
 The running product is a **Goal Predictor Telegram Bot** (`NanoTest.py`).
 
-It watches **live football fixtures** from API-Football, computes a **second-half (minutes 46–60) probability that another goal arrives before the end of normal time**, and may **publish one ordinary channel signal per fixture** when the immutable `balanced-two-rule` portfolio passes.
+It watches **live football fixtures** from API-Football, computes a **second-half (minutes 46–60) probability that another goal arrives before the end of normal time**, and may **publish one ordinary channel signal per fixture** when the validated publication champion passes. The initial and fail-safe champion is immutable `balanced-two-rule`.
 
 A parallel **research factory** records every technically eligible snapshot, residual ML, market quotes, hand-written candidate arms, and four wide-research rule profiles. Historical search and primary wide-research champions no longer publish. The BASE filter is retained as an audit/control feature but is not the Telegram gate.
 
@@ -84,7 +84,7 @@ CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps colle
     | `season_context_factor` | ≥ 1.02 | `BASE_SIGNAL_MIN_SEASON_CONTEXT_FACTOR` |
 
     Invalid/non-finite inputs fail closed (`passed=false`). Its result is recorded but does not allow or block Telegram publication.
-12. **Apply the only production gate: frozen `balanced-two-rule` v1.** It is an OR portfolio: at least one of its two immutable members must PASS. Missing features, prediction errors, market unavailability affecting a required member, or evaluation exceptions cannot create a signal; if neither member passes, publication is blocked. The rule ignores the BASE result.
+12. **Apply the publication champion.** The default and safe fallback is frozen `balanced-two-rule` v1. If both automatic-champion feature flags are enabled, a source-controlled replacement may take over only after passing a fresh prospective Champion–Challenger cohort. Missing features, prediction errors, market unavailability affecting a required member, or evaluation exceptions cannot create a signal. The champion ignores the BASE result.
     - `wide-1f89b379f5d04f3ceb3f`: `prob_to90≤79`, away corner share `≥0.5`, home-away total-shot balance `≤-0.076923`, box-shots × causal static-ML p90 `≥0.228077`, trailing-team SOT share `≥0.333333`.
     - `wide-0bed4a7f285d9f108840`: causal market p90 × season factor `≥0.832204` and 10-minute pressure delta `≥1.82`.
 13. **Publish to Telegram** (Markdown, rate-limited edits):
@@ -109,8 +109,8 @@ CLI besides the bot: `python3 NanoTest.py --dump-match <fixture_id>` dumps colle
 |-----------|---------------------|
 | Minute &lt; 46 | No ordinary send; may seed rolling dynamics; prefilter observation |
 | Minute 46, coverage &lt; 0.85 | Skip this cycle (wait for stats) |
-| Minute 46–60, `balanced-two-rule` FAIL/UNAVAILABLE | No send; **decision snapshot still written** |
-| Minute 46–60, `balanced-two-rule` PASS | Send, regardless of BASE result |
+| Minute 46–60, publication champion FAIL/UNAVAILABLE | No send; **decision snapshot still written** |
+| Minute 46–60, publication champion PASS | Send, regardless of BASE result |
 | Minute &gt; 60, already sent | Monitor updates only |
 | Duplicate fixture already in `sent_matches` | No second ordinary send |
 | Missing stats / unknown fixture id | Long no-stats block |
@@ -260,6 +260,30 @@ The historical primary champion router is not called by `main_loop`.
 
 CLI: `scripts/discover_wide_rules.py`, `scripts/run_wide_research_cycle.py`, `scripts/report_wide_research.py`.
 
+### 4.8.1 Automatic publication champion
+
+`ENABLE_AUTOMATIC_PUBLICATION_CHAMPION` opens an isolated continuous SQLite
+book for the fixed candidate catalog. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY`
+additionally permits an atomic production swap; with that flag off, the
+controller only writes recommendations.
+
+- every candidate starts from zero in this store; frozen-portfolio and source
+  rule history is never imported as switching evidence;
+- adjacent thresholds and near-identical portfolios share one family;
+- a challenger needs at least 40 resolved outcomes, 14 calendar days, 10
+  trigger-days, 8 leagues, no league above 30%, and at least 2 triggers/week;
+- ranking uses a beta posterior with an 83% / 40-match prior and its lower 90%
+  bound; that bound must be at least 82%;
+- the challenger must exceed the champion by at least 2 percentage points with
+  family-count-adjusted posterior probability (base 95%);
+- both rules are compared from the same later timestamp, and a champion has a
+  14-day minimum tenure;
+- the SQLite phase swap and checksummed pointer update are one transaction.
+
+The current decision is written atomically to
+`stats/automatic_publication_champion.json`. Contract or pointer corruption
+retains/falls back to `balanced-two-rule`; it cannot broaden publication.
+
 ### 4.9 Research health
 
 **Can:** snapshot observations/outcomes/discovery/pools/retries/disk; warn vs critical with hysteresis; persist `stats/research_health.json` and alert state. **Cannot** score rules or promote.
@@ -299,7 +323,8 @@ CLI: `scripts/walk_forward_evaluation.py`.
 | Reputation auto-apply (telegram) | Yes (probabilities) | Shadow journal |
 | Reputation expanded auto-apply | Optional (default off) | Shadow journal (default on) |
 | BASE `p90≥75` + Δrep + intensity + season | Audit/control only | Copied into snapshots / control arm |
-| Frozen `balanced-two-rule` | **Only publication gate** | Frozen portfolio sqlite |
+| Frozen `balanced-two-rule` | Default publication champion and safe fallback | Frozen portfolio sqlite |
+| Automatic Champion–Challenger | Optional atomic replacement after fresh prospective gates | Dedicated sqlite + checksummed report |
 | Wide primary champion | None | sqlite + manifest |
 | Wide 4f / precision / rare | None | sqlite + reports |
 | Shadow ML static/rolling | Static p90 is one input to `balanced-two-rule`; rolling ML has no production effect | artifacts + prediction JSONL |

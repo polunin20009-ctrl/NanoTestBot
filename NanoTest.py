@@ -107,6 +107,10 @@ from market_benchmark import (
     SNAPSHOT_RECORD_TYPE as MARKET_SNAPSHOT_RECORD_TYPE,
     normalize_live_goal_markets,
 )
+from wide_research.automatic_champion import (
+    AutomaticChampionController,
+    AutomaticChampionLayer,
+)
 from wide_research.controller import WideResearchController
 from market_benchmark.research import CausalQuoteCache
 from wide_research.discovery import (
@@ -1311,6 +1315,48 @@ WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON = max(
     100,
     int(os.environ.get("WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON", "200")),
 )
+# Automatic selection owns a new prospective store.  Historical research
+# can nominate a source-controlled candidate, but can never authorize a switch.
+ENABLE_AUTOMATIC_PUBLICATION_CHAMPION = _parse_env_bool(
+    "ENABLE_AUTOMATIC_PUBLICATION_CHAMPION", False
+)
+AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY = _parse_env_bool(
+    "AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY", False
+)
+AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE = os.environ.get(
+    "AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE",
+    os.path.join("data", "automatic_publication_champion.sqlite3"),
+)
+AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE = os.environ.get(
+    "AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE",
+    os.path.join("stats", "automatic_publication_champion.json"),
+)
+AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES = max(
+    10 * 1024 * 1024,
+    int(
+        os.environ.get(
+            "AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES",
+            str(512 * 1024 * 1024),
+        )
+    ),
+)
+AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES = {
+    "balanced-two-rule": "balanced-core",
+    "balanced-plus-total-shots": "balanced-shot-volume",
+    "balanced-plus-sot-volume": "balanced-shot-volume",
+    "market-pressure-plus-volume": "market-pressure-shot-volume",
+    "market-pressure-plus-total-shots": "market-pressure-shot-volume",
+    "market-pressure-plus-sot-portfolio": "market-pressure-shot-volume",
+    "market-season-plus-volume": "market-season-shot-volume",
+    "market-season-plus-total-shots": "market-season-shot-volume",
+    "market-season-plus-sot-portfolio": "market-season-shot-volume",
+    "market-pressure-plus-box-context": "market-pressure-box-context",
+    "market-pressure-box-context-strict": "market-pressure-box-context",
+    "market-pressure-box-context-game-state": "market-pressure-box-context",
+    "exact-four-volume-only": "exact-four-shot-tempo",
+    "exact-four-total-shots-only": "exact-four-shot-tempo",
+    "exact-four-sot-volume-only": "exact-four-shot-tempo",
+}
 WIDE_RESEARCH_FROZEN_MEMBER_REFS = {
     "four_factor_volume": (
         "exact_four_shadow",
@@ -1941,9 +1987,17 @@ def log_feature_flags() -> None:
         "portfolio_count=%s terminal_horizon=%s db=%s "
         "shadow_only=true production_apply=false",
         ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS,
-        20,
+        21,
         WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON,
         WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE,
+    )
+    logger.info(
+        "[AUTOMATIC_CHAMPION_CONFIG] enabled=%s production_apply=%s "
+        "db=%s report=%s candidates=28 prospective_only=true",
+        ENABLE_AUTOMATIC_PUBLICATION_CHAMPION,
+        AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY,
+        AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE,
+        AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE,
     )
     logger.info(
         "[ROLLING_DYNAMICS_CONFIG] enabled=%s shadow_only=true production_apply=false schema=%s windows=5,10 max_extra_minutes=%s seed_minutes=36,39,41,44 seed_max_fetch_attempts=%s seed_workers=%s",
@@ -21920,6 +21974,12 @@ _wide_research_rare_precision_signature: Tuple[Any, ...] = ()
 _wide_research_frozen_portfolio_store: Optional[WideResearchStore] = None
 _wide_research_frozen_portfolio_layer: Optional[FrozenPortfolioLayer] = None
 _wide_research_frozen_portfolio_signature: Tuple[Any, ...] = ()
+_automatic_publication_champion_store: Optional[WideResearchStore] = None
+_automatic_publication_champion_layer: Optional[AutomaticChampionLayer] = None
+_automatic_publication_champion_controller: Optional[
+    AutomaticChampionController
+] = None
+_automatic_publication_champion_signature: Tuple[Any, ...] = ()
 _wide_research_stop = threading.Event()
 _wide_research_wakeup = threading.Event()
 _wide_research_thread: Optional[threading.Thread] = None
@@ -22044,6 +22104,10 @@ def _research_retry_tick() -> Dict[str, Any]:
         (
             ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS,
             _get_wide_research_frozen_portfolio_layer,
+        ),
+        (
+            ENABLE_AUTOMATIC_PUBLICATION_CHAMPION,
+            _get_automatic_publication_champion_layer,
         ),
     ):
         if not enabled:
@@ -22196,11 +22260,18 @@ def _assert_wide_research_runtime_paths() -> None:
         normalize(WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE + "-wal"),
         normalize(WIDE_RESEARCH_FROZEN_PORTFOLIO_DB_FILE + "-shm"),
     ]
+    automatic_champion_output_files = [
+        normalize(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE),
+        normalize(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE + "-wal"),
+        normalize(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE + "-shm"),
+        normalize(AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE),
+    ]
     primary_outputs = set(primary_output_files)
     experimental_outputs = set(experimental_output_files)
     precision_outputs = set(precision_output_files)
     rare_precision_outputs = set(rare_precision_output_files)
     frozen_portfolio_outputs = set(frozen_portfolio_output_files)
+    automatic_champion_outputs = set(automatic_champion_output_files)
     primary_output_dir = normalize(WIDE_RESEARCH_OUTPUT_DIR)
     experimental_output_dir = normalize(WIDE_RESEARCH_FOUR_FACTOR_OUTPUT_DIR)
     precision_output_dir = normalize(WIDE_RESEARCH_PRECISION_OUTPUT_DIR)
@@ -22359,6 +22430,18 @@ def _assert_wide_research_runtime_paths() -> None:
         outputs.update(rare_precision_outputs)
     if ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS:
         outputs.update(frozen_portfolio_outputs)
+    if ENABLE_AUTOMATIC_PUBLICATION_CHAMPION:
+        if len(automatic_champion_output_files) != len(
+            automatic_champion_outputs
+        ):
+            raise ValueError("automatic champion outputs overlap each other")
+        overlap = sorted(outputs & automatic_champion_outputs)
+        if overlap:
+            raise ValueError(
+                "automatic champion output overlaps another profile: "
+                + overlap[0]
+            )
+        outputs.update(automatic_champion_outputs)
     protected: set[str] = set()
     for name in (
         "OBSERVATION_HISTORY_FILE",
@@ -22925,6 +23008,145 @@ def _get_wide_research_frozen_portfolio_layer() -> FrozenPortfolioLayer:
     return _get_wide_research_frozen_portfolio_components()[1]
 
 
+def _automatic_publication_champion_specs() -> Tuple[
+    FrozenPortfolioSpec, ...
+]:
+    """Return the fixed candidate catalog for a fresh prospective book."""
+
+    base_specs = tuple(
+        _get_wide_research_frozen_portfolio_components()[1].specs
+    )
+    members = {
+        member.manifest.rule_id: member
+        for spec in base_specs
+        for member in spec.members
+    }
+
+    def source(rule_id: str) -> FrozenPortfolioMember:
+        value = members.get(rule_id)
+        if value is None:
+            raise KeyError(
+                "automatic champion source member is missing: " + rule_id
+            )
+        return value
+
+    singletons = (
+        FrozenPortfolioSpec(
+            portfolio_id="market-pressure-only",
+            version="v1",
+            members=(source("wide-0bed4a7f285d9f108840"),),
+        ),
+        FrozenPortfolioSpec(
+            portfolio_id="asymmetry-only",
+            version="v1",
+            members=(source("wide-1f89b379f5d04f3ceb3f"),),
+        ),
+        FrozenPortfolioSpec(
+            portfolio_id="market-season-pace-only",
+            version="v1",
+            members=(source("wide-9a553c7878963807ea7a"),),
+        ),
+        FrozenPortfolioSpec(
+            portfolio_id="exact-four-volume-only",
+            version="v1",
+            members=(source("wide-aa99916f49da87ffd916"),),
+        ),
+        FrozenPortfolioSpec(
+            portfolio_id="exact-four-total-shots-only",
+            version="v1",
+            members=(source("wide-292d027395d07e02dd66"),),
+        ),
+        FrozenPortfolioSpec(
+            portfolio_id="exact-four-sot-volume-only",
+            version="v1",
+            members=(source("wide-f424901a7cce76336cea"),),
+        ),
+        FrozenPortfolioSpec(
+            portfolio_id="exact-four-box-context-only",
+            version="v1",
+            members=(source("wide-024ee3811fbe580cac5e"),),
+        ),
+    )
+    return base_specs + singletons
+
+
+def _get_automatic_publication_champion_components() -> Tuple[
+    WideResearchStore,
+    AutomaticChampionLayer,
+    AutomaticChampionController,
+]:
+    global _automatic_publication_champion_store
+    global _automatic_publication_champion_layer
+    global _automatic_publication_champion_controller
+    global _automatic_publication_champion_signature
+
+    specs = _automatic_publication_champion_specs()
+    signature: Tuple[Any, ...] = (
+        os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE),
+        os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE),
+        int(AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES),
+        bool(AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY),
+        tuple(
+            (
+                spec.rule_id,
+                spec.manifest()["portfolio_hash"],
+                AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES.get(
+                    spec.portfolio_id, spec.portfolio_id
+                ),
+            )
+            for spec in specs
+        ),
+    )
+    with _wide_research_lock:
+        if (
+            _automatic_publication_champion_store is None
+            or _automatic_publication_champion_layer is None
+            or _automatic_publication_champion_controller is None
+            or _automatic_publication_champion_signature != signature
+        ):
+            _assert_wide_research_runtime_paths()
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            store = WideResearchStore(
+                AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE,
+                allowed_root=project_root,
+                max_db_bytes=(
+                    AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES
+                ),
+            )
+            store.bind_profile("automatic_champion")
+            layer = AutomaticChampionLayer(
+                store,
+                specs,
+                families=AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES,
+                max_prediction_lag_seconds=(
+                    SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
+                ),
+            )
+            controller = AutomaticChampionController(
+                store,
+                specs,
+                families=AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES,
+                baseline_portfolio_id=BALANCED_TWO_RULE_PORTFOLIO_ID,
+                report_path=AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE,
+                production_enabled=(
+                    AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY
+                ),
+            )
+            _automatic_publication_champion_store = store
+            _automatic_publication_champion_layer = layer
+            _automatic_publication_champion_controller = controller
+            _automatic_publication_champion_signature = signature
+        return (
+            _automatic_publication_champion_store,
+            _automatic_publication_champion_layer,
+            _automatic_publication_champion_controller,
+        )
+
+
+def _get_automatic_publication_champion_layer() -> AutomaticChampionLayer:
+    return _get_automatic_publication_champion_components()[1]
+
+
 def _wide_research_retry_gate(
     layer: WideShadowLayer,
     *,
@@ -22958,6 +23180,7 @@ def evaluate_and_store_wide_research(
             or ENABLE_WIDE_RESEARCH_PRECISION
             or ENABLE_WIDE_RESEARCH_RARE_PRECISION
             or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
+            or ENABLE_AUTOMATIC_PUBLICATION_CHAMPION
         )
         or not isinstance(observation, Mapping)
         or str(observation.get("record_type") or "") != "observation"
@@ -23171,6 +23394,43 @@ def evaluate_and_store_wide_research(
                 "shadow_only=true production_unchanged=true",
                 observation_id,
             )
+    if ENABLE_AUTOMATIC_PUBLICATION_CHAMPION:
+        try:
+            result_champion = (
+                _get_automatic_publication_champion_layer().process_snapshot(
+                    observation,
+                    static_prediction=static_prediction,
+                    rolling_prediction=rolling_prediction,
+                )
+            )
+            claimed_champion = (
+                result_champion.get("claimed")
+                if isinstance(result_champion, dict)
+                else []
+            )
+            if claimed_champion:
+                logger.info(
+                    "[AUTOMATIC_CHAMPION_TRIGGER] observation_id=%s "
+                    "fixture_id=%s minute=%s claimed=%s "
+                    "prospective_only=true",
+                    observation_id,
+                    observation.get("fixture_id"),
+                    observation.get("minute"),
+                    [
+                        {
+                            "portfolio_id": item.get("portfolio_id"),
+                            "phase_id": item.get("phase_id"),
+                        }
+                        for item in claimed_champion
+                        if isinstance(item, dict)
+                    ],
+                )
+        except Exception:
+            logger.exception(
+                "[AUTOMATIC_CHAMPION_ERROR] observation_id=%s "
+                "action=retain_current_champion",
+                observation_id,
+            )
     return primary_pass
 
 
@@ -23184,6 +23444,7 @@ def append_wide_research_outcomes(
             or ENABLE_WIDE_RESEARCH_PRECISION
             or ENABLE_WIDE_RESEARCH_RARE_PRECISION
             or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
+            or ENABLE_AUTOMATIC_PUBLICATION_CHAMPION
         )
         or not outcomes
     ):
@@ -23309,6 +23570,31 @@ def append_wide_research_outcomes(
                 "shadow_only=true production_unchanged=true",
                 len(outcomes),
             )
+    if ENABLE_AUTOMATIC_PUBLICATION_CHAMPION:
+        try:
+            result_champion = (
+                _get_automatic_publication_champion_layer().process_outcomes(
+                    outcomes
+                )
+            )
+            updated_champion = _safe_int(
+                result_champion.get("updated_triggers"), 0
+            )
+            if updated_champion:
+                wakeup = True
+                logger.info(
+                    "[AUTOMATIC_CHAMPION_OUTCOME] inserted=%s "
+                    "updated_triggers=%s ignored_unmatched=%s",
+                    result_champion.get("inserted"),
+                    updated_champion,
+                    result_champion.get("ignored_unmatched"),
+                )
+        except Exception:
+            logger.exception(
+                "[AUTOMATIC_CHAMPION_OUTCOME_ERROR] records=%s "
+                "action=retain_current_champion",
+                len(outcomes),
+            )
     if wakeup:
         _wide_research_wakeup.set()
     return primary_updated
@@ -23357,7 +23643,7 @@ def route_publication_with_balanced_two_rule(
     current_filter_allow: bool,
     evidence_sink: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Use the immutable balanced-two-rule OR-portfolio as the only send gate."""
+    """Route through the validated champion, defaulting to balanced-two-rule."""
 
     blocked = {
         "applied": True,
@@ -23428,6 +23714,15 @@ def route_publication_with_balanced_two_rule(
         spec = balanced_two_rule_spec(
             terminal_horizon=WIDE_RESEARCH_FROZEN_PORTFOLIO_HORIZON
         )
+        automatic_champion_applied = False
+        if (
+            ENABLE_AUTOMATIC_PUBLICATION_CHAMPION
+            and AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY
+        ):
+            spec = _get_automatic_publication_champion_components()[
+                2
+            ].active_spec()
+            automatic_champion_applied = True
         evaluation = evaluate_frozen_portfolio(
             spec,
             preview,
@@ -23441,9 +23736,10 @@ def route_publication_with_balanced_two_rule(
         return {
             "applied": True,
             "allow": bool(passed_members),
-            "source": BALANCED_TWO_RULE_PORTFOLIO_ID,
+            "source": spec.portfolio_id,
             "reason": str(evaluation.get("reason") or "no_member_passed"),
             "rule_id": spec.rule_id,
+            "automatic_champion_applied": automatic_champion_applied,
             "phase_id": spec.phase_id,
             "portfolio_hash": evaluation.get("portfolio_hash"),
             "current_filter_allow": bool(current_filter_allow),
@@ -23671,6 +23967,7 @@ def persist_wide_monitor_snapshot(
             or ENABLE_WIDE_RESEARCH_PRECISION
             or ENABLE_WIDE_RESEARCH_RARE_PRECISION
             or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
+            or ENABLE_AUTOMATIC_PUBLICATION_CHAMPION
         )
         or not ENABLE_OBSERVATION_HISTORY
         or int(minute) < int(REGULAR_SIGNAL_MIN_MINUTE)
@@ -24881,7 +25178,9 @@ def wide_research_daemon() -> None:
         "rare_precision_auto_lifecycle=%s "
         "rare_precision_hard_shadow_only=true "
         "frozen_portfolios_enabled=%s "
-        "frozen_portfolios_hard_shadow_only=true",
+        "frozen_portfolios_hard_shadow_only=true "
+        "automatic_champion_enabled=%s "
+        "automatic_champion_production_apply=%s",
         ENABLE_WIDE_RESEARCH,
         WIDE_RESEARCH_AUTO_DISCOVERY,
         WIDE_RESEARCH_AUTO_LIFECYCLE,
@@ -24895,6 +25194,8 @@ def wide_research_daemon() -> None:
         WIDE_RESEARCH_RARE_PRECISION_AUTO_DISCOVERY,
         WIDE_RESEARCH_RARE_PRECISION_AUTO_LIFECYCLE,
         ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS,
+        ENABLE_AUTOMATIC_PUBLICATION_CHAMPION,
+        AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY,
     )
     if ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS:
         try:
@@ -24910,6 +25211,31 @@ def wide_research_daemon() -> None:
             logger.exception(
                 "[WIDE_RESEARCH_FROZEN_PORTFOLIO_ERROR] "
                 "action=startup production_unchanged=true"
+            )
+    if ENABLE_AUTOMATIC_PUBLICATION_CHAMPION:
+        try:
+            (
+                champion_store,
+                champion_layer,
+                champion_controller,
+            ) = _get_automatic_publication_champion_components()
+            recovery = champion_store.recover()
+            if _wide_research_retry_gate(
+                champion_layer, log_tag="AUTOMATIC_CHAMPION"
+            ):
+                decision = champion_controller.reconcile()
+                logger.info(
+                    "[AUTOMATIC_CHAMPION_RECOVERY] recovery=%s "
+                    "active=%s recommended=%s switched=%s",
+                    recovery,
+                    decision.get("active_portfolio_id"),
+                    decision.get("recommended_portfolio_id"),
+                    decision.get("switched"),
+                )
+        except Exception:
+            logger.exception(
+                "[AUTOMATIC_CHAMPION_STARTUP_ERROR] "
+                "action=retain_balanced_two_rule"
             )
     initial_delay_primary = (
         _wide_research_initial_discovery_delay_seconds()
@@ -25363,6 +25689,41 @@ def wide_research_daemon() -> None:
                         "[WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_ERROR] "
                         "shadow_only=true production_unchanged=true"
                     )
+            if ENABLE_AUTOMATIC_PUBLICATION_CHAMPION:
+                try:
+                    (
+                        _champion_store,
+                        champion_layer,
+                        champion_controller,
+                    ) = _get_automatic_publication_champion_components()
+                    retries_clear = _wide_research_retry_gate(
+                        champion_layer, log_tag="AUTOMATIC_CHAMPION"
+                    )
+                    decision = (
+                        champion_controller.reconcile()
+                        if retries_clear
+                        else {}
+                    )
+                    if (
+                        decision.get("switched")
+                        or decision.get("recommended_rule_id")
+                        or decision.get("status") == "blocked"
+                    ):
+                        logger.info(
+                            "[AUTOMATIC_CHAMPION_DECISION] active=%s "
+                            "recommended=%s switched=%s status=%s "
+                            "production_apply=%s",
+                            decision.get("active_portfolio_id"),
+                            decision.get("recommended_portfolio_id"),
+                            decision.get("switched"),
+                            decision.get("status"),
+                            AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[AUTOMATIC_CHAMPION_LIFECYCLE_ERROR] "
+                        "action=retain_current_champion"
+                    )
             timeout = float(WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS)
             if ENABLE_WIDE_RESEARCH and WIDE_RESEARCH_AUTO_DISCOVERY:
                 timeout = min(
@@ -25416,6 +25777,7 @@ def start_wide_research_daemon() -> None:
         or ENABLE_WIDE_RESEARCH_PRECISION
         or ENABLE_WIDE_RESEARCH_RARE_PRECISION
         or ENABLE_WIDE_RESEARCH_FROZEN_PORTFOLIOS
+        or ENABLE_AUTOMATIC_PUBLICATION_CHAMPION
     ):
         logger.info("[WIDE_RESEARCH_DAEMON] disabled")
         return
