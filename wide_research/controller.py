@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -36,6 +36,7 @@ from .store import WideResearchStore
 EVALUATED_STATUSES = ("candidate", "shadow", "ready", "active")
 IMPORT_IDENTITY_STATUSES = (*EVALUATED_STATUSES, "paused")
 TERMINAL_REVIEW_POLICY_VERSION = "wide_terminal_review_v1"
+POOL_LIFECYCLE_POLICY_VERSION = "wide_pool_lifecycle_v1"
 MAX_EVALUATED_PHASES = 64
 
 
@@ -150,6 +151,40 @@ def _terminal_phase(phase: Mapping[str, Any]) -> bool:
     return _mapping(_mapping(phase.get("policy")).get("terminal_review")).get(
         "enabled"
     ) is True
+
+
+def _normalize_pool_lifecycle_policy(
+    value: Any,
+) -> Optional[dict[str, Any]]:
+    payload = _mapping(value)
+    if not payload:
+        return None
+    if set(payload) != {"version", "terminal_look", "max_age_days"}:
+        return None
+    if payload.get("version") != POOL_LIFECYCLE_POLICY_VERSION:
+        return None
+    terminal_look = payload.get("terminal_look")
+    max_age_days = payload.get("max_age_days")
+    if (
+        type(terminal_look) is not int
+        or terminal_look < 1
+        or type(max_age_days) is not int
+        or max_age_days < 1
+    ):
+        return None
+    return {
+        "version": POOL_LIFECYCLE_POLICY_VERSION,
+        "terminal_look": terminal_look,
+        "max_age_days": max_age_days,
+    }
+
+
+def _phase_pool_lifecycle_policy(
+    phase: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    return _normalize_pool_lifecycle_policy(
+        _mapping(phase.get("policy")).get("pool_lifecycle")
+    )
 
 
 def _execution_fingerprint(manifest: Mapping[str, Any]) -> str:
@@ -531,6 +566,7 @@ class WideResearchController:
         pointer_name: str = "production",
         terminal_review_enabled: bool = False,
         terminal_review_min_hit_rate: float = 0.90,
+        pool_lifecycle_policy: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.store = store
         self.active_manifest_path = str(active_manifest_path)
@@ -552,6 +588,20 @@ class WideResearchController:
             raise ValueError(
                 "terminal_review_min_hit_rate must be finite and in [0, 1]"
             )
+        self.pool_lifecycle_policy = None
+        if pool_lifecycle_policy is not None:
+            self.pool_lifecycle_policy = _normalize_pool_lifecycle_policy(
+                pool_lifecycle_policy
+            )
+            if self.pool_lifecycle_policy is None:
+                raise ValueError("invalid pool_lifecycle_policy")
+            if (
+                self.pool_lifecycle_policy["terminal_look"]
+                not in self.policy.allowed_looks
+            ):
+                raise ValueError(
+                    "pool lifecycle terminal look must be a lifecycle look"
+                )
 
     def _terminal_review_manifest(self) -> dict[str, Any]:
         return {
@@ -656,6 +706,7 @@ class WideResearchController:
             "search_generation": search_generation,
             "admission_policy": "generation_and_validation_rank_v1",
             "terminal_review": self._terminal_review_manifest(),
+            "pool_lifecycle": self.pool_lifecycle_policy,
         }
         results_by_id = {
             str(row.get("candidate_id") or ""): row
@@ -764,6 +815,14 @@ class WideResearchController:
                     for row in registered_existing
                 ):
                     raise ValueError("existing rule has a different frozen terminal review policy")
+                if self.pool_lifecycle_policy is not None and any(
+                    _phase_pool_lifecycle_policy(row)
+                    != self.pool_lifecycle_policy
+                    for row in registered_existing
+                ):
+                    raise ValueError(
+                        "existing rule has a different frozen pool lifecycle policy"
+                    )
                 reused.append(
                     {
                         "rule_id": rule.rule_id,
@@ -939,6 +998,11 @@ class WideResearchController:
                         "historical_metrics_are_evidence": False,
                         "lifecycle": self.policy.manifest(),
                         "terminal_review": self._terminal_review_manifest(),
+                        **(
+                            {"pool_lifecycle": self.pool_lifecycle_policy}
+                            if self.pool_lifecycle_policy is not None
+                            else {}
+                        ),
                         "discovery": {
                             "run_id": run_id,
                             "rank": candidate.get("rank_at_discovery"),
@@ -1205,7 +1269,15 @@ class WideResearchController:
         phase_id = str(phase["phase_id"])
         triggers = self.store.list_triggers(phase_id=phase_id)
         latest_closed: Optional[tuple[int, list[dict[str, Any]]]] = None
+        pool_lifecycle = _phase_pool_lifecycle_policy(phase)
+        terminal_look = (
+            int(pool_lifecycle["terminal_look"])
+            if pool_lifecycle is not None
+            else None
+        )
         for look in policy.allowed_looks:
+            if terminal_look is not None and int(look) > terminal_look:
+                break
             if len(triggers) < int(look):
                 break
             frozen = self.store.freeze_phase_look(phase_id, int(look))
@@ -1255,6 +1327,97 @@ class WideResearchController:
         )
         write_active_manifest_atomic(Path(self.active_manifest_path), payload)
         return payload
+
+    def _finalize_purge_transition(self, now: datetime) -> list[str]:
+        """Retire only redundant pre-purge executors, never by outcomes."""
+
+        phases = self.store.list_phases()
+        purged_generations = [
+            _mapping(
+                _mapping(_mapping(row.get("policy")).get("discovery")).get(
+                    "search_generation"
+                )
+            )
+            for row in phases
+            if str(
+                _mapping(
+                    _mapping(_mapping(row.get("policy")).get("discovery")).get(
+                        "search_generation"
+                    )
+                ).get("engine_version")
+                or ""
+            ).endswith(TEMPORAL_PURGED_ENGINE_SUFFIX)
+        ]
+        transitions = []
+        for phase in phases:
+            status = str(phase.get("status") or "")
+            if status not in {"candidate", "shadow"}:
+                continue
+            generation = _mapping(
+                _mapping(_mapping(phase.get("policy")).get("discovery")).get(
+                    "search_generation"
+                )
+            )
+            successor = next(
+                (
+                    value
+                    for value in purged_generations
+                    if _purge_only_generation_transition(generation, value)
+                ),
+                None,
+            )
+            if successor is None:
+                continue
+            transitions.append(
+                {
+                    "phase_id": str(phase["phase_id"]),
+                    "to_status": "retired",
+                    "expected_status": status,
+                    "reason": "temporal_purge_transition_finalized",
+                    "metadata": {
+                        "replacement_search_generation": successor,
+                        "outcome_independent": True,
+                        "evidence_preserved": True,
+                    },
+                }
+            )
+        updated = self.store.transition_phases_atomically(
+            transitions,
+            changed_at_utc=_utc_iso(now),
+        )
+        return [str(row["phase_id"]) for row in updated]
+
+    def _migrate_current_pool_lifecycle(self, now: datetime) -> list[str]:
+        """Freeze the configured policy onto current purge-safe legacy phases."""
+
+        if self.pool_lifecycle_policy is None:
+            return []
+        phase_ids = []
+        for phase in self.store.list_phases(
+            statuses=("candidate", "shadow", "ready")
+        ):
+            generation = _mapping(
+                _mapping(_mapping(phase.get("policy")).get("discovery")).get(
+                    "search_generation"
+                )
+            )
+            if not str(generation.get("engine_version") or "").endswith(
+                TEMPORAL_PURGED_ENGINE_SUFFIX
+            ):
+                continue
+            existing = _mapping(phase.get("policy")).get("pool_lifecycle")
+            if existing is None:
+                phase_ids.append(str(phase["phase_id"]))
+            elif _phase_pool_lifecycle_policy(phase) != self.pool_lifecycle_policy:
+                raise ValueError(
+                    "phase has an invalid or different frozen pool lifecycle policy"
+                )
+        migrated = self.store.freeze_phase_pool_lifecycle_policy(
+            phase_ids,
+            self.pool_lifecycle_policy,
+            changed_at_utc=_utc_iso(now),
+        )
+        return [str(row["phase_id"]) for row in migrated]
 
     def reconcile(self, *, now_utc: Optional[str] = None) -> dict[str, Any]:
         now = _parse_utc(now_utc) if now_utc else datetime.now(timezone.utc)
@@ -1319,6 +1482,8 @@ class WideResearchController:
                 updated_at_utc=_utc_iso(now),
             )
             pointed_phase_id = ""
+        purge_transition_retired = self._finalize_purge_transition(now)
+        pool_policy_migrated = self._migrate_current_pool_lifecycle(now)
         phase_rows = self.store.list_phases()
         for phase in phase_rows:
             phase_id = str(phase["phase_id"])
@@ -1441,13 +1606,23 @@ class WideResearchController:
                 evidence[phase_id] = (metrics, milestone, p_value)
                 ordered_hypotheses.append((phase_id, p_value))
             ordered_hypotheses.sort(key=lambda item: (item[1], item[0]))
-            look_counts = {
-                len(descriptor["lifecycle_policy"].allowed_looks)
-                for descriptor in family_descriptors
-                if isinstance(
-                    descriptor.get("lifecycle_policy"), LifecyclePolicy
+            look_counts = set()
+            for member, descriptor in zip(members, family_descriptors):
+                member_policy = descriptor.get("lifecycle_policy")
+                if not isinstance(member_policy, LifecyclePolicy):
+                    continue
+                pool_policy = _phase_pool_lifecycle_policy(member)
+                terminal_look = (
+                    int(pool_policy["terminal_look"])
+                    if pool_policy is not None
+                    else None
                 )
-            }
+                look_counts.add(
+                    sum(
+                        terminal_look is None or int(look) <= terminal_look
+                        for look in member_policy.allowed_looks
+                    )
+                )
             look_alpha = alpha_budget / max(1, max(look_counts, default=1))
             step_down_open = True
             for index, (phase_id, p_value) in enumerate(ordered_hypotheses):
@@ -1516,6 +1691,25 @@ class WideResearchController:
                 }
             )
             terminal_review = _phase_terminal_review_policy(phase)
+            pool_lifecycle = _phase_pool_lifecycle_policy(phase)
+            age_days = (
+                now - _parse_utc(phase.get("starts_at_utc"))
+            ).total_seconds() / 86400.0
+            age_expired = bool(
+                pool_lifecycle
+                and age_days >= float(pool_lifecycle["max_age_days"])
+            )
+            pool_terminal_closed = bool(
+                pool_lifecycle
+                and milestone == int(pool_lifecycle["terminal_look"])
+            )
+            if pool_lifecycle:
+                readiness[-1]["pool_lifecycle"] = {
+                    **pool_lifecycle,
+                    "age_days": max(0.0, age_days),
+                    "age_expired": age_expired,
+                    "terminal_closed": pool_terminal_closed,
+                }
             terminal_rows = None
             if terminal_review and terminal_review["enabled"]:
                 try:
@@ -1558,6 +1752,48 @@ class WideResearchController:
                         metadata=terminal_disposition,
                         changed_at_utc=_utc_iso(now),
                     )
+            elif pool_terminal_closed:
+                if decision.eligible:
+                    if str(phase["status"]) != "ready":
+                        self.store.transition_phase(
+                            phase_id,
+                            "ready",
+                            expected_status=str(phase["status"]),
+                            reason="pool_terminal_finalist_graduated",
+                            metadata={
+                                "pool_lifecycle": pool_lifecycle,
+                                "milestone": milestone,
+                                "decision": decision.as_dict(),
+                            },
+                            changed_at_utc=_utc_iso(now),
+                        )
+                elif str(phase["status"]) in {"candidate", "shadow"}:
+                    self.store.transition_phase(
+                        phase_id,
+                        "paused",
+                        expected_status=str(phase["status"]),
+                        reason="pool_terminal_nonfinalist_paused",
+                        metadata={
+                            "pool_lifecycle": pool_lifecycle,
+                            "milestone": milestone,
+                            "decision": decision.as_dict(),
+                            "outcome_adaptive_replacement": False,
+                        },
+                        changed_at_utc=_utc_iso(now),
+                    )
+            elif age_expired and str(phase["status"]) in {"candidate", "shadow"}:
+                self.store.transition_phase(
+                    phase_id,
+                    "paused",
+                    expected_status=str(phase["status"]),
+                    reason="pool_calendar_age_expired",
+                    metadata={
+                        "pool_lifecycle": pool_lifecycle,
+                        "age_days": max(0.0, age_days),
+                        "outcome_independent": True,
+                    },
+                    changed_at_utc=_utc_iso(now),
+                )
             elif decision.eligible:
                 if str(phase["status"]) != "ready":
                     self.store.transition_phase(
@@ -1690,6 +1926,8 @@ class WideResearchController:
             "readiness": readiness,
             "degradation": degradation,
             "promoted_phase_id": promoted,
+            "purge_transition_retired_phase_ids": purge_transition_retired,
+            "pool_policy_migrated_phase_ids": pool_policy_migrated,
             "active_pointer": pointer,
             "active_manifest": published,
         }
