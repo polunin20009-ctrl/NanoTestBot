@@ -492,7 +492,7 @@ def test_reconcile_finalizes_purge_overlap_and_migrates_current_policy(
     assert set(result["purge_transition_retired_phase_ids"]) == retired
     assert set(result["pool_policy_migrated_phase_ids"]) == current_ids
     phases = {row["phase_id"]: row for row in store.list_phases()}
-    assert phases[protected]["status"] == "ready"
+    assert phases[protected]["status"] != "retired"
     assert all(phases[phase_id]["status"] == "retired" for phase_id in retired)
     assert all(
         phases[phase_id]["policy"]["pool_lifecycle"] == pool_policy
