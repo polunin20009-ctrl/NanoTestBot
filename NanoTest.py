@@ -912,6 +912,11 @@ WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB = max(
 WIDE_RESEARCH_MAX_SHADOW_RULES = max(
     1, min(20, int(os.environ.get("WIDE_RESEARCH_MAX_SHADOW_RULES", "10")))
 )
+WIDE_RESEARCH_POOL_LIFECYCLE_POLICY = {
+    "version": "wide_pool_lifecycle_v1",
+    "terminal_look": 200,
+    "max_age_days": 180,
+}
 WIDE_RESEARCH_MAX_DB_BYTES = max(
     10 * 1024 * 1024,
     int(
@@ -950,9 +955,9 @@ WIDE_RESEARCH_FOUR_FACTOR_PROSPECTIVE_START_UTC = os.environ.get(
 WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY = _parse_env_bool(
     "WIDE_RESEARCH_FOUR_FACTOR_AUTO_DISCOVERY", True
 )
-# Hard-coded by design: this profile is research-only and its phases remain
-# SHADOW even if they accumulate enough prospective evidence for readiness.
-WIDE_RESEARCH_FOUR_FACTOR_AUTO_LIFECYCLE = False
+# Hard-coded by design: this profile is research-only. Lifecycle maintenance
+# may mark finalists READY, but production routing remains physically absent.
+WIDE_RESEARCH_FOUR_FACTOR_AUTO_LIFECYCLE = True
 WIDE_RESEARCH_FOUR_FACTOR_DISCOVERY_INTERVAL_SECONDS = max(
     86400,
     int(
@@ -1281,6 +1286,11 @@ WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY = LifecyclePolicy(
     min_triggers_per_week=0.0,
     allowed_looks=(50, 100, 200),
 )
+WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY = {
+    "version": "wide_pool_lifecycle_v1",
+    "terminal_look": 200,
+    "max_age_days": 365,
+}
 WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES = max(
     10 * 1024 * 1024,
     int(
@@ -22528,6 +22538,7 @@ def _get_wide_research_components() -> Tuple[
         int(WIDE_RESEARCH_MAX_SHADOW_RULES),
         int(WIDE_RESEARCH_MAX_DB_BYTES),
         int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
+        tuple(sorted(WIDE_RESEARCH_POOL_LIFECYCLE_POLICY.items())),
     )
     with _wide_research_lock:
         if (
@@ -22565,6 +22576,7 @@ def _get_wide_research_components() -> Tuple[
                 prospective_start_utc=WIDE_RESEARCH_PROSPECTIVE_START_UTC,
                 production_enabled=WIDE_RESEARCH_PRODUCTION_APPLY,
                 max_shadow_rules=WIDE_RESEARCH_MAX_SHADOW_RULES,
+                pool_lifecycle_policy=WIDE_RESEARCH_POOL_LIFECYCLE_POLICY,
             )
             _wide_research_router = ActiveRuleRouter(
                 WIDE_RESEARCH_ACTIVE_MANIFEST_FILE
@@ -22604,6 +22616,7 @@ def _get_wide_research_four_factor_components() -> Tuple[
         int(WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES),
         int(WIDE_RESEARCH_FOUR_FACTOR_MAX_DB_BYTES),
         int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
+        tuple(sorted(WIDE_RESEARCH_POOL_LIFECYCLE_POLICY.items())),
     )
     with _wide_research_lock:
         if (
@@ -22641,6 +22654,7 @@ def _get_wide_research_four_factor_components() -> Tuple[
                 ),
                 production_enabled=False,
                 max_shadow_rules=WIDE_RESEARCH_FOUR_FACTOR_MAX_SHADOW_RULES,
+                pool_lifecycle_policy=WIDE_RESEARCH_POOL_LIFECYCLE_POLICY,
             )
             _wide_research_4f_signature = signature
         return (
@@ -22672,6 +22686,7 @@ def _get_wide_research_precision_components() -> Tuple[
         int(WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES),
         int(WIDE_RESEARCH_PRECISION_MAX_DB_BYTES),
         int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
+        tuple(sorted(WIDE_RESEARCH_POOL_LIFECYCLE_POLICY.items())),
     )
     with _wide_research_lock:
         if (
@@ -22709,6 +22724,7 @@ def _get_wide_research_precision_components() -> Tuple[
                 ),
                 production_enabled=False,
                 max_shadow_rules=WIDE_RESEARCH_PRECISION_MAX_SHADOW_RULES,
+                pool_lifecycle_policy=WIDE_RESEARCH_POOL_LIFECYCLE_POLICY,
             )
             _wide_research_precision_signature = signature
         return (
@@ -22744,6 +22760,11 @@ def _get_wide_research_rare_precision_components() -> Tuple[
         int(WIDE_RESEARCH_PHASE_REFRESH_SECONDS),
         tuple(WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.allowed_looks),
         int(WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.min_resolved),
+        tuple(
+            sorted(
+                WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY.items()
+            )
+        ),
     )
     with _wide_research_lock:
         if (
@@ -22787,6 +22808,9 @@ def _get_wide_research_rare_precision_components() -> Tuple[
                     policy=WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY,
                     terminal_review_enabled=True,
                     terminal_review_min_hit_rate=0.90,
+                    pool_lifecycle_policy=(
+                        WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY
+                    ),
                 )
             )
             _wide_research_rare_precision_signature = signature
@@ -25387,6 +25411,7 @@ def wide_research_daemon() -> None:
             initial_delay_rare_precision,
         )
     primary_controller: Optional[WideResearchController] = None
+    four_factor_controller: Optional[WideResearchController] = None
     precision_controller: Optional[WideResearchController] = None
     rare_precision_controller: Optional[WideResearchController] = None
     try:
@@ -25409,7 +25434,7 @@ def wide_research_daemon() -> None:
                 )
         if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
             try:
-                store_4f, _layer_4f, _controller_4f = (
+                store_4f, _layer_4f, four_factor_controller = (
                     _get_wide_research_four_factor_components()
                 )
                 recovery_4f = store_4f.recover()
@@ -25417,7 +25442,21 @@ def wide_research_daemon() -> None:
                     "[WIDE_RESEARCH_4F_RECOVERY] %s shadow_only=true",
                     recovery_4f,
                 )
+                if (
+                    WIDE_RESEARCH_FOUR_FACTOR_AUTO_LIFECYCLE
+                    and _wide_research_retry_gate(
+                        _layer_4f,
+                        log_tag="WIDE_RESEARCH_4F",
+                    )
+                ):
+                    lifecycle_4f = four_factor_controller.reconcile()
+                    logger.info(
+                        "[WIDE_RESEARCH_4F_LIFECYCLE] "
+                        "reviewed=%s production_apply=false shadow_only=true",
+                        len(lifecycle_4f.get("readiness") or []),
+                    )
             except Exception:
+                four_factor_controller = None
                 logger.exception(
                     "[WIDE_RESEARCH_4F_RECOVERY_ERROR] "
                     "shadow_only=true production_unchanged=true"
@@ -25672,6 +25711,37 @@ def wide_research_daemon() -> None:
                     logger.exception(
                         "[WIDE_RESEARCH_LIFECYCLE_ERROR] "
                         "production_unchanged=true"
+                    )
+            if (
+                ENABLE_WIDE_RESEARCH_FOUR_FACTOR
+                and WIDE_RESEARCH_FOUR_FACTOR_AUTO_LIFECYCLE
+                and four_factor_controller is not None
+            ):
+                try:
+                    retries_clear = _wide_research_retry_gate(
+                        _get_wide_research_four_factor_layer(),
+                        log_tag="WIDE_RESEARCH_4F",
+                    )
+                    lifecycle_4f = (
+                        four_factor_controller.reconcile()
+                        if retries_clear
+                        else {}
+                    )
+                    transitioned = (
+                        lifecycle_4f.get("purge_transition_retired_phase_ids")
+                        or []
+                    )
+                    if transitioned:
+                        logger.info(
+                            "[WIDE_RESEARCH_4F_LIFECYCLE] "
+                            "purge_transition_retired=%s "
+                            "production_apply=false shadow_only=true",
+                            len(transitioned),
+                        )
+                except Exception:
+                    logger.exception(
+                        "[WIDE_RESEARCH_4F_LIFECYCLE_ERROR] "
+                        "shadow_only=true production_unchanged=true"
                     )
             if (
                 ENABLE_WIDE_RESEARCH_PRECISION

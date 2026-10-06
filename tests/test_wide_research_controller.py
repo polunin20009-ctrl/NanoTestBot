@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 
@@ -442,6 +443,63 @@ def test_purge_transition_preserves_clocks_and_admits_one_new_cohort(
     } == active_phase_ids
 
 
+def test_reconcile_finalizes_purge_overlap_and_migrates_current_policy(
+    tmp_path,
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    pool_policy = {
+        "version": "wide_pool_lifecycle_v1",
+        "terminal_look": 200,
+        "max_age_days": 180,
+    }
+    importer = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-09-01T00:00:00+00:00",
+        max_shadow_rules=2,
+    )
+    first = importer.import_report(
+        _generation_report("pre-purge", "v3", 2),
+        imported_at_utc="2026-09-01T01:00:00+00:00",
+    )
+    old_ids = {row["phase_id"] for row in first["imported"]}
+    protected = first["imported"][0]["phase_id"]
+    store.transition_phase(
+        protected,
+        "ready",
+        expected_status="shadow",
+        reason="protected finalist fixture",
+    )
+    migrated = importer.import_report(
+        _purged_successor(
+            _generation_report("placeholder", "v3", 2),
+            run_id="purged",
+        ),
+        imported_at_utc="2026-09-03T01:00:00+00:00",
+    )
+    current_ids = {row["phase_id"] for row in migrated["imported"]}
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-09-01T00:00:00+00:00",
+        max_shadow_rules=2,
+        pool_lifecycle_policy=pool_policy,
+    )
+
+    result = controller.reconcile(now_utc="2026-09-04T00:00:00+00:00")
+
+    retired = old_ids - {protected}
+    assert set(result["purge_transition_retired_phase_ids"]) == retired
+    assert set(result["pool_policy_migrated_phase_ids"]) == current_ids
+    phases = {row["phase_id"]: row for row in store.list_phases()}
+    assert phases[protected]["status"] == "ready"
+    assert all(phases[phase_id]["status"] == "retired" for phase_id in retired)
+    assert all(
+        phases[phase_id]["policy"]["pool_lifecycle"] == pool_policy
+        for phase_id in current_ids
+    )
+
+
 def test_purged_report_requires_matching_partition_artifacts(tmp_path) -> None:
     store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
     controller = WideResearchController(
@@ -772,6 +830,174 @@ def test_ready_phase_is_revalidated_after_outcome_correction(tmp_path) -> None:
     )
     controller.reconcile(now_utc="2026-08-29T01:00:00+00:00")
     assert store.list_phases(rule_id="wide-test-rule")[0]["status"] == "shadow"
+
+
+@pytest.mark.parametrize(
+    ("goals", "expected_status", "expected_reason"),
+    [
+        ((True, True), "ready", "pool_terminal_finalist_graduated"),
+        ((False, False), "paused", "pool_terminal_nonfinalist_paused"),
+    ],
+)
+def test_pool_terminal_look_graduates_or_pauses(
+    tmp_path, goals, expected_status, expected_reason
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        policy=_policy(),
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v1",
+            "terminal_look": 2,
+            "max_age_days": 180,
+        },
+    )
+    phase_id = controller.import_report(
+        _report(), imported_at_utc="2026-08-28T00:00:00+00:00"
+    )["imported"][0]["phase_id"]
+    layer = WideShadowLayer(store, refresh_seconds=0)
+    for index, goal in enumerate(goals):
+        observed = datetime(2026, 8, 28, 12 + index, tzinfo=UTC)
+        snapshot = _snapshot(3000 + index, observed)
+        layer.process_snapshot(snapshot)
+        layer.process_outcomes(
+            [
+                {
+                    "observation_id": snapshot["observation_id"],
+                    "outcome_schema_version": 1,
+                    "created_at_utc": (observed + timedelta(hours=2)).isoformat(),
+                    "outcome": {
+                        "status": "resolved",
+                        "goal_to90_normal_time": goal,
+                        "resolved_at_utc": (
+                            observed + timedelta(hours=2)
+                        ).isoformat(),
+                    },
+                }
+            ]
+        )
+
+    result = controller.reconcile(now_utc="2026-08-29T00:00:00+00:00")
+
+    assert store.list_phases()[0]["status"] == expected_status
+    review = next(row for row in result["readiness"] if row["phase_id"] == phase_id)
+    assert review["pool_lifecycle"]["terminal_closed"] is True
+    with sqlite3.connect(store.path) as connection:
+        reason = connection.execute(
+            "SELECT reason FROM lifecycle_events WHERE phase_id=? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (phase_id,),
+        ).fetchone()[0]
+    assert reason == expected_reason
+
+
+def test_pool_terminal_pending_outcome_keeps_phase_running(tmp_path) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        policy=_policy(),
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v1",
+            "terminal_look": 2,
+            "max_age_days": 180,
+        },
+    )
+    controller.import_report(
+        _report(), imported_at_utc="2026-08-28T00:00:00+00:00"
+    )
+    layer = WideShadowLayer(store, refresh_seconds=0)
+    for index in range(2):
+        observed = datetime(2026, 8, 28, 12 + index, tzinfo=UTC)
+        snapshot = _snapshot(3100 + index, observed)
+        layer.process_snapshot(snapshot)
+        if index == 0:
+            layer.process_outcomes(
+                [
+                    {
+                        "observation_id": snapshot["observation_id"],
+                        "outcome_schema_version": 1,
+                        "created_at_utc": (
+                            observed + timedelta(hours=2)
+                        ).isoformat(),
+                        "outcome": {
+                            "status": "resolved",
+                            "goal_to90_normal_time": True,
+                            "resolved_at_utc": (
+                                observed + timedelta(hours=2)
+                            ).isoformat(),
+                        },
+                    }
+                ]
+            )
+
+    result = controller.reconcile(now_utc="2026-08-29T00:00:00+00:00")
+
+    assert store.list_phases()[0]["status"] == "shadow"
+    assert result["readiness"][0]["milestone"] is None
+    assert result["readiness"][0]["pool_lifecycle"]["terminal_closed"] is False
+
+
+def test_pool_calendar_expiry_is_outcome_independent(tmp_path) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-01-01T00:00:00+00:00",
+        policy=_policy(),
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v1",
+            "terminal_look": 2,
+            "max_age_days": 180,
+        },
+    )
+    controller.import_report(
+        _report(), imported_at_utc="2026-01-01T00:00:00+00:00"
+    )
+
+    result = controller.reconcile(now_utc="2026-07-01T00:00:00+00:00")
+
+    assert store.list_phases()[0]["status"] == "paused"
+    assert result["readiness"][0]["pool_lifecycle"]["age_expired"] is True
+
+
+def test_pool_policy_is_frozen_per_phase(tmp_path) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    first = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v1",
+            "terminal_look": 200,
+            "max_age_days": 180,
+        },
+    )
+    first.import_report(
+        _report(), imported_at_utc="2026-08-28T00:00:00+00:00"
+    )
+    changed = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v1",
+            "terminal_look": 200,
+            "max_age_days": 365,
+        },
+    )
+
+    with pytest.raises(ValueError, match="different frozen pool lifecycle"):
+        changed.import_report(
+            _report(), imported_at_utc="2026-08-29T00:00:00+00:00"
+        )
+    assert (
+        store.list_phases()[0]["policy"]["pool_lifecycle"]["max_age_days"]
+        == 180
+    )
 
 
 def test_terminal_shadow_review_freezes_final_look_without_production(

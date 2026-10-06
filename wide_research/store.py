@@ -2201,6 +2201,167 @@ class WideResearchStore:
             assert updated is not None
             return self._decode_row(updated)
 
+    def transition_phases_atomically(
+        self,
+        transitions: Sequence[Mapping[str, Any]],
+        *,
+        actor: str = "automation",
+        changed_at_utc: Any = None,
+    ) -> list[Dict[str, Any]]:
+        """Apply a fully validated set of lifecycle CAS transitions."""
+
+        normalized_actor = _required_text(actor, "actor")
+        changed = _utc_timestamp(changed_at_utc or _utc_now(), "changed_at_utc")
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        projected = 1024
+        for item in transitions:
+            if not isinstance(item, Mapping):
+                raise ValueError("phase transition must be a mapping")
+            phase = _required_text(item.get("phase_id"), "phase_id")
+            if phase in seen:
+                raise ValueError(f"duplicate phase transition {phase}")
+            seen.add(phase)
+            target = _required_text(item.get("to_status"), "to_status").lower()
+            if target not in PHASE_STATUSES:
+                raise ValueError(f"unsupported phase status {target}")
+            expected = _required_text(
+                item.get("expected_status"), "expected_status"
+            ).lower()
+            reason = _required_text(item.get("reason"), "reason")
+            metadata_json = _canonical_json(dict(item.get("metadata") or {}))
+            projected += len(metadata_json) + 512
+            normalized.append(
+                {
+                    "phase_id": phase,
+                    "to_status": target,
+                    "expected_status": expected,
+                    "reason": reason,
+                    "metadata_json": metadata_json,
+                }
+            )
+        if not normalized:
+            return []
+        with self._write(projected_bytes=projected) as connection:
+            rows: dict[str, sqlite3.Row] = {}
+            for item in normalized:
+                phase = str(item["phase_id"])
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?", (phase,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown phase {phase}")
+                current = str(row["status"])
+                if current != item["expected_status"]:
+                    raise ConcurrentUpdateError(
+                        f"phase {phase} status is {current}, "
+                        f"expected {item['expected_status']}"
+                    )
+                if current == item["to_status"]:
+                    raise InvalidLifecycleTransition(
+                        f"phase {phase} is already {current}"
+                    )
+                if current in TERMINAL_PHASE_STATUSES:
+                    raise InvalidLifecycleTransition(
+                        f"terminal phase {phase} cannot move from "
+                        f"{current} to {item['to_status']}"
+                    )
+                rows[phase] = row
+            for item in normalized:
+                phase = str(item["phase_id"])
+                current = str(rows[phase]["status"])
+                connection.execute(
+                    "UPDATE phases SET status=?, updated_at_utc=? "
+                    "WHERE phase_id=?",
+                    (item["to_status"], changed, phase),
+                )
+                self._insert_lifecycle_event(
+                    connection,
+                    phase_id=phase,
+                    from_status=current,
+                    to_status=str(item["to_status"]),
+                    reason=str(item["reason"]),
+                    actor=normalized_actor,
+                    metadata=json.loads(str(item["metadata_json"])),
+                    created_at_utc=changed,
+                )
+            updated = []
+            for item in normalized:
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?",
+                    (item["phase_id"],),
+                ).fetchone()
+                assert row is not None
+                updated.append(self._decode_row(row))
+            return updated
+
+    def freeze_phase_pool_lifecycle_policy(
+        self,
+        phase_ids: Sequence[str],
+        policy: Mapping[str, Any],
+        *,
+        changed_at_utc: Any = None,
+    ) -> list[Dict[str, Any]]:
+        """Add one immutable pool policy to legacy phases as an audited migration."""
+
+        normalized_ids = [_required_text(value, "phase_id") for value in phase_ids]
+        if len(normalized_ids) != len(set(normalized_ids)):
+            raise ValueError("duplicate phase_id in pool policy migration")
+        if not normalized_ids:
+            return []
+        policy_json = _canonical_json(dict(policy))
+        changed = _utc_timestamp(changed_at_utc or _utc_now(), "changed_at_utc")
+        with self._write(
+            projected_bytes=len(normalized_ids) * (len(policy_json) + 1024)
+        ) as connection:
+            prepared: list[tuple[str, sqlite3.Row, str, str]] = []
+            for phase in normalized_ids:
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?", (phase,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown phase {phase}")
+                current_policy = json.loads(str(row["policy_json"]))
+                existing = current_policy.get("pool_lifecycle")
+                if existing is not None and _canonical_json(existing) != policy_json:
+                    raise ImmutableRecordError(
+                        f"phase {phase} has another frozen pool lifecycle policy"
+                    )
+                current_policy["pool_lifecycle"] = json.loads(policy_json)
+                updated_json = _canonical_json(current_policy)
+                prepared.append(
+                    (phase, row, updated_json, _json_hash(updated_json))
+                )
+            for phase, row, updated_json, updated_hash in prepared:
+                if json.loads(str(row["policy_json"])).get("pool_lifecycle") is not None:
+                    continue
+                connection.execute(
+                    "UPDATE phases SET policy_json=?, policy_hash=?, "
+                    "updated_at_utc=? WHERE phase_id=?",
+                    (updated_json, updated_hash, changed, phase),
+                )
+                self._insert_lifecycle_event(
+                    connection,
+                    phase_id=phase,
+                    from_status=str(row["status"]),
+                    to_status=str(row["status"]),
+                    reason="pool_lifecycle_policy_migrated",
+                    actor="automation",
+                    metadata={
+                        "policy": json.loads(policy_json),
+                        "outcome_independent": True,
+                    },
+                    created_at_utc=changed,
+                )
+            result = []
+            for phase in normalized_ids:
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?", (phase,)
+                ).fetchone()
+                assert row is not None
+                result.append(self._decode_row(row))
+            return result
+
     @staticmethod
     def _pointer_checksum(
         *,
