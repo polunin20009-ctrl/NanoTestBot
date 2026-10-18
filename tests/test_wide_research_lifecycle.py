@@ -65,6 +65,54 @@ def test_readiness_accepts_strong_diverse_stable_candidate():
     assert decision.metrics["resolved"] == 300
 
 
+def test_normal_readiness_accepts_ninety_percent_with_wilson_floor():
+    # 139/150 clears target 0.90, Wilson ≥0.85, and Holm at look α=0.05/8.
+    metrics = {
+        "wins": 139,
+        "losses": 11,
+        "span_days": 30.0,
+        "trigger_days": 20,
+        "leagues": 10,
+        "max_league_share": 0.25,
+        "triggers_per_week": 5.0,
+        "weekly": [
+            {"wins": 35, "losses": 3},
+            {"wins": 35, "losses": 3},
+            {"wins": 34, "losses": 3},
+            {"wins": 35, "losses": 2},
+        ],
+    }
+    decision = evaluate_readiness(metrics)
+    assert metrics["wins"] + metrics["losses"] == 150
+    assert decision.metrics["hit_rate"] >= 0.90
+    assert decision.metrics["wilson_lower"] >= 0.85
+    assert decision.eligible
+    assert decision.target_state == "READY"
+
+
+def test_normal_readiness_still_rejects_weak_wilson_floor():
+    metrics = {
+        "wins": 135,
+        "losses": 15,
+        "span_days": 30.0,
+        "trigger_days": 20,
+        "leagues": 10,
+        "max_league_share": 0.25,
+        "triggers_per_week": 5.0,
+        "weekly": [
+            {"wins": 34, "losses": 4},
+            {"wins": 34, "losses": 4},
+            {"wins": 33, "losses": 4},
+            {"wins": 34, "losses": 3},
+        ],
+    }
+    decision = evaluate_readiness(metrics)
+    assert decision.metrics["hit_rate"] == 0.9
+    assert decision.metrics["wilson_lower"] < 0.85
+    assert not decision.eligible
+    assert "wilson_lower_below_gate" in decision.reasons
+
+
 def test_readiness_rejects_league_concentration():
     metrics = _ready_metrics()
     metrics["max_league_share"] = 0.8

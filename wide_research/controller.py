@@ -40,6 +40,44 @@ POOL_LIFECYCLE_POLICY_VERSION = "wide_pool_lifecycle_v1"
 MAX_EVALUATED_PHASES = 64
 
 
+def _lifecycle_policy_manifest(policy: LifecyclePolicy) -> dict[str, Any]:
+    payload = policy.manifest()
+    payload["allowed_looks"] = list(policy.allowed_looks)
+    return payload
+
+
+def _relaxable_lifecycle_predecessors() -> tuple[dict[str, Any], ...]:
+    """Known frozen v1 manifests that may move onto the current runtime gates.
+
+    Custom or experimental frozen policies are intentionally absent so reconcile
+    cannot rewrite them when the process defaults change.
+    """
+
+    primary_v1 = _lifecycle_policy_manifest(
+        LifecyclePolicy(
+            version="wide_lifecycle_v1",
+            target_hit_rate=0.95,
+            null_hit_rate=0.90,
+            min_resolved=200,
+            min_wilson_lower=0.90,
+            min_weekly_hit_rate=0.90,
+        )
+    )
+    rare_v1 = _lifecycle_policy_manifest(
+        LifecyclePolicy(
+            version="wide_lifecycle_v1",
+            target_hit_rate=0.95,
+            null_hit_rate=0.90,
+            min_resolved=200,
+            min_wilson_lower=0.90,
+            min_weekly_hit_rate=0.90,
+            min_triggers_per_week=0.0,
+            allowed_looks=(50, 100, 200),
+        )
+    )
+    return (primary_v1, rare_v1)
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -1419,6 +1457,43 @@ class WideResearchController:
         )
         return [str(row["phase_id"]) for row in migrated]
 
+    def _migrate_relaxed_lifecycle_policy(self, now: datetime) -> list[str]:
+        """Audited move from known strict v1 gates onto the runtime policy.
+
+        Custom frozen policies stay untouched.  Only candidate/shadow phases
+        whose lifecycle exactly matches a documented predecessor are rewritten
+        so live research can use the relaxed READY gates without weakening
+        intentionally stricter or experimental phase contracts.
+        """
+
+        desired = self.policy.manifest()
+        desired["allowed_looks"] = list(self.policy.allowed_looks)
+        predecessors = _relaxable_lifecycle_predecessors()
+        updates = []
+        for phase in self.store.list_phases(statuses=("candidate", "shadow")):
+            current = dict(_mapping(_mapping(phase.get("policy")).get("lifecycle")))
+            if current == desired or current not in predecessors:
+                continue
+            # Terminal hard-shadow cohorts keep their final look contract; skip
+            # rather than break reconcile when looks cannot align.
+            terminal = _phase_terminal_review_policy(phase)
+            if terminal is not None and int(terminal["final_look"]) != max(
+                self.policy.allowed_looks
+            ):
+                continue
+            updates.append(
+                {
+                    "phase_id": str(phase["phase_id"]),
+                    "expected_status": str(phase["status"]),
+                    "lifecycle_policy": desired,
+                }
+            )
+        migrated = self.store.replace_phase_lifecycle_policies(
+            updates,
+            changed_at_utc=_utc_iso(now),
+        )
+        return [str(row["phase_id"]) for row in migrated]
+
     def reconcile(self, *, now_utc: Optional[str] = None) -> dict[str, Any]:
         now = _parse_utc(now_utc) if now_utc else datetime.now(timezone.utc)
         pointer = self.store.get_active_pointer(self.pointer_name)
@@ -1484,6 +1559,7 @@ class WideResearchController:
             pointed_phase_id = ""
         purge_transition_retired = self._finalize_purge_transition(now)
         pool_policy_migrated = self._migrate_current_pool_lifecycle(now)
+        lifecycle_policy_migrated = self._migrate_relaxed_lifecycle_policy(now)
         phase_rows = self.store.list_phases()
         for phase in phase_rows:
             phase_id = str(phase["phase_id"])
@@ -1928,6 +2004,7 @@ class WideResearchController:
             "promoted_phase_id": promoted,
             "purge_transition_retired_phase_ids": purge_transition_retired,
             "pool_policy_migrated_phase_ids": pool_policy_migrated,
+            "lifecycle_policy_migrated_phase_ids": lifecycle_policy_migrated,
             "active_pointer": pointer,
             "active_manifest": published,
         }

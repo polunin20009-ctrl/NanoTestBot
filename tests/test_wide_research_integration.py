@@ -569,8 +569,8 @@ def test_rare_precision_components_are_isolated_and_terminal_shadow_only(
     assert captured["production_enabled"] is False
     assert captured["terminal_review_enabled"] is True
     assert captured["terminal_review_min_hit_rate"] == 0.90
-    assert captured["policy"].allowed_looks == (50, 100, 200)
-    assert captured["policy"].min_resolved == 200
+    assert captured["policy"].allowed_looks == (50, 100, 150, 200)
+    assert captured["policy"].min_resolved == 150
     assert captured["policy"].min_triggers_per_week == 0.0
 
 
@@ -826,7 +826,9 @@ def test_rare_precision_summary_requires_mode_specific_frozen_contract(
     lifecycle_policy = (
         bot.WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.manifest()
     )
-    lifecycle_policy["allowed_looks"] = [50, 100, 200]
+    lifecycle_policy["allowed_looks"] = list(
+        bot.WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY.allowed_looks
+    )
     payload = {
         "cycle_type": "discovery",
         "store_profile": "rare_precision_shadow",

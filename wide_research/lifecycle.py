@@ -19,7 +19,7 @@ from statistics import NormalDist
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
-LIFECYCLE_POLICY_VERSION = "wide_lifecycle_v1"
+LIFECYCLE_POLICY_VERSION = "wide_lifecycle_v2"
 ACTIVE_MANIFEST_SCHEMA_VERSION = 1
 READY = "READY"
 SHADOW = "SHADOW"
@@ -108,16 +108,18 @@ class LifecyclePolicy:
     """Immutable gates for automatic READY/promotion/degradation decisions."""
 
     version: str = LIFECYCLE_POLICY_VERSION
-    target_hit_rate: float = 0.95
-    null_hit_rate: float = 0.90
-    min_resolved: int = 200
+    # Research READY uses normal gates. Telegram switching stays on the
+    # separate automatic-champion policy and remains stricter.
+    target_hit_rate: float = 0.90
+    null_hit_rate: float = 0.85
+    min_resolved: int = 150
     min_span_days: float = 28.0
     min_trigger_days: int = 14
     min_leagues: int = 8
     max_league_share: float = 0.35
-    min_wilson_lower: float = 0.90
+    min_wilson_lower: float = 0.85
     min_weekly_windows: int = 4
-    min_weekly_hit_rate: float = 0.90
+    min_weekly_hit_rate: float = 0.85
     min_triggers_per_week: float = 2.0
     family_alpha: float = 0.05
     allowed_looks: tuple[int, ...] = (50, 100, 150, 200, 300, 500, 750, 1000)

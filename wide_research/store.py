@@ -2295,6 +2295,95 @@ class WideResearchStore:
                 updated.append(self._decode_row(row))
             return updated
 
+    def replace_phase_lifecycle_policies(
+        self,
+        updates: Sequence[Mapping[str, Any]],
+        *,
+        changed_at_utc: Any = None,
+    ) -> list[Dict[str, Any]]:
+        """Atomically replace frozen lifecycle gates on selected phases."""
+
+        normalized: list[tuple[str, str, dict[str, Any]]] = []
+        seen: set[str] = set()
+        for item in updates:
+            if not isinstance(item, Mapping):
+                raise ValueError("lifecycle policy update must be a mapping")
+            phase = _required_text(item.get("phase_id"), "phase_id")
+            if phase in seen:
+                raise ValueError(f"duplicate phase lifecycle update {phase}")
+            seen.add(phase)
+            expected = _required_text(
+                item.get("expected_status"), "expected_status"
+            ).lower()
+            policy = item.get("lifecycle_policy")
+            if not isinstance(policy, Mapping):
+                raise ValueError("lifecycle_policy must be a mapping")
+            normalized.append((phase, expected, dict(policy)))
+        if not normalized:
+            return []
+        changed = _utc_timestamp(changed_at_utc or _utc_now(), "changed_at_utc")
+        projected = sum(
+            len(_canonical_json(policy)) + 1024 for _phase, _status, policy in normalized
+        )
+        with self._write(projected_bytes=projected) as connection:
+            prepared: list[tuple[str, sqlite3.Row, str, str, dict[str, Any]]] = []
+            for phase, expected, policy in normalized:
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?", (phase,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown phase {phase}")
+                current = str(row["status"])
+                if current != expected:
+                    raise ConcurrentUpdateError(
+                        f"phase {phase} status is {current}, expected {expected}"
+                    )
+                if current in TERMINAL_PHASE_STATUSES:
+                    raise InvalidLifecycleTransition(
+                        f"terminal phase {phase} cannot change lifecycle policy"
+                    )
+                current_policy = json.loads(str(row["policy_json"]))
+                previous = current_policy.get("lifecycle")
+                current_policy["lifecycle"] = policy
+                updated_json = _canonical_json(current_policy)
+                prepared.append(
+                    (
+                        phase,
+                        row,
+                        updated_json,
+                        _json_hash(updated_json),
+                        {
+                            "previous_lifecycle": previous,
+                            "lifecycle": policy,
+                            "outcome_independent": True,
+                        },
+                    )
+                )
+            for phase, row, updated_json, updated_hash, metadata in prepared:
+                connection.execute(
+                    "UPDATE phases SET policy_json=?, policy_hash=?, "
+                    "updated_at_utc=? WHERE phase_id=?",
+                    (updated_json, updated_hash, changed, phase),
+                )
+                self._insert_lifecycle_event(
+                    connection,
+                    phase_id=phase,
+                    from_status=str(row["status"]),
+                    to_status=str(row["status"]),
+                    reason="lifecycle_policy_relaxed_v2",
+                    actor="automation",
+                    metadata=metadata,
+                    created_at_utc=changed,
+                )
+            result = []
+            for phase, _expected, _policy in normalized:
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?", (phase,)
+                ).fetchone()
+                assert row is not None
+                result.append(self._decode_row(row))
+            return result
+
     def freeze_phase_pool_lifecycle_policy(
         self,
         phase_ids: Sequence[str],

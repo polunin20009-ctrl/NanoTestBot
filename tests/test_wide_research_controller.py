@@ -500,6 +500,46 @@ def test_reconcile_finalizes_purge_overlap_and_migrates_current_policy(
     )
 
 
+def test_reconcile_migrates_shadow_phases_to_relaxed_lifecycle_gates(
+    tmp_path,
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    old_policy = LifecyclePolicy(
+        version="wide_lifecycle_v1",
+        target_hit_rate=0.95,
+        null_hit_rate=0.90,
+        min_resolved=200,
+        min_wilson_lower=0.90,
+        min_weekly_hit_rate=0.90,
+    )
+    importer = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-09-01T00:00:00+00:00",
+        policy=old_policy,
+    )
+    imported = importer.import_report(
+        _generation_report("legacy-gates", "v9", 1),
+        imported_at_utc="2026-09-01T01:00:00+00:00",
+    )
+    phase_id = imported["imported"][0]["phase_id"]
+    assert store.list_phases()[0]["policy"]["lifecycle"]["min_wilson_lower"] == 0.90
+
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-09-01T00:00:00+00:00",
+    )
+    result = controller.reconcile(now_utc="2026-09-02T00:00:00+00:00")
+
+    assert result["lifecycle_policy_migrated_phase_ids"] == [phase_id]
+    lifecycle = store.list_phases()[0]["policy"]["lifecycle"]
+    assert lifecycle["version"] == "wide_lifecycle_v2"
+    assert lifecycle["min_resolved"] == 150
+    assert lifecycle["min_wilson_lower"] == 0.85
+    assert lifecycle["target_hit_rate"] == 0.90
+
+
 def test_purged_report_requires_matching_partition_artifacts(tmp_path) -> None:
     store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
     controller = WideResearchController(
