@@ -1464,7 +1464,7 @@ SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS = max(
     int(
         os.environ.get(
             "SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS",
-            "900",
+            "1800",
         )
     ),
 )
