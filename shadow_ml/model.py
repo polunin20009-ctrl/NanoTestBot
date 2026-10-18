@@ -392,10 +392,26 @@ def _next15_quality_diagnostics(
     }
 
 
+# xG coverage is provider-sparse and must not veto offline readiness alone.
+# Diagnostics still report it; the readiness gate uses required metrics only.
+_CORE_LIVE_METRIC_NAMES = (
+    "xg",
+    "shots_on_target",
+    "shots_in_box",
+    "pressure_index",
+)
+_OPTIONAL_CORE_LIVE_METRICS = frozenset({"xg"})
+_REQUIRED_CORE_LIVE_METRICS = tuple(
+    name
+    for name in _CORE_LIVE_METRIC_NAMES
+    if name not in _OPTIONAL_CORE_LIVE_METRICS
+)
+
+
 def _core_live_metric_diagnostics(
     eligible: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    metric_names = ("xg", "shots_on_target", "shots_in_box", "pressure_index")
+    metric_names = _CORE_LIVE_METRIC_NAMES
     available_by_metric = {name: 0 for name in metric_names}
     for item in eligible:
         record = _as_mapping(item.get("record"))
@@ -419,13 +435,26 @@ def _core_live_metric_diagnostics(
     rows = len(eligible)
     total_slots = rows * len(metric_names)
     available_slots = sum(available_by_metric.values())
+    required_total_slots = rows * len(_REQUIRED_CORE_LIVE_METRICS)
+    required_available_slots = sum(
+        available_by_metric[name] for name in _REQUIRED_CORE_LIVE_METRICS
+    )
     return {
         "rows_evaluated": rows,
         "metric_groups": list(metric_names),
+        "optional_metric_groups": sorted(_OPTIONAL_CORE_LIVE_METRICS),
+        "required_metric_groups": list(_REQUIRED_CORE_LIVE_METRICS),
         "available_slots": available_slots,
         "total_slots": total_slots,
         "availability_fraction": (
             round(available_slots / total_slots, 9) if total_slots else None
+        ),
+        "required_available_slots": required_available_slots,
+        "required_total_slots": required_total_slots,
+        "required_availability_fraction": (
+            round(required_available_slots / required_total_slots, 9)
+            if required_total_slots
+            else None
         ),
         "per_metric": {
             name: {
@@ -435,6 +464,8 @@ def _core_live_metric_diagnostics(
                     if rows
                     else None
                 ),
+                "required_for_readiness": name
+                in _REQUIRED_CORE_LIVE_METRICS,
             }
             for name in metric_names
         },
@@ -1595,9 +1626,15 @@ def _train_target(
         ):
             readiness_reasons.append("offline_next15_unknown_fraction")
 
+    # Prefer the required-metric fraction so sparse optional feeds (xG) do not
+    # veto readiness while shots/pressure coverage stays healthy.
     core_availability = _finite_float(
-        core_live_metrics.get("availability_fraction")
+        core_live_metrics.get("required_availability_fraction")
     )
+    if core_availability is None:
+        core_availability = _finite_float(
+            core_live_metrics.get("availability_fraction")
+        )
     if (
         core_availability is None
         or core_availability < config.offline_ready_min_core_availability

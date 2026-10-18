@@ -585,7 +585,7 @@ def test_next15_unknown_fraction_blocks_only_next15_offline_readiness() -> None:
     assert to90["status"] == "offline_ready"
 
 
-def test_low_core_live_metric_availability_blocks_both_targets() -> None:
+def test_missing_xg_does_not_block_offline_core_availability() -> None:
     rows = _training_rows(20)
     for record in rows:
         record["raw_metrics"].pop("xg_home")
@@ -601,7 +601,49 @@ def test_low_core_live_metric_availability_blocks_both_targets() -> None:
 
     quality = artifact["training_summary"]["data_quality"]["core_live_metrics"]
     assert quality["availability_fraction"] == 0.75
+    assert quality["required_availability_fraction"] == 1.0
+    assert quality["optional_metric_groups"] == ["xg"]
+    assert quality["required_metric_groups"] == [
+        "shots_on_target",
+        "shots_in_box",
+        "pressure_index",
+    ]
     assert quality["per_metric"]["xg"]["availability_fraction"] == 0.0
+    assert quality["per_metric"]["xg"]["required_for_readiness"] is False
+    for target in ("next15", "to90"):
+        target_model = artifact["targets"][target]
+        assert target_model["trained"] is True
+        assert (
+            "offline_core_live_metric_availability"
+            not in target_model["readiness_reasons"]
+        )
+        assert target_model["status"] == "offline_ready"
+
+
+def test_low_required_core_live_metric_availability_blocks_both_targets() -> None:
+    rows = _training_rows(20)
+    for record in rows:
+        record["raw_metrics"].pop("shots_on_target_home")
+        record["raw_metrics"].pop("shots_on_target_away")
+        record["availability"]["shots_on_target_home"] = False
+        record["availability"]["shots_on_target_away"] = False
+
+    artifact = model.train_shadow_model(
+        rows,
+        config=_small_config(),
+        now="2026-03-01T00:00:00+00:00",
+    )
+
+    quality = artifact["training_summary"]["data_quality"]["core_live_metrics"]
+    assert quality["required_availability_fraction"] == round(2 / 3, 9)
+    assert (
+        quality["per_metric"]["shots_on_target"]["availability_fraction"]
+        == 0.0
+    )
+    assert (
+        quality["per_metric"]["shots_on_target"]["required_for_readiness"]
+        is True
+    )
     for target in ("next15", "to90"):
         target_model = artifact["targets"][target]
         assert target_model["trained"] is True
