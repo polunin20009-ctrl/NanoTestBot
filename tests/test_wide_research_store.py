@@ -509,6 +509,38 @@ def test_lifecycle_and_active_pointer_use_compare_and_swap(tmp_path):
     assert cleared["phase_id"] is None
 
 
+def test_batch_lifecycle_transition_rolls_back_on_one_stale_status(tmp_path):
+    store = make_store(tmp_path)
+    register(store, rule_id="r1", phase_id="p1")
+    register(store, rule_id="r2", phase_id="p2")
+    store.transition_phase(
+        "p2", "ready", expected_status="shadow", reason="fixture setup"
+    )
+
+    with pytest.raises(ConcurrentUpdateError, match="p2 status is ready"):
+        store.transition_phases_atomically(
+            [
+                {
+                    "phase_id": "p1",
+                    "to_status": "retired",
+                    "expected_status": "shadow",
+                    "reason": "batch cleanup",
+                },
+                {
+                    "phase_id": "p2",
+                    "to_status": "retired",
+                    "expected_status": "shadow",
+                    "reason": "batch cleanup",
+                },
+            ]
+        )
+
+    assert {row["phase_id"]: row["status"] for row in store.list_phases()} == {
+        "p1": "shadow",
+        "p2": "ready",
+    }
+
+
 def test_pointer_checksum_corruption_is_detected(tmp_path):
     store = make_store(tmp_path)
     register(store, status="active")

@@ -500,9 +500,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         controller_kwargs.update(
             {
                 "policy": LifecyclePolicy(
-                    min_resolved=200,
+                    min_resolved=150,
                     min_triggers_per_week=0.0,
-                    allowed_looks=(50, 100, 200),
+                    allowed_looks=(50, 100, 150, 200),
                 ),
                 "terminal_review_enabled": True,
                 "terminal_review_min_hit_rate": 0.90,
