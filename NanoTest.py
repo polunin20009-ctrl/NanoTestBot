@@ -1464,13 +1464,13 @@ SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS = max(
     int(
         os.environ.get(
             "SHADOW_ML_TRAIN_SUBPROCESS_TIMEOUT_SECONDS",
-            "900",
+            "1800",
         )
     ),
 )
 SHADOW_ML_WORKER_MEMORY_LIMIT_MB = max(
     512,
-    int(os.environ.get("SHADOW_ML_WORKER_MEMORY_LIMIT_MB", "3072")),
+    int(os.environ.get("SHADOW_ML_WORKER_MEMORY_LIMIT_MB", "5120")),
 )
 SHADOW_ML_CANDIDATE_MIN_FIXTURES = max(
     20, int(os.environ.get("SHADOW_ML_CANDIDATE_MIN_FIXTURES", "150"))
