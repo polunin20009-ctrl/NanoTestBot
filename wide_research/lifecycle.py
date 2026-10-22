@@ -19,7 +19,7 @@ from statistics import NormalDist
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
-LIFECYCLE_POLICY_VERSION = "wide_lifecycle_v2"
+LIFECYCLE_POLICY_VERSION = "wide_lifecycle_v3"
 ACTIVE_MANIFEST_SCHEMA_VERSION = 1
 READY = "READY"
 SHADOW = "SHADOW"
@@ -112,13 +112,15 @@ class LifecyclePolicy:
     # separate automatic-champion policy and remains stricter.
     target_hit_rate: float = 0.90
     null_hit_rate: float = 0.85
-    min_resolved: int = 150
-    min_span_days: float = 28.0
-    min_trigger_days: int = 14
+    min_resolved: int = 200
+    min_span_days: float = 10.0
+    # Calendar coverage is governed by min_span_days. Requiring fourteen
+    # distinct trigger dates would silently restore a fourteen-day minimum.
+    min_trigger_days: int = 1
     min_leagues: int = 8
     max_league_share: float = 0.35
     min_wilson_lower: float = 0.85
-    min_weekly_windows: int = 4
+    min_weekly_windows: int = 2
     min_weekly_hit_rate: float = 0.85
     min_triggers_per_week: float = 2.0
     family_alpha: float = 0.05

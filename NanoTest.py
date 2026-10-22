@@ -913,8 +913,10 @@ WIDE_RESEARCH_MAX_SHADOW_RULES = max(
     1, min(20, int(os.environ.get("WIDE_RESEARCH_MAX_SHADOW_RULES", "10")))
 )
 WIDE_RESEARCH_POOL_LIFECYCLE_POLICY = {
-    "version": "wide_pool_lifecycle_v1",
-    "terminal_look": 200,
+    "version": "wide_pool_lifecycle_v2",
+    "selection_look": 200,
+    "selection_min_hit_rate": 0.90,
+    "terminal_look": 1000,
     "max_age_days": 180,
 }
 WIDE_RESEARCH_MAX_DB_BYTES = max(
@@ -1282,13 +1284,14 @@ WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_BEAM_WIDTH = 128
 WIDE_RESEARCH_RARE_PRECISION_ALLOW_FEATURE_RANGES = True
 WIDE_RESEARCH_RARE_PRECISION_VALIDATION_WINDOW_COUNT = 4
 WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY = LifecyclePolicy(
-    min_resolved=150,
     min_triggers_per_week=0.0,
-    allowed_looks=(50, 100, 150, 200),
+    allowed_looks=(50, 100, 200, 300, 500, 750, 1000),
 )
 WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY = {
-    "version": "wide_pool_lifecycle_v1",
-    "terminal_look": 200,
+    "version": "wide_pool_lifecycle_v2",
+    "selection_look": 200,
+    "selection_min_hit_rate": 0.90,
+    "terminal_look": 1000,
     "max_age_days": 365,
 }
 WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES = max(
@@ -25102,9 +25105,12 @@ def _wide_research_rare_precision_summary_is_current(
     if not isinstance(profile_contract, Mapping):
         return False
     lifecycle_policy = profile_contract.get("lifecycle_policy")
+    pool_lifecycle = profile_contract.get("pool_lifecycle")
     terminal_review = profile_contract.get("terminal_review")
-    if not isinstance(lifecycle_policy, Mapping) or not isinstance(
-        terminal_review, Mapping
+    if (
+        not isinstance(lifecycle_policy, Mapping)
+        or not isinstance(pool_lifecycle, Mapping)
+        or not isinstance(terminal_review, Mapping)
     ):
         return False
     expected_lifecycle_policy = (
@@ -25168,6 +25174,8 @@ def _wide_research_rare_precision_summary_is_current(
             and int(profile_contract.get("max_shadow_rules"))
             == WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES
             and dict(lifecycle_policy) == expected_lifecycle_policy
+            and dict(pool_lifecycle)
+            == WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY
             and terminal_review.get("enabled") is True
             and int(terminal_review.get("final_look")) == 200
             and float(terminal_review.get("min_point_hit_rate")) == 0.90

@@ -149,21 +149,23 @@ Readiness is checked only at pre-registered resolved-sample milestones:
 `50, 100, 150, 200, 300, 500, 750, 1000`. The default policy cannot pass before
 200 resolved triggers. At a closed look, all of these gates must pass:
 
-- observed hit rate is at least 95%;
-- the lower bound of the 95% Wilson interval is at least 90%;
-- the prospective span is at least 28 days;
-- triggers occurred on at least 14 distinct days;
+- observed hit rate is at least 90%;
+- the lower bound of the 95% Wilson interval is at least 85%;
+- the prospective span is at least 10 calendar days;
 - at least 8 leagues are represented;
 - no league contributes more than 35% of resolved triggers;
 - frequency is at least 2 resolved triggers per week;
-- at least 4 weekly windows have a hit rate of at least 90%;
-- a one-sided binomial test beats the 90% null after correction for both the
+- at least 2 weekly windows have a hit rate of at least 85%;
+- a one-sided binomial test beats the 85% null after correction for both the
   fixed discovery-run candidate family, repeated milestone looks, and the
   telescoping alpha budget spent across successive discovery runs.
 
-If a rule fails at 200, extra results do not continuously move that same test;
-the next fresh decision point is the next configured milestone. This avoids
-repeatedly checking after every favorable result.
+The first 200 results are also a pool-selection stage. A rule below 90% stops
+and frees its slot. A rule at or above 90% keeps collecting, even when those
+200 arrived in fewer than 10 days, and receives fresh READY decisions only at
+the pre-registered 300/500/750/1000 milestones. This avoids both the old
+impossible "stop at 200, then wait for time to pass" state and repeated checking
+after every favorable result.
 
 Historical holdout, historical Telegram signals, and outcomes before the phase
 boundary are never added to these gates.
@@ -394,7 +396,7 @@ Wilson ranking penalizes tiny samples, and no historical result can become
 production evidence. `precision_shadow` has a separate bound SQLite database,
 no `ActiveRuleRouter`, and hard-rejects production mode. Its lifecycle does run
 the ordinary prospective readiness checks (at least 200 resolved triggers,
-28 days, 14 trigger days, 8 leagues, Wilson lower bound at least 90%, weekly
+10 calendar days, 8 leagues, Wilson lower bound at least 85%, weekly
 stability and corrected significance). A passing phase may be marked READY in
 the laboratory database, but `production_enabled=false` makes promotion or
 Telegram routing impossible until a separately reviewed policy is implemented.
@@ -473,22 +475,23 @@ with the original evaluator. This speeds up the larger search without sampling
 or dropping observations.
 
 Each admitted rule automatically starts an immutable prospective phase at
-import time. Reviews use the first 50, 100 and 200 triggered fixtures. Poor
+import time. Initial reviews use the first 50, 100 and 200 triggered fixtures. Poor
 interim results do not replace or restart the candidate. Once the first 200
-fixtures are claimed, further admission is capped atomically and the lifecycle
-pauses the phase, freeing its executable pool slot. Pending outcomes still
-resolve against that fixed cohort. The evidence remains on disk. Rediscovery
+fixtures close, rules below 90% pause and free their executable pool slots.
+Rules at or above 90% continue collecting fresh evidence through the
+300/500/750/1000 milestones. Pending outcomes still resolve against the fixed
+200-fixture selection cohort. The evidence remains on disk. Rediscovery
 of the same executable rule reuses that identity across search-version
 changes, and corrections to its outcomes remain
 visible in subsequent reports. A run with no finalists preserves ongoing
 phases. If all 64 slots are occupied, admission explicitly reports the
 unadmitted candidates; it does not evict rules based on wins and losses.
 
-At the final review, observed hit rate of at least 90% is labelled
-`reviewable`; this is a request for manual examination, not proof of 93%.
-The ordinary stricter readiness gates are also reported separately. Every
-terminal phase stays paused even when those gates pass. This profile has no
-production router and cannot publish a Telegram signal.
+At the 200-result selection review, observed hit rate of at least 90% is
+labelled `reviewable` and permits continued collection. The ordinary readiness
+gates are reported separately and can pass only from 200 results and 10
+calendar days onward. This profile has no production router and cannot publish
+a Telegram signal.
 
 #### Extended expressions and causal market scope (September 11)
 
@@ -622,8 +625,10 @@ python3.12 scripts/report_wide_research.py \
   --db data/wide_research_rare_precision.sqlite3 --json
 ```
 
-`terminal_review` reports the frozen 200-fixture result and whether its outcomes
-have all closed. Unknown outcomes are never replaced by later wins.
+`terminal_review` reports the frozen 200-fixture selection result and whether
+its outcomes have all closed. Unknown outcomes are never replaced by later
+wins. Reviewable rules keep collecting after that frozen selection cohort;
+non-reviewable rules pause.
 
 ## Commands and reports
 
@@ -738,7 +743,7 @@ the DB, pointer, phase timestamps, checksums, or artifact files by hand.
 
 ## Limitations
 
-The 95% target is a qualification policy, not a promise. Even a rule that
+The 90% target is a qualification policy, not a promise. Even a rule that
 passes all gates can perform worse later because competitions, teams, API data,
 market conditions, and match populations change. A high point estimate on a
 small or concentrated sample is specifically not enough; that is why the
@@ -750,7 +755,7 @@ conjunctions, not every possible program or causal explanation. Rare 100%
 historical rules are usually fragile and may never collect 200 prospective
 triggers. Conversely, a useful high-coverage rule can be rejected if its
 uncertainty remains too large. Automatic replacement reduces stale-rule risk
-but cannot guarantee a continuously available 95% champion; during gaps the
+but cannot guarantee a continuously available 90% champion; during gaps the
 correct behavior is the existing-filter fallback.
 
 Treat wide research as an auditable candidate factory and safety-controlled

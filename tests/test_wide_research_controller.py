@@ -499,6 +499,28 @@ def test_reconcile_finalizes_purge_overlap_and_migrates_current_policy(
         for phase_id in current_ids
     )
 
+    staged_pool_policy = {
+        "version": "wide_pool_lifecycle_v2",
+        "selection_look": 200,
+        "selection_min_hit_rate": 0.90,
+        "terminal_look": 1000,
+        "max_age_days": 180,
+    }
+    staged = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-09-01T00:00:00+00:00",
+        max_shadow_rules=2,
+        pool_lifecycle_policy=staged_pool_policy,
+    )
+    staged_result = staged.reconcile(now_utc="2026-09-05T00:00:00+00:00")
+    assert set(staged_result["pool_policy_migrated_phase_ids"]) == current_ids
+    phases = {row["phase_id"]: row for row in store.list_phases()}
+    assert all(
+        phases[phase_id]["policy"]["pool_lifecycle"] == staged_pool_policy
+        for phase_id in current_ids
+    )
+
 
 def test_reconcile_migrates_shadow_phases_to_relaxed_lifecycle_gates(
     tmp_path,
@@ -509,7 +531,10 @@ def test_reconcile_migrates_shadow_phases_to_relaxed_lifecycle_gates(
         target_hit_rate=0.95,
         null_hit_rate=0.90,
         min_resolved=200,
+        min_span_days=28.0,
+        min_trigger_days=14,
         min_wilson_lower=0.90,
+        min_weekly_windows=4,
         min_weekly_hit_rate=0.90,
     )
     importer = WideResearchController(
@@ -534,8 +559,9 @@ def test_reconcile_migrates_shadow_phases_to_relaxed_lifecycle_gates(
 
     assert result["lifecycle_policy_migrated_phase_ids"] == [phase_id]
     lifecycle = store.list_phases()[0]["policy"]["lifecycle"]
-    assert lifecycle["version"] == "wide_lifecycle_v2"
-    assert lifecycle["min_resolved"] == 150
+    assert lifecycle["version"] == "wide_lifecycle_v3"
+    assert lifecycle["min_resolved"] == 200
+    assert lifecycle["min_span_days"] == 10.0
     assert lifecycle["min_wilson_lower"] == 0.85
     assert lifecycle["target_hit_rate"] == 0.90
 
@@ -979,6 +1005,154 @@ def test_pool_terminal_pending_outcome_keeps_phase_running(tmp_path) -> None:
     assert store.list_phases()[0]["status"] == "shadow"
     assert result["readiness"][0]["milestone"] is None
     assert result["readiness"][0]["pool_lifecycle"]["terminal_closed"] is False
+
+
+def test_staged_pool_keeps_strong_selection_collecting_past_first_look(
+    tmp_path,
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    policy = replace(
+        _policy(),
+        min_resolved=3,
+        allowed_looks=(2, 3),
+    )
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        policy=policy,
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v2",
+            "selection_look": 2,
+            "selection_min_hit_rate": 0.90,
+            "terminal_look": 3,
+            "max_age_days": 180,
+        },
+    )
+    phase_id = controller.import_report(
+        _report(), imported_at_utc="2026-08-28T00:00:00+00:00"
+    )["imported"][0]["phase_id"]
+    layer = WideShadowLayer(store, refresh_seconds=0)
+
+    for index in range(2):
+        observed = datetime(2026, 8, 28, 12 + index, tzinfo=UTC)
+        snapshot = _snapshot(3200 + index, observed)
+        layer.process_snapshot(snapshot)
+        layer.process_outcomes(
+            [
+                {
+                    "observation_id": snapshot["observation_id"],
+                    "outcome_schema_version": 1,
+                    "created_at_utc": (observed + timedelta(hours=2)).isoformat(),
+                    "outcome": {
+                        "status": "resolved",
+                        "goal_to90_normal_time": True,
+                        "resolved_at_utc": (
+                            observed + timedelta(hours=2)
+                        ).isoformat(),
+                    },
+                }
+            ]
+        )
+
+    blocked_until_scored = layer.process_snapshot(
+        _snapshot(3299, datetime(2026, 8, 28, 18, tzinfo=UTC))
+    )
+    assert blocked_until_scored["claimed"] == []
+    selected = controller.reconcile(now_utc="2026-08-29T00:00:00+00:00")
+    selection = selected["readiness"][0]["pool_lifecycle"]["selection"]
+    assert selection["continue"] is True
+    assert store.list_phases()[0]["status"] == "shadow"
+
+    observed = datetime(2026, 8, 29, 12, tzinfo=UTC)
+    snapshot = _snapshot(3202, observed)
+    assert len(layer.process_snapshot(snapshot)["claimed"]) == 1
+    layer.process_outcomes(
+        [
+            {
+                "observation_id": snapshot["observation_id"],
+                "outcome_schema_version": 1,
+                "created_at_utc": (observed + timedelta(hours=2)).isoformat(),
+                "outcome": {
+                    "status": "resolved",
+                    "goal_to90_normal_time": True,
+                    "resolved_at_utc": (observed + timedelta(hours=2)).isoformat(),
+                },
+            }
+        ]
+    )
+    controller.reconcile(now_utc="2026-08-30T00:00:00+00:00")
+    assert store.list_phases()[0]["status"] == "ready"
+    assert len(store.list_triggers(phase_id=phase_id)) == 3
+    capped = layer.process_snapshot(
+        _snapshot(3203, datetime(2026, 8, 30, 12, tzinfo=UTC))
+    )
+    assert capped["claimed"] == []
+
+
+def test_staged_terminal_review_continues_reviewable_hard_shadow(
+    tmp_path,
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        production_enabled=False,
+        policy=replace(_policy(), min_resolved=2, allowed_looks=(2, 3)),
+        terminal_review_enabled=True,
+        terminal_review_min_hit_rate=0.90,
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v2",
+            "selection_look": 2,
+            "selection_min_hit_rate": 0.90,
+            "terminal_look": 3,
+            "max_age_days": 365,
+        },
+    )
+    controller.import_report(
+        _report(), imported_at_utc="2026-08-28T00:00:00+00:00"
+    )
+    layer = WideShadowLayer(store, refresh_seconds=0)
+    for index in range(2):
+        observed = datetime(2026, 8, 28, 12 + index, tzinfo=UTC)
+        snapshot = _snapshot(3300 + index, observed)
+        layer.process_snapshot(snapshot)
+        layer.process_outcomes(
+            [
+                {
+                    "observation_id": snapshot["observation_id"],
+                    "outcome_schema_version": 1,
+                    "created_at_utc": (observed + timedelta(hours=2)).isoformat(),
+                    "outcome": {
+                        "status": "resolved",
+                        "goal_to90_normal_time": True,
+                        "resolved_at_utc": (
+                            observed + timedelta(hours=2)
+                        ).isoformat(),
+                    },
+                }
+            ]
+        )
+
+    # Existing rare phases reached this state under the old hard stop. A
+    # reviewable frozen selection cohort is resumed after the staged policy
+    # migration instead of remaining stuck forever.
+    phase_id = store.list_phases()[0]["phase_id"]
+    store.transition_phase(
+        phase_id,
+        "paused",
+        expected_status="shadow",
+        reason="legacy_terminal_stop",
+    )
+    result = controller.reconcile(now_utc="2026-08-29T00:00:00+00:00")
+    assert result["readiness"][0]["terminal_review"]["reviewable"] is True
+    assert store.list_phases()[0]["status"] == "shadow"
+    fresh_only = controller.reconcile(now_utc="2026-08-29T01:00:00+00:00")
+    assert fresh_only["readiness"][0]["milestone"] is None
+    assert store.list_phases()[0]["status"] == "shadow"
+    observed = datetime(2026, 8, 29, 12, tzinfo=UTC)
+    assert len(layer.process_snapshot(_snapshot(3302, observed))["claimed"]) == 1
 
 
 def test_pool_calendar_expiry_is_outcome_independent(tmp_path) -> None:

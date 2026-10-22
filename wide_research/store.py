@@ -1462,18 +1462,79 @@ class WideResearchStore:
                 or str(historical["to_status"]) not in EVALUATED_PHASE_STATUSES
             ):
                 return False
-            terminal = json.loads(definition["policy_json"]).get("terminal_review") or {}
+            phase_policy = json.loads(definition["policy_json"])
+            terminal = phase_policy.get("terminal_review") or {}
             if terminal.get("enabled") is True:
                 horizon = terminal.get("final_look")
                 if type(horizon) is not int or horizon <= 0:
                     raise ImmutableRecordError("invalid frozen terminal horizon")
-                # Cap admission under the same write transaction as the
-                # first-trigger claim, even before the lifecycle cache refresh.
+                pool_lifecycle = phase_policy.get("pool_lifecycle") or {}
+                staged_continuation = (
+                    pool_lifecycle.get("version") == "wide_pool_lifecycle_v2"
+                    and pool_lifecycle.get("selection_look") == horizon
+                )
+                terminal_horizon = pool_lifecycle.get("terminal_look")
+                if staged_continuation and (
+                    type(terminal_horizon) is not int
+                    or terminal_horizon <= horizon
+                ):
+                    raise ImmutableRecordError(
+                        "invalid frozen pool terminal horizon"
+                    )
                 count = connection.execute(
                     "SELECT COUNT(*) FROM triggers WHERE phase_id=?", (phase,)
                 ).fetchone()[0]
                 if count >= horizon:
-                    return False
+                    if not staged_continuation:
+                        return False
+                    if count >= terminal_horizon:
+                        return False
+                    authorized = connection.execute(
+                        """
+                        SELECT 1 FROM lifecycle_events
+                        WHERE phase_id=? AND reason IN (
+                            'pool_selection_finalist_continued',
+                            'terminal_review_finalist_resumed'
+                        )
+                        LIMIT 1
+                        """,
+                        (phase,),
+                    ).fetchone()
+                    if authorized is None:
+                        return False
+            else:
+                pool_lifecycle = phase_policy.get("pool_lifecycle") or {}
+                if pool_lifecycle.get("version") == "wide_pool_lifecycle_v2":
+                    selection_look = pool_lifecycle.get("selection_look")
+                    terminal_horizon = pool_lifecycle.get("terminal_look")
+                    if type(selection_look) is not int or selection_look <= 0:
+                        raise ImmutableRecordError(
+                            "invalid frozen pool selection horizon"
+                        )
+                    if (
+                        type(terminal_horizon) is not int
+                        or terminal_horizon <= selection_look
+                    ):
+                        raise ImmutableRecordError(
+                            "invalid frozen pool terminal horizon"
+                        )
+                    count = connection.execute(
+                        "SELECT COUNT(*) FROM triggers WHERE phase_id=?", (phase,)
+                    ).fetchone()[0]
+                    if count >= selection_look:
+                        if count >= terminal_horizon:
+                            return False
+                        authorized = connection.execute(
+                            """
+                            SELECT 1 FROM lifecycle_events
+                            WHERE phase_id=?
+                              AND reason='pool_selection_finalist_continued'
+                            LIMIT 1
+                            """,
+                            (phase,),
+                        ).fetchone()
+                        if authorized is None:
+                            return False
             if triggered < definition["starts_at_utc"] or (
                 definition["stops_at_utc"] is not None
                 and triggered >= definition["stops_at_utc"]
@@ -2201,6 +2262,67 @@ class WideResearchStore:
             assert updated is not None
             return self._decode_row(updated)
 
+    def note_phase_lifecycle_event_once(
+        self,
+        phase_id: str,
+        *,
+        expected_status: str,
+        reason: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        changed_at_utc: Any = None,
+    ) -> Dict[str, Any]:
+        """Append one same-state lifecycle authorization event idempotently."""
+
+        phase = _required_text(phase_id, "phase_id")
+        expected = _required_text(expected_status, "expected_status").lower()
+        normalized_reason = _required_text(reason, "reason")
+        changed = _utc_timestamp(changed_at_utc or _utc_now(), "changed_at_utc")
+        normalized_metadata = dict(metadata or {})
+        with self._write(
+            projected_bytes=len(_canonical_json(normalized_metadata)) + 1024
+        ) as connection:
+            row = connection.execute(
+                "SELECT * FROM phases WHERE phase_id=?", (phase,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown phase {phase}")
+            current = str(row["status"])
+            if current != expected:
+                raise ConcurrentUpdateError(
+                    f"phase {phase} status is {current}, expected {expected}"
+                )
+            existing = connection.execute(
+                "SELECT 1 FROM lifecycle_events WHERE phase_id=? AND reason=? LIMIT 1",
+                (phase, normalized_reason),
+            ).fetchone()
+            if existing is None:
+                self._insert_lifecycle_event(
+                    connection,
+                    phase_id=phase,
+                    from_status=current,
+                    to_status=current,
+                    reason=normalized_reason,
+                    actor="automation",
+                    metadata=normalized_metadata,
+                    created_at_utc=changed,
+                )
+            return self._decode_row(row)
+
+    def has_phase_lifecycle_event(
+        self, phase_id: str, *, reason: str
+    ) -> bool:
+        phase = _required_text(phase_id, "phase_id")
+        normalized_reason = _required_text(reason, "reason")
+        with self._read() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM lifecycle_events "
+                    "WHERE phase_id=? AND reason=? LIMIT 1",
+                    (phase, normalized_reason),
+                ).fetchone()
+                is not None
+            )
+
     def transition_phases_atomically(
         self,
         transitions: Sequence[Mapping[str, Any]],
@@ -2444,6 +2566,112 @@ class WideResearchStore:
                 )
             result = []
             for phase in normalized_ids:
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?", (phase,)
+                ).fetchone()
+                assert row is not None
+                result.append(self._decode_row(row))
+            return result
+
+    def replace_phase_pool_lifecycle_policies(
+        self,
+        updates: Sequence[Mapping[str, Any]],
+        *,
+        changed_at_utc: Any = None,
+    ) -> list[Dict[str, Any]]:
+        """Audit an explicit migration from one known pool policy to another."""
+
+        normalized: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
+        seen: set[str] = set()
+        for item in updates:
+            if not isinstance(item, Mapping):
+                raise ValueError("pool lifecycle update must be a mapping")
+            phase = _required_text(item.get("phase_id"), "phase_id")
+            if phase in seen:
+                raise ValueError(f"duplicate phase pool lifecycle update {phase}")
+            seen.add(phase)
+            expected_status = _required_text(
+                item.get("expected_status"), "expected_status"
+            ).lower()
+            previous = item.get("previous_policy")
+            replacement = item.get("pool_lifecycle_policy")
+            if not isinstance(previous, Mapping) or not isinstance(
+                replacement, Mapping
+            ):
+                raise ValueError(
+                    "previous_policy and pool_lifecycle_policy must be mappings"
+                )
+            normalized.append(
+                (
+                    phase,
+                    expected_status,
+                    dict(previous),
+                    dict(replacement),
+                )
+            )
+        if not normalized:
+            return []
+        changed = _utc_timestamp(changed_at_utc or _utc_now(), "changed_at_utc")
+        projected = sum(
+            len(_canonical_json(replacement)) + 1024
+            for _phase, _status, _previous, replacement in normalized
+        )
+        with self._write(projected_bytes=projected) as connection:
+            prepared: list[tuple[str, sqlite3.Row, str, str, dict[str, Any]]] = []
+            for phase, expected_status, previous, replacement in normalized:
+                row = connection.execute(
+                    "SELECT * FROM phases WHERE phase_id=?", (phase,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown phase {phase}")
+                current_status = str(row["status"])
+                if current_status != expected_status:
+                    raise ConcurrentUpdateError(
+                        f"phase {phase} status is {current_status}, "
+                        f"expected {expected_status}"
+                    )
+                if current_status in TERMINAL_PHASE_STATUSES:
+                    raise InvalidLifecycleTransition(
+                        f"terminal phase {phase} cannot change pool policy"
+                    )
+                current_policy = json.loads(str(row["policy_json"]))
+                if current_policy.get("pool_lifecycle") != previous:
+                    raise ImmutableRecordError(
+                        f"phase {phase} pool lifecycle predecessor mismatch"
+                    )
+                current_policy["pool_lifecycle"] = replacement
+                updated_json = _canonical_json(current_policy)
+                prepared.append(
+                    (
+                        phase,
+                        row,
+                        updated_json,
+                        _json_hash(updated_json),
+                        {
+                            "previous_pool_lifecycle": previous,
+                            "pool_lifecycle": replacement,
+                            "outcome_independent": True,
+                        },
+                    )
+                )
+            for phase, row, updated_json, updated_hash, metadata in prepared:
+                connection.execute(
+                    "UPDATE phases SET policy_json=?, policy_hash=?, "
+                    "updated_at_utc=? WHERE phase_id=?",
+                    (updated_json, updated_hash, changed, phase),
+                )
+                self._insert_lifecycle_event(
+                    connection,
+                    phase_id=phase,
+                    from_status=str(row["status"]),
+                    to_status=str(row["status"]),
+                    reason="pool_lifecycle_policy_staged_v2",
+                    actor="automation",
+                    metadata=metadata,
+                    created_at_utc=changed,
+                )
+            result = []
+            for phase, _status, _previous, _replacement in normalized:
                 row = connection.execute(
                     "SELECT * FROM phases WHERE phase_id=?", (phase,)
                 ).fetchone()

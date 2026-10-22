@@ -36,7 +36,8 @@ from .store import WideResearchStore
 EVALUATED_STATUSES = ("candidate", "shadow", "ready", "active")
 IMPORT_IDENTITY_STATUSES = (*EVALUATED_STATUSES, "paused")
 TERMINAL_REVIEW_POLICY_VERSION = "wide_terminal_review_v1"
-POOL_LIFECYCLE_POLICY_VERSION = "wide_pool_lifecycle_v1"
+POOL_LIFECYCLE_POLICY_VERSION = "wide_pool_lifecycle_v2"
+LEGACY_POOL_LIFECYCLE_POLICY_VERSION = "wide_pool_lifecycle_v1"
 MAX_EVALUATED_PHASES = 64
 
 
@@ -47,12 +48,17 @@ def _lifecycle_policy_manifest(policy: LifecyclePolicy) -> dict[str, Any]:
 
 
 def _relaxable_lifecycle_predecessors() -> tuple[dict[str, Any], ...]:
-    """Known frozen v1 manifests that may move onto the current runtime gates.
+    """Known frozen manifests that may move onto the current runtime gates.
 
     Custom or experimental frozen policies are intentionally absent so reconcile
     cannot rewrite them when the process defaults change.
     """
 
+    old_common = {
+        "min_span_days": 28.0,
+        "min_trigger_days": 14,
+        "min_weekly_windows": 4,
+    }
     primary_v1 = _lifecycle_policy_manifest(
         LifecyclePolicy(
             version="wide_lifecycle_v1",
@@ -61,6 +67,7 @@ def _relaxable_lifecycle_predecessors() -> tuple[dict[str, Any], ...]:
             min_resolved=200,
             min_wilson_lower=0.90,
             min_weekly_hit_rate=0.90,
+            **old_common,
         )
     )
     rare_v1 = _lifecycle_policy_manifest(
@@ -73,9 +80,26 @@ def _relaxable_lifecycle_predecessors() -> tuple[dict[str, Any], ...]:
             min_weekly_hit_rate=0.90,
             min_triggers_per_week=0.0,
             allowed_looks=(50, 100, 200),
+            **old_common,
         )
     )
-    return (primary_v1, rare_v1)
+    primary_v2 = _lifecycle_policy_manifest(
+        LifecyclePolicy(
+            version="wide_lifecycle_v2",
+            min_resolved=150,
+            **old_common,
+        )
+    )
+    rare_v2 = _lifecycle_policy_manifest(
+        LifecyclePolicy(
+            version="wide_lifecycle_v2",
+            min_resolved=150,
+            min_triggers_per_week=0.0,
+            allowed_looks=(50, 100, 150, 200),
+            **old_common,
+        )
+    )
+    return (primary_v1, rare_v1, primary_v2, rare_v2)
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -174,7 +198,16 @@ def _phase_terminal_review_policy(
     if not math.isfinite(normalized_rate) or not 0.0 <= normalized_rate <= 1.0:
         return None
     lifecycle = _phase_lifecycle_policy(phase)
-    if lifecycle is None or final_look != max(lifecycle.allowed_looks):
+    pool = _mapping(_mapping(phase.get("policy")).get("pool_lifecycle"))
+    staged_selection_look = (
+        pool.get("selection_look")
+        if pool.get("version") == POOL_LIFECYCLE_POLICY_VERSION
+        else None
+    )
+    if lifecycle is None or final_look not in {
+        max(lifecycle.allowed_looks),
+        staged_selection_look,
+    }:
         return None
     return {
         "version": TERMINAL_REVIEW_POLICY_VERSION,
@@ -197,9 +230,22 @@ def _normalize_pool_lifecycle_policy(
     payload = _mapping(value)
     if not payload:
         return None
-    if set(payload) != {"version", "terminal_look", "max_age_days"}:
-        return None
-    if payload.get("version") != POOL_LIFECYCLE_POLICY_VERSION:
+    version = payload.get("version")
+    legacy = version == LEGACY_POOL_LIFECYCLE_POLICY_VERSION
+    expected = (
+        {"version", "terminal_look", "max_age_days"}
+        if legacy
+        else {
+            "version",
+            "selection_look",
+            "selection_min_hit_rate",
+            "terminal_look",
+            "max_age_days",
+        }
+    )
+    if set(payload) != expected or (
+        not legacy and version != POOL_LIFECYCLE_POLICY_VERSION
+    ):
         return None
     terminal_look = payload.get("terminal_look")
     max_age_days = payload.get("max_age_days")
@@ -210,11 +256,33 @@ def _normalize_pool_lifecycle_policy(
         or max_age_days < 1
     ):
         return None
-    return {
-        "version": POOL_LIFECYCLE_POLICY_VERSION,
+    normalized = {
+        "version": str(version),
         "terminal_look": terminal_look,
         "max_age_days": max_age_days,
     }
+    if legacy:
+        return normalized
+    selection_look = payload.get("selection_look")
+    try:
+        selection_min_hit_rate = float(payload.get("selection_min_hit_rate"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        type(selection_look) is not int
+        or selection_look < 1
+        or selection_look >= terminal_look
+        or not math.isfinite(selection_min_hit_rate)
+        or not 0.0 <= selection_min_hit_rate <= 1.0
+    ):
+        return None
+    normalized.update(
+        {
+            "selection_look": selection_look,
+            "selection_min_hit_rate": selection_min_hit_rate,
+        }
+    )
+    return normalized
 
 
 def _phase_pool_lifecycle_policy(
@@ -222,6 +290,50 @@ def _phase_pool_lifecycle_policy(
 ) -> Optional[dict[str, Any]]:
     return _normalize_pool_lifecycle_policy(
         _mapping(phase.get("policy")).get("pool_lifecycle")
+    )
+
+
+def _pool_policy_can_advance(
+    current: Optional[Mapping[str, Any]],
+    desired: Optional[Mapping[str, Any]],
+) -> bool:
+    if current == desired:
+        return True
+    return bool(
+        current
+        and desired
+        and current.get("version") == LEGACY_POOL_LIFECYCLE_POLICY_VERSION
+        and desired.get("version") == POOL_LIFECYCLE_POLICY_VERSION
+        and int(current.get("terminal_look") or 0)
+        == int(desired.get("selection_look") or -1)
+    )
+
+
+def _phase_pool_policy_can_advance(
+    phase: Mapping[str, Any],
+    desired_pool: Optional[Mapping[str, Any]],
+    desired_lifecycle: LifecyclePolicy,
+) -> bool:
+    current_pool = _phase_pool_lifecycle_policy(phase)
+    if not _pool_policy_can_advance(current_pool, desired_pool):
+        return False
+    if current_pool == desired_pool:
+        return True
+    if desired_pool is None:
+        return False
+    desired_terminal = int(desired_pool.get("terminal_look") or 0)
+    current_lifecycle = _phase_lifecycle_policy(phase)
+    if (
+        current_lifecycle is not None
+        and desired_terminal in current_lifecycle.allowed_looks
+    ):
+        return True
+    current_manifest = dict(
+        _mapping(_mapping(phase.get("policy")).get("lifecycle"))
+    )
+    return bool(
+        current_manifest in _relaxable_lifecycle_predecessors()
+        and desired_terminal in desired_lifecycle.allowed_looks
     )
 
 
@@ -640,12 +752,25 @@ class WideResearchController:
                 raise ValueError(
                     "pool lifecycle terminal look must be a lifecycle look"
                 )
+            selection_look = self.pool_lifecycle_policy.get("selection_look")
+            if (
+                selection_look is not None
+                and selection_look not in self.policy.allowed_looks
+            ):
+                raise ValueError(
+                    "pool lifecycle selection look must be a lifecycle look"
+                )
 
     def _terminal_review_manifest(self) -> dict[str, Any]:
+        final_look = max(self.policy.allowed_looks)
+        if self.pool_lifecycle_policy is not None:
+            final_look = int(
+                self.pool_lifecycle_policy.get("selection_look", final_look)
+            )
         return {
             "version": TERMINAL_REVIEW_POLICY_VERSION,
             "enabled": self.terminal_review_enabled,
-            "final_look": max(self.policy.allowed_looks),
+            "final_look": final_look,
             "min_point_hit_rate": self.terminal_review_min_hit_rate,
         }
 
@@ -854,8 +979,11 @@ class WideResearchController:
                 ):
                     raise ValueError("existing rule has a different frozen terminal review policy")
                 if self.pool_lifecycle_policy is not None and any(
-                    _phase_pool_lifecycle_policy(row)
-                    != self.pool_lifecycle_policy
+                    not _phase_pool_policy_can_advance(
+                        row,
+                        self.pool_lifecycle_policy,
+                        self.policy,
+                    )
                     for row in registered_existing
                 ):
                     raise ValueError(
@@ -1336,6 +1464,18 @@ class WideResearchController:
                 invalid_as_loss=True,
             ), None
         milestone, rows = latest_closed
+        if (
+            pool_lifecycle is not None
+            and "selection_look" in pool_lifecycle
+            and milestone <= int(pool_lifecycle["selection_look"])
+            and self.store.has_phase_lifecycle_event(
+                phase_id, reason="terminal_review_finalist_resumed"
+            )
+        ):
+            # A legacy finalist was selected using the original 200 results.
+            # Its relaxed READY decision must wait for genuinely new evidence
+            # at the next registered look instead of certifying retrospectively.
+            milestone = None
         return self._prospective_metrics(
             rows,
             invalid_as_loss=True,
@@ -1426,13 +1566,14 @@ class WideResearchController:
         return [str(row["phase_id"]) for row in updated]
 
     def _migrate_current_pool_lifecycle(self, now: datetime) -> list[str]:
-        """Freeze the configured policy onto current purge-safe legacy phases."""
+        """Freeze or explicitly advance the pool policy on purge-safe phases."""
 
         if self.pool_lifecycle_policy is None:
             return []
         phase_ids = []
+        replacements = []
         for phase in self.store.list_phases(
-            statuses=("candidate", "shadow", "ready")
+            statuses=("candidate", "shadow", "ready", "paused")
         ):
             generation = _mapping(
                 _mapping(_mapping(phase.get("policy")).get("discovery")).get(
@@ -1445,8 +1586,24 @@ class WideResearchController:
                 continue
             existing = _mapping(phase.get("policy")).get("pool_lifecycle")
             if existing is None:
-                phase_ids.append(str(phase["phase_id"]))
-            elif _phase_pool_lifecycle_policy(phase) != self.pool_lifecycle_policy:
+                if str(phase["status"]) != "paused":
+                    phase_ids.append(str(phase["phase_id"]))
+                continue
+            normalized_existing = _phase_pool_lifecycle_policy(phase)
+            if normalized_existing == self.pool_lifecycle_policy:
+                continue
+            if _phase_pool_policy_can_advance(
+                phase, self.pool_lifecycle_policy, self.policy
+            ):
+                replacements.append(
+                    {
+                        "phase_id": str(phase["phase_id"]),
+                        "expected_status": str(phase["status"]),
+                        "previous_policy": dict(existing),
+                        "pool_lifecycle_policy": self.pool_lifecycle_policy,
+                    }
+                )
+            elif str(phase["status"]) != "paused":
                 raise ValueError(
                     "phase has an invalid or different frozen pool lifecycle policy"
                 )
@@ -1455,10 +1612,14 @@ class WideResearchController:
             self.pool_lifecycle_policy,
             changed_at_utc=_utc_iso(now),
         )
-        return [str(row["phase_id"]) for row in migrated]
+        replaced = self.store.replace_phase_pool_lifecycle_policies(
+            replacements,
+            changed_at_utc=_utc_iso(now),
+        )
+        return [str(row["phase_id"]) for row in (*migrated, *replaced)]
 
     def _migrate_relaxed_lifecycle_policy(self, now: datetime) -> list[str]:
-        """Audited move from known strict v1 gates onto the runtime policy.
+        """Audited move from known lifecycle gates onto the runtime policy.
 
         Custom frozen policies stay untouched.  Only candidate/shadow phases
         whose lifecycle exactly matches a documented predecessor are rewritten
@@ -1470,15 +1631,19 @@ class WideResearchController:
         desired["allowed_looks"] = list(self.policy.allowed_looks)
         predecessors = _relaxable_lifecycle_predecessors()
         updates = []
-        for phase in self.store.list_phases(statuses=("candidate", "shadow")):
+        for phase in self.store.list_phases(
+            statuses=("candidate", "shadow", "paused")
+        ):
             current = dict(_mapping(_mapping(phase.get("policy")).get("lifecycle")))
             if current == desired or current not in predecessors:
                 continue
-            # Terminal hard-shadow cohorts keep their final look contract; skip
-            # rather than break reconcile when looks cannot align.
             terminal = _phase_terminal_review_policy(phase)
-            if terminal is not None and int(terminal["final_look"]) != max(
-                self.policy.allowed_looks
+            pool = _phase_pool_lifecycle_policy(phase)
+            valid_terminal_looks = {max(self.policy.allowed_looks)}
+            if pool is not None and "selection_look" in pool:
+                valid_terminal_looks.add(int(pool["selection_look"]))
+            if terminal is not None and int(terminal["final_look"]) not in (
+                valid_terminal_looks
             ):
                 continue
             updates.append(
@@ -1723,6 +1888,10 @@ class WideResearchController:
                 }
 
         readiness: list[dict[str, Any]] = []
+        evaluated_count = sum(
+            str(row.get("status")) in EVALUATED_STATUSES for row in phase_rows
+        )
+        available_resume_slots = max(0, self.max_shadow_rules - evaluated_count)
         for phase in review_phases:
             phase_id = str(phase["phase_id"])
             metrics, milestone, _p_value = evidence[phase_id]
@@ -1779,12 +1948,52 @@ class WideResearchController:
                 pool_lifecycle
                 and milestone == int(pool_lifecycle["terminal_look"])
             )
+            pool_selection = None
+            if pool_lifecycle and "selection_look" in pool_lifecycle:
+                selection_look = int(pool_lifecycle["selection_look"])
+                try:
+                    selection_rows = self.store.triggers_for_phase_look(
+                        phase_id, selection_look
+                    )
+                except KeyError:
+                    selection_rows = None
+                if selection_rows is not None:
+                    selection_metrics = self._prospective_metrics(
+                        selection_rows, invalid_as_loss=True
+                    )
+                    selection_total = int(selection_metrics["wins"]) + int(
+                        selection_metrics["losses"]
+                    )
+                    selection_pending = len(selection_rows) - selection_total
+                    selection_closed = selection_pending == 0
+                    selection_hit_rate = (
+                        int(selection_metrics["wins"]) / selection_total
+                        if selection_closed and selection_total
+                        else None
+                    )
+                    pool_selection = {
+                        "closed": selection_closed,
+                        "look": selection_look,
+                        "resolved": selection_total,
+                        "pending": selection_pending,
+                        "hit_rate": selection_hit_rate,
+                        "min_hit_rate": float(
+                            pool_lifecycle["selection_min_hit_rate"]
+                        ),
+                        "continue": (
+                            selection_hit_rate
+                            >= float(pool_lifecycle["selection_min_hit_rate"])
+                            if selection_hit_rate is not None
+                            else None
+                        ),
+                    }
             if pool_lifecycle:
                 readiness[-1]["pool_lifecycle"] = {
                     **pool_lifecycle,
                     "age_days": max(0.0, age_days),
                     "age_expired": age_expired,
                     "terminal_closed": pool_terminal_closed,
+                    "selection": pool_selection,
                 }
             terminal_rows = None
             if terminal_review and terminal_review["enabled"]:
@@ -1819,7 +2028,56 @@ class WideResearchController:
                     "production_applied": False,
                 }
                 readiness[-1]["terminal_review"] = terminal_disposition
-                if str(phase["status"]) != "paused":
+                staged_continuation = bool(
+                    pool_lifecycle
+                    and pool_lifecycle.get("version")
+                    == POOL_LIFECYCLE_POLICY_VERSION
+                    and int(pool_lifecycle.get("selection_look") or 0)
+                    == int(terminal_review["final_look"])
+                )
+                if (
+                    staged_continuation
+                    and terminal_disposition["reviewable"] is True
+                ):
+                    if str(phase["status"]) == "paused":
+                        if age_expired:
+                            readiness[-1]["resume_deferred"] = (
+                                "pool_calendar_age_expired"
+                            )
+                            continue
+                        if available_resume_slots <= 0:
+                            readiness[-1]["resume_deferred"] = (
+                                "pool_capacity"
+                            )
+                            continue
+                        self.store.transition_phase(
+                            phase_id,
+                            "shadow",
+                            expected_status="paused",
+                            reason="terminal_review_finalist_resumed",
+                            metadata={
+                                **terminal_disposition,
+                                "future_evidence_only": True,
+                                "pool_lifecycle": pool_lifecycle,
+                            },
+                            changed_at_utc=_utc_iso(now),
+                        )
+                        available_resume_slots -= 1
+                        # Re-evaluate on the next pass using only milestones
+                        # frozen after this audited resume.
+                        continue
+                    if str(phase["status"]) in {"candidate", "shadow"}:
+                        self.store.note_phase_lifecycle_event_once(
+                            phase_id,
+                            expected_status=str(phase["status"]),
+                            reason="pool_selection_finalist_continued",
+                            metadata={
+                                "selection": terminal_disposition,
+                                "pool_lifecycle": pool_lifecycle,
+                            },
+                            changed_at_utc=_utc_iso(now),
+                        )
+                elif str(phase["status"]) != "paused":
                     self.store.transition_phase(
                         phase_id,
                         "paused",
@@ -1828,6 +2086,43 @@ class WideResearchController:
                         metadata=terminal_disposition,
                         changed_at_utc=_utc_iso(now),
                     )
+                    continue
+                else:
+                    continue
+            if (
+                pool_selection is not None
+                and pool_selection["closed"]
+                and pool_selection["continue"] is True
+                and str(phase["status"]) in {"candidate", "shadow"}
+            ):
+                self.store.note_phase_lifecycle_event_once(
+                    phase_id,
+                    expected_status=str(phase["status"]),
+                    reason="pool_selection_finalist_continued",
+                    metadata={
+                        "selection": pool_selection,
+                        "pool_lifecycle": pool_lifecycle,
+                    },
+                    changed_at_utc=_utc_iso(now),
+                )
+            if (
+                pool_selection is not None
+                and pool_selection["closed"]
+                and pool_selection["continue"] is False
+                and str(phase["status"]) in {"candidate", "shadow"}
+            ):
+                self.store.transition_phase(
+                    phase_id,
+                    "paused",
+                    expected_status=str(phase["status"]),
+                    reason="pool_selection_nonfinalist_paused",
+                    metadata={
+                        "pool_lifecycle": pool_lifecycle,
+                        "selection": pool_selection,
+                        "outcome_adaptive_replacement": False,
+                    },
+                    changed_at_utc=_utc_iso(now),
+                )
             elif pool_terminal_closed:
                 if decision.eligible:
                     if str(phase["status"]) != "ready":
