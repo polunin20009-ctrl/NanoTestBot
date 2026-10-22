@@ -272,7 +272,7 @@ of an already registered phase.
 | `WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS` | `604800` | Discovery cadence; minimum 86400 seconds |
 | `WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS` | `900` | Lifecycle cadence; minimum 300 seconds |
 | `WIDE_RESEARCH_PHASE_REFRESH_SECONDS` | `60` | Live phase-cache refresh; minimum 5 seconds |
-| `WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS` | `1800` | Discovery subprocess timeout; minimum 300 seconds |
+| `WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS` | `5400` | Discovery subprocess timeout; minimum 300 seconds |
 | `WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB` | `3072` | Hard address-space ceiling for each isolated discovery worker |
 | `WIDE_RESEARCH_MAX_SHADOW_RULES` | `10` | Simultaneously measured phases; clamped to 1--20 |
 | `WIDE_RESEARCH_MAX_DB_BYTES` | `2147483648` | SQLite/WAL storage budget; minimum 10 MiB |
