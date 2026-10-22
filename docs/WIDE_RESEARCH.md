@@ -239,11 +239,22 @@ baseline itself has the same sustained degradation, publication is suspended;
 it resumes only after its rolling rate reaches 80% or a fully eligible
 challenger replaces it.
 
-A changed policy/catalog, invalid or suspended pointer, pointer-generation
-change during evaluation, or evaluation error blocks publication. It never
-silently substitutes a different rule. Switching the staged production flag
-is the one contract change that is re-authorized automatically without
-discarding already prospective evidence.
+A READY precision rule may be admitted automatically as a frozen singleton
+challenger when `ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS=true`.
+Admission copies only the immutable rule definition and starts a new
+Champion–Challenger clock; outcomes used to earn READY are never imported.
+At most `AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS` discovery nominees
+collect concurrently. A nominee that has not qualified by the fixed
+`AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON` is rejected and frees its
+slot. Every admitted family remains in the multiplicity count, so successive
+generations cannot make the superiority test easier. Adding a challenger is
+an append-only catalog update and preserves the active champion and its tenure.
+
+A changed policy or non-append-only catalog mutation, invalid or suspended
+pointer, pointer-generation change during evaluation, or evaluation error
+blocks publication. It never silently substitutes a different rule.
+Append-only challenger admission and switching the staged production flag are
+re-authorized atomically without discarding already prospective evidence.
 
 The manifest cache never accepts a lower generation or a corrupt update. While
 the process is alive it also rejects different content under the same

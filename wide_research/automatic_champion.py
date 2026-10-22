@@ -19,7 +19,14 @@ from statistics import NormalDist
 from typing import Any, Mapping, Optional, Sequence
 
 from .live import WideShadowLayer
-from .portfolio import FrozenPortfolioLayer, FrozenPortfolioSpec
+from .lifecycle import wilson_interval
+from .portfolio import (
+    FrozenPortfolioLayer,
+    FrozenPortfolioMember,
+    FrozenPortfolioSpec,
+    frozen_portfolio_spec_from_dict,
+)
+from .rules import rule_manifest_from_dict
 from .schema import canonical_hash
 from .store import WideResearchStore
 
@@ -27,6 +34,7 @@ from .store import WideResearchStore
 AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v2"
 AUTOMATIC_CHAMPION_POINTER = "automatic_publication_champion"
 AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION = 1
+DISCOVERY_NOMINATION_PREFIX = "discovery-ready-"
 
 
 class AutomaticChampionUnavailable(RuntimeError):
@@ -237,16 +245,216 @@ class AutomaticChampionLayer(FrozenPortfolioLayer):
                     "production_applied": False,
                 },
             )
-        self.specs = normalized
+        statuses = {
+            str(row.get("rule_id") or ""): str(row.get("status") or "")
+            for row in store.list_phases()
+        }
+        self.specs = tuple(
+            spec
+            for spec in normalized
+            if statuses.get(spec.rule_id)
+            in {"candidate", "shadow", "ready", "active"}
+        )
         self.families = normalized_families
         WideShadowLayer.__init__(
             self,
             store,
-            max_active_rules=len(normalized),
+            max_active_rules=max(1, len(self.specs)),
             refresh_seconds=0.0,
             max_prediction_lag_seconds=max_prediction_lag_seconds,
         )
         self.include_extended = True
+
+
+def is_discovery_nomination(spec: FrozenPortfolioSpec) -> bool:
+    return spec.portfolio_id.startswith(DISCOVERY_NOMINATION_PREFIX)
+
+
+def discovery_nomination_family(spec: FrozenPortfolioSpec) -> str:
+    """Group threshold variants of the same discovered rule shape."""
+
+    member = spec.members[0]
+    shape = {
+        "source_profile": member.source_profile,
+        "clauses": [
+            {"feature": clause.feature, "op": clause.op}
+            for clause in member.manifest.clauses
+        ],
+    }
+    return "discovery-" + canonical_hash(shape)[:16]
+
+
+def discovery_nomination_source_key(
+    spec: FrozenPortfolioSpec,
+) -> tuple[str, str]:
+    if not is_discovery_nomination(spec) or len(spec.members) != 1:
+        raise ValueError("not a singleton discovery nomination")
+    member = spec.members[0]
+    return member.source_profile, member.manifest.rule_id
+
+
+def load_discovery_nomination_specs(
+    store: WideResearchStore,
+) -> tuple[FrozenPortfolioSpec, ...]:
+    """Restore every admitted nomination, including closed generations."""
+
+    specs = []
+    for row in store.list_manifests():
+        manifest = row.get("manifest")
+        if not isinstance(manifest, Mapping):
+            continue
+        if not str(manifest.get("portfolio_id") or "").startswith(
+            DISCOVERY_NOMINATION_PREFIX
+        ):
+            continue
+        specs.append(frozen_portfolio_spec_from_dict(manifest))
+    specs.sort(key=lambda value: value.rule_id)
+    return tuple(specs)
+
+
+def select_ready_discovery_nominations(
+    source_store: WideResearchStore,
+    *,
+    target_store: WideResearchStore,
+    source_profile: str,
+    existing_specs: Sequence[FrozenPortfolioSpec],
+    max_active: int,
+) -> tuple[FrozenPortfolioSpec, ...]:
+    """Select the strongest READY rules for currently available duel slots."""
+
+    limit = max(0, int(max_active))
+    admitted_keys = {
+        discovery_nomination_source_key(spec)
+        for spec in existing_specs
+        if is_discovery_nomination(spec)
+    }
+    target_phases = {
+        str(row.get("rule_id") or ""): str(row.get("status") or "")
+        for row in target_store.list_phases()
+    }
+    active_dynamic = sum(
+        1
+        for spec in existing_specs
+        if is_discovery_nomination(spec)
+        and target_phases.get(spec.rule_id)
+        in {"candidate", "shadow", "ready", "active"}
+    )
+    available = max(0, limit - active_dynamic)
+    if available == 0:
+        return ()
+
+    ranked: list[tuple[tuple[Any, ...], Mapping[str, Any]]] = []
+    for phase in source_store.list_phases(statuses=("ready",)):
+        key = (str(source_profile), str(phase.get("rule_id") or ""))
+        if key in admitted_keys:
+            continue
+        wins = 0
+        resolved = 0
+        for trigger in source_store.list_triggers(
+            phase_id=str(phase.get("phase_id") or "")
+        ):
+            status = str(trigger.get("latest_outcome_status") or "pending")
+            if status not in {"win", "loss", "invalid"}:
+                continue
+            resolved += 1
+            wins += int(status == "win")
+        lower, _upper = wilson_interval(wins, resolved)
+        ranked.append(
+            (
+                (
+                    -float(lower),
+                    -(wins / resolved if resolved else 0.0),
+                    -resolved,
+                    str(phase.get("rule_id") or ""),
+                ),
+                phase,
+            )
+        )
+    ranked.sort(key=lambda item: item[0])
+
+    selected = []
+    profile_slug = str(source_profile).replace("_", "-")
+    for _score, phase in ranked[:available]:
+        manifest_payload = phase.get("manifest")
+        if not isinstance(manifest_payload, Mapping):
+            continue
+        manifest = rule_manifest_from_dict(manifest_payload)
+        member = FrozenPortfolioMember(
+            source_profile=str(source_profile),
+            source_store_hash=str(phase.get("manifest_hash") or ""),
+            manifest=manifest,
+        )
+        selected.append(
+            FrozenPortfolioSpec(
+                portfolio_id=(
+                    f"{DISCOVERY_NOMINATION_PREFIX}{profile_slug}-"
+                    f"{manifest.rule_id}"
+                ),
+                version="v1",
+                members=(member,),
+            )
+        )
+    return tuple(selected)
+
+
+def retire_exhausted_discovery_nominations(
+    store: WideResearchStore,
+    decision: Mapping[str, Any],
+    *,
+    terminal_horizon: int = 200,
+) -> tuple[str, ...]:
+    """Close failed duels at a fixed horizon so later READY rules get a slot."""
+
+    if str(decision.get("status") or "") == "blocked":
+        return ()
+    active_rule_id = str(decision.get("active_rule_id") or "")
+    retired = []
+    phases = {
+        str(row.get("rule_id") or ""): row for row in store.list_phases()
+    }
+    for evaluation in decision.get("evaluations") or []:
+        if not isinstance(evaluation, Mapping):
+            continue
+        rule_id = str(evaluation.get("rule_id") or "")
+        portfolio_id = str(evaluation.get("portfolio_id") or "")
+        if (
+            not portfolio_id.startswith(DISCOVERY_NOMINATION_PREFIX)
+            or rule_id == active_rule_id
+            or evaluation.get("eligible") is True
+        ):
+            continue
+        metrics = _mapping(evaluation.get("metrics"))
+        if int(metrics.get("resolved") or 0) < int(terminal_horizon):
+            continue
+        reasons = {str(value) for value in evaluation.get("reasons") or []}
+        if reasons & {
+            "insufficient_span_days",
+            "insufficient_trigger_days",
+            "insufficient_leagues",
+            "insufficient_frequency",
+            "champion_comparison_insufficient_resolved",
+            "champion_minimum_tenure",
+        }:
+            # Fast collection must not recreate the old "hit the sample cap,
+            # then freeze while calendar gates catch up" failure mode.
+            continue
+        phase = phases.get(rule_id)
+        if phase is None or str(phase.get("status") or "") != "shadow":
+            continue
+        phase_id = str(phase.get("phase_id") or "")
+        store.transition_phase(
+            phase_id,
+            "rejected",
+            expected_status="shadow",
+            reason="automatic_challenger_terminal_review_failed",
+            actor="automatic_champion",
+            metadata={
+                "terminal_horizon": int(terminal_horizon),
+                "evaluation": dict(evaluation),
+            },
+        )
+        retired.append(phase_id)
+    return tuple(retired)
 
 
 class AutomaticChampionController:
@@ -380,11 +588,17 @@ class AutomaticChampionController:
             reasons.append("pointer_schema_mismatch")
         if payload.get("policy_hash") != self.policy_hash:
             reasons.append("policy_hash_mismatch")
-        if payload.get("catalog_hash") != self.catalog_hash:
-            reasons.append("catalog_hash_mismatch")
         if _mapping(payload.get("policy")) != self.policy_manifest:
             reasons.append("policy_manifest_mismatch")
-        if _mapping(payload.get("catalog")) != self.catalog:
+        stored_catalog = _mapping(payload.get("catalog"))
+        catalog_is_append_only = bool(stored_catalog) and all(
+            self.catalog.get(str(rule_id)) == entry
+            for rule_id, entry in stored_catalog.items()
+        )
+        if (
+            payload.get("catalog_hash") != self.catalog_hash
+            or stored_catalog != self.catalog
+        ) and not catalog_is_append_only:
             reasons.append("catalog_manifest_mismatch")
         if payload.get("production_enabled") is not self.production_enabled:
             reasons.append("production_mode_mismatch")
@@ -412,6 +626,47 @@ class AutomaticChampionController:
             if str(phase.get("status") or "") != "active":
                 reasons.append("active_phase_not_active")
         return payload, reasons
+
+    def _refresh_catalog(
+        self,
+        pointer: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> Mapping[str, Any]:
+        """Authorize append-only challengers without resetting the champion."""
+
+        metadata = self._pointer_metadata(
+            selector_started_at_utc=_utc_iso(
+                _parse_utc(payload.get("selector_started_at_utc"))
+            ),
+            active_since_utc=_utc_iso(
+                _parse_utc(payload.get("active_since_utc"))
+            ),
+            previous_rule_id=(
+                str(payload.get("previous_rule_id"))
+                if payload.get("previous_rule_id")
+                else None
+            ),
+            decision={
+                "reason": "candidate_catalog_extended",
+                "previous_catalog_hash": payload.get("catalog_hash"),
+                "catalog_hash": self.catalog_hash,
+            },
+            publication_suspended=bool(payload.get("publication_suspended")),
+            suspension_reason=(
+                str(payload.get("suspension_reason"))
+                if payload.get("suspension_reason")
+                else None
+            ),
+        )
+        return self.store.set_active_pointer(
+            self.pointer_name,
+            phase_id=str(pointer["phase_id"]),
+            expected_generation=int(pointer["generation"]),
+            metadata=metadata,
+            updated_at_utc=_utc_iso(now),
+        )
 
     def active_selection(self) -> ActiveChampionSelection:
         """Return one validated pointer generation or fail publication closed."""
@@ -616,6 +871,15 @@ class AutomaticChampionController:
                 pointer, payload, now=now
             )
             payload, contract_reasons = self._validate_pointer(pointer)
+        if (
+            not contract_reasons
+            and (
+                payload.get("catalog_hash") != self.catalog_hash
+                or _mapping(payload.get("catalog")) != self.catalog
+            )
+        ):
+            pointer = self._refresh_catalog(pointer, payload, now=now)
+            payload, contract_reasons = self._validate_pointer(pointer)
         selector_started = _parse_utc(payload.get("selector_started_at_utc"))
         active_since = _parse_utc(payload.get("active_since_utc"))
         active_rule_id = str(pointer.get("rule_id") or "")
@@ -676,6 +940,12 @@ class AutomaticChampionController:
                 evaluations.append(row)
                 continue
             reasons = self._eligibility_reasons(metrics)
+            if str(phase.get("status") or "") not in {
+                "candidate",
+                "shadow",
+                "ready",
+            }:
+                reasons.append("candidate_not_competing")
             if self.families[spec.rule_id] == active_family:
                 reasons.append("same_family_as_champion")
             active_metrics = self._metrics(

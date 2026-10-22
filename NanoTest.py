@@ -110,6 +110,11 @@ from market_benchmark import (
 from wide_research.automatic_champion import (
     AutomaticChampionController,
     AutomaticChampionLayer,
+    discovery_nomination_family,
+    is_discovery_nomination,
+    load_discovery_nomination_specs,
+    retire_exhausted_discovery_nominations,
+    select_ready_discovery_nominations,
 )
 from wide_research.controller import WideResearchController
 from market_benchmark.research import CausalQuoteCache
@@ -1353,6 +1358,28 @@ AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES = max(
         )
     ),
 )
+ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS = _parse_env_bool(
+    "ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS", True
+)
+AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS = max(
+    1,
+    min(
+        5,
+        int(
+            os.environ.get(
+                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "5"
+            )
+        ),
+    ),
+)
+AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON = max(
+    40,
+    int(
+        os.environ.get(
+            "AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON", "200"
+        )
+    ),
+)
 AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES = {
     "balanced-two-rule": "balanced-core",
     "broad-three-rule": "balanced-expanded-volume",
@@ -2019,11 +2046,16 @@ def log_feature_flags() -> None:
     )
     logger.info(
         "[AUTOMATIC_CHAMPION_CONFIG] enabled=%s production_apply=%s "
-        "db=%s report=%s candidates=28 prospective_only=true",
+        "db=%s report=%s candidates=28 prospective_only=true "
+        "discovery_nominations=%s discovery_max_challengers=%s "
+        "discovery_terminal_horizon=%s",
         ENABLE_AUTOMATIC_PUBLICATION_CHAMPION,
         AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY,
         AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE,
         AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE,
+        ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS,
+        AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS,
+        AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON,
     )
     logger.info(
         "[ROLLING_DYNAMICS_CONFIG] enabled=%s shadow_only=true production_apply=false schema=%s windows=5,10 max_extra_minutes=%s seed_minutes=36,39,41,44 seed_max_fetch_attempts=%s seed_workers=%s",
@@ -23152,44 +23184,76 @@ def _get_automatic_publication_champion_components() -> Tuple[
     global _automatic_publication_champion_controller
     global _automatic_publication_champion_signature
 
-    specs = _automatic_publication_champion_specs()
-    signature: Tuple[Any, ...] = (
-        os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE),
-        os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE),
-        int(AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES),
-        bool(AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY),
-        tuple(
-            (
-                spec.rule_id,
-                spec.manifest()["portfolio_hash"],
-                AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES.get(
-                    spec.portfolio_id, spec.portfolio_id
-                ),
-            )
-            for spec in specs
-        ),
-    )
     with _wide_research_lock:
-        if (
-            _automatic_publication_champion_store is None
-            or _automatic_publication_champion_layer is None
-            or _automatic_publication_champion_controller is None
-            or _automatic_publication_champion_signature != signature
-        ):
-            _assert_wide_research_runtime_paths()
+        _assert_wide_research_runtime_paths()
+        if _automatic_publication_champion_store is None:
             project_root = os.path.dirname(os.path.abspath(__file__))
-            store = WideResearchStore(
+            _automatic_publication_champion_store = WideResearchStore(
                 AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE,
                 allowed_root=project_root,
                 max_db_bytes=(
                     AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES
                 ),
             )
-            store.bind_profile("automatic_champion")
+            _automatic_publication_champion_store.bind_profile(
+                "automatic_champion"
+            )
+        store = _automatic_publication_champion_store
+        fixed_specs = _automatic_publication_champion_specs()
+        persisted_dynamic = load_discovery_nomination_specs(store)
+        selected: Tuple[FrozenPortfolioSpec, ...] = ()
+        if (
+            ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS
+            and ENABLE_WIDE_RESEARCH_PRECISION
+        ):
+            selected = select_ready_discovery_nominations(
+                _get_wide_research_precision_components()[0],
+                target_store=store,
+                source_profile="precision_shadow",
+                existing_specs=fixed_specs + persisted_dynamic,
+                max_active=(
+                    AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS
+                ),
+            )
+        dynamic_specs = tuple(
+            sorted(
+                (*persisted_dynamic, *selected),
+                key=lambda value: value.rule_id,
+            )
+        )
+        specs = fixed_specs + dynamic_specs
+        families = dict(AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES)
+        for spec in specs:
+            if is_discovery_nomination(spec):
+                families[spec.portfolio_id] = discovery_nomination_family(spec)
+        phase_statuses = {
+            str(row.get("rule_id") or ""): str(row.get("status") or "")
+            for row in store.list_phases()
+        }
+        signature: Tuple[Any, ...] = (
+            os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE),
+            os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE),
+            int(AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES),
+            bool(AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY),
+            tuple(
+                (
+                    spec.rule_id,
+                    spec.manifest()["portfolio_hash"],
+                    families.get(spec.portfolio_id, spec.portfolio_id),
+                    phase_statuses.get(spec.rule_id),
+                )
+                for spec in specs
+            ),
+        )
+        if (
+            _automatic_publication_champion_layer is None
+            or _automatic_publication_champion_controller is None
+            or _automatic_publication_champion_signature != signature
+        ):
             layer = AutomaticChampionLayer(
                 store,
                 specs,
-                families=AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES,
+                families=families,
                 max_prediction_lag_seconds=(
                     SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
                 ),
@@ -23197,17 +23261,32 @@ def _get_automatic_publication_champion_components() -> Tuple[
             controller = AutomaticChampionController(
                 store,
                 specs,
-                families=AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES,
+                families=families,
                 baseline_portfolio_id=BALANCED_TWO_RULE_PORTFOLIO_ID,
                 report_path=AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE,
                 production_enabled=(
                     AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY
                 ),
             )
-            _automatic_publication_champion_store = store
             _automatic_publication_champion_layer = layer
             _automatic_publication_champion_controller = controller
-            _automatic_publication_champion_signature = signature
+            _automatic_publication_champion_signature = (
+                *signature[:-1],
+                tuple(
+                    (
+                        spec.rule_id,
+                        spec.manifest()["portfolio_hash"],
+                        families.get(spec.portfolio_id, spec.portfolio_id),
+                        {
+                            str(row.get("rule_id") or ""): str(
+                                row.get("status") or ""
+                            )
+                            for row in store.list_phases()
+                        }.get(spec.rule_id),
+                    )
+                    for spec in specs
+                ),
+            )
         return (
             _automatic_publication_champion_store,
             _automatic_publication_champion_layer,
@@ -25324,13 +25403,23 @@ def wide_research_daemon() -> None:
                 champion_layer, log_tag="AUTOMATIC_CHAMPION"
             ):
                 decision = champion_controller.reconcile()
+                retired_nominations = (
+                    retire_exhausted_discovery_nominations(
+                        champion_store,
+                        decision,
+                        terminal_horizon=(
+                            AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON
+                        ),
+                    )
+                )
                 logger.info(
                     "[AUTOMATIC_CHAMPION_RECOVERY] recovery=%s "
-                    "active=%s recommended=%s switched=%s",
+                    "active=%s recommended=%s switched=%s retired=%s",
                     recovery,
                     decision.get("active_portfolio_id"),
                     decision.get("recommended_portfolio_id"),
                     decision.get("switched"),
+                    len(retired_nominations),
                 )
         except Exception:
             logger.exception(
@@ -25850,18 +25939,31 @@ def wide_research_daemon() -> None:
                         if retries_clear
                         else {}
                     )
+                    retired_nominations = (
+                        retire_exhausted_discovery_nominations(
+                            _champion_store,
+                            decision,
+                            terminal_horizon=(
+                                AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON
+                            ),
+                        )
+                        if decision
+                        else ()
+                    )
                     if (
                         decision.get("switched")
                         or decision.get("recommended_rule_id")
                         or decision.get("status") == "blocked"
+                        or retired_nominations
                     ):
                         logger.info(
                             "[AUTOMATIC_CHAMPION_DECISION] active=%s "
-                            "recommended=%s switched=%s status=%s "
+                            "recommended=%s switched=%s retired=%s status=%s "
                             "production_apply=%s",
                             decision.get("active_portfolio_id"),
                             decision.get("recommended_portfolio_id"),
                             decision.get("switched"),
+                            len(retired_nominations),
                             decision.get("status"),
                             AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY,
                         )

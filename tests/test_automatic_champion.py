@@ -11,6 +11,9 @@ from wide_research.automatic_champion import (
     AutomaticChampionLayer,
     AutomaticChampionPolicy,
     AutomaticChampionUnavailable,
+    discovery_nomination_family,
+    retire_exhausted_discovery_nominations,
+    select_ready_discovery_nominations,
 )
 from wide_research.portfolio import (
     FrozenPortfolioMember,
@@ -108,6 +111,14 @@ def _store(tmp_path) -> WideResearchStore:
     return store
 
 
+def _source_store(tmp_path) -> WideResearchStore:
+    store = WideResearchStore(
+        tmp_path / "precision.sqlite3", allowed_root=tmp_path
+    )
+    store.bind_profile("precision_shadow")
+    return store
+
+
 def _permissive_policy() -> AutomaticChampionPolicy:
     return AutomaticChampionPolicy(
         prior_hit_rate=0.5,
@@ -124,6 +135,159 @@ def _permissive_policy() -> AutomaticChampionPolicy:
         champion_min_tenure_days=1.0,
         degradation_window=4,
         degradation_rate=0.5,
+    )
+
+
+def test_ready_discovery_rule_is_frozen_into_a_fresh_duel(tmp_path) -> None:
+    source = _source_store(tmp_path)
+    manifest = RuleManifest(
+        "wide-ready",
+        "v1",
+        (Clause("bot.prob_to90", ">=", 88.0),),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+    source.register_rule_and_phase(
+        rule_id=manifest.rule_id,
+        manifest=manifest.as_dict(),
+        phase_id="wide-ready:prospective",
+        status="ready",
+        starts_at_utc=(datetime.now(UTC) - timedelta(days=30)).isoformat(),
+        policy={"prospective": True},
+    )
+    target = _store(tmp_path)
+
+    selected = select_ready_discovery_nominations(
+        source,
+        target_store=target,
+        source_profile="precision_shadow",
+        existing_specs=(),
+        max_active=5,
+    )
+
+    assert len(selected) == 1
+    nomination = selected[0]
+    assert nomination.members[0].manifest == manifest
+    assert nomination.members[0].source_profile == "precision_shadow"
+    assert discovery_nomination_family(nomination).startswith("discovery-")
+    before = datetime.now(UTC)
+    AutomaticChampionLayer(
+        target,
+        (nomination,),
+        families={nomination.portfolio_id: discovery_nomination_family(nomination)},
+    )
+    admitted = target.list_phases(rule_id=nomination.rule_id)[0]
+    assert datetime.fromisoformat(admitted["starts_at_utc"]) >= before
+    assert target.list_triggers(phase_id=nomination.phase_id) == []
+
+
+def test_append_only_candidate_catalog_keeps_active_champion_valid(
+    tmp_path,
+) -> None:
+    baseline = _spec("baseline", 0.0)
+    first = _spec("first", 80.0)
+    store = _store(tmp_path)
+    initial_specs = (baseline, first)
+    initial_families = {"baseline": "baseline", "first": "first"}
+    AutomaticChampionLayer(store, initial_specs, families=initial_families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    initial = AutomaticChampionController(
+        store,
+        initial_specs,
+        families=initial_families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+    )
+    first_result = initial.reconcile(now_utc=started.isoformat())
+    active_since = first_result["active_since_utc"]
+
+    added = _spec("added", 90.0)
+    extended_specs = (*initial_specs, added)
+    extended_families = {**initial_families, "added": "added"}
+    AutomaticChampionLayer(store, extended_specs, families=extended_families)
+    extended = AutomaticChampionController(
+        store,
+        extended_specs,
+        families=extended_families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+    )
+
+    assert extended.active_selection().spec == baseline
+    refreshed = extended.reconcile(
+        now_utc=(started + timedelta(minutes=1)).isoformat()
+    )
+    assert refreshed["status"] == "ok"
+    assert refreshed["active_portfolio_id"] == "baseline"
+    assert refreshed["active_since_utc"] == active_since
+    assert extended.active_selection().generation == 2
+
+
+def test_failed_dynamic_duel_frees_its_slot_at_fixed_horizon(tmp_path) -> None:
+    target = _store(tmp_path)
+    nomination = FrozenPortfolioSpec(
+        "discovery-ready-precision-shadow-wide-failed",
+        "v1",
+        (_member("wide-failed", 90.0),),
+    )
+    AutomaticChampionLayer(
+        target,
+        (nomination,),
+        families={nomination.portfolio_id: "discovery-shape"},
+    )
+    decision = {
+        "status": "ok",
+        "active_rule_id": "another-rule",
+        "evaluations": [
+            {
+                "rule_id": nomination.rule_id,
+                "portfolio_id": nomination.portfolio_id,
+                "eligible": False,
+                "metrics": {"resolved": 200},
+                "reasons": ["multiple_testing_superiority_gate"],
+            }
+        ],
+    }
+
+    retired = retire_exhausted_discovery_nominations(target, decision)
+
+    assert retired == (nomination.phase_id,)
+    assert target.list_phases(rule_id=nomination.rule_id)[0]["status"] == (
+        "rejected"
+    )
+
+
+def test_fast_dynamic_duel_keeps_collecting_until_calendar_gate(tmp_path) -> None:
+    target = _store(tmp_path)
+    nomination = FrozenPortfolioSpec(
+        "discovery-ready-precision-shadow-wide-fast",
+        "v1",
+        (_member("wide-fast", 90.0),),
+    )
+    AutomaticChampionLayer(
+        target,
+        (nomination,),
+        families={nomination.portfolio_id: "discovery-shape"},
+    )
+    decision = {
+        "status": "ok",
+        "active_rule_id": "another-rule",
+        "evaluations": [
+            {
+                "rule_id": nomination.rule_id,
+                "portfolio_id": nomination.portfolio_id,
+                "eligible": False,
+                "metrics": {"resolved": 200},
+                "reasons": [
+                    "insufficient_span_days",
+                    "multiple_testing_superiority_gate",
+                ],
+            }
+        ],
+    }
+
+    assert retire_exhausted_discovery_nominations(target, decision) == ()
+    assert target.list_phases(rule_id=nomination.rule_id)[0]["status"] == (
+        "shadow"
     )
 
 
