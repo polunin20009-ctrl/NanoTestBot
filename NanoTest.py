@@ -23174,7 +23174,9 @@ def _automatic_publication_champion_specs() -> Tuple[
     return specs
 
 
-def _get_automatic_publication_champion_components() -> Tuple[
+def _get_automatic_publication_champion_components(
+    *, refresh_nominations: bool = False
+) -> Tuple[
     WideResearchStore,
     AutomaticChampionLayer,
     AutomaticChampionController,
@@ -23185,6 +23187,17 @@ def _get_automatic_publication_champion_components() -> Tuple[
     global _automatic_publication_champion_signature
 
     with _wide_research_lock:
+        if (
+            not refresh_nominations
+            and _automatic_publication_champion_store is not None
+            and _automatic_publication_champion_layer is not None
+            and _automatic_publication_champion_controller is not None
+        ):
+            return (
+                _automatic_publication_champion_store,
+                _automatic_publication_champion_layer,
+                _automatic_publication_champion_controller,
+            )
         _assert_wide_research_runtime_paths()
         if _automatic_publication_champion_store is None:
             project_root = os.path.dirname(os.path.abspath(__file__))
@@ -25930,7 +25943,9 @@ def wide_research_daemon() -> None:
                         _champion_store,
                         champion_layer,
                         champion_controller,
-                    ) = _get_automatic_publication_champion_components()
+                    ) = _get_automatic_publication_champion_components(
+                        refresh_nominations=True
+                    )
                     retries_clear = _wide_research_retry_gate(
                         champion_layer, log_tag="AUTOMATIC_CHAMPION"
                     )
