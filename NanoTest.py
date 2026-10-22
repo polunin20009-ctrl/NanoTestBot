@@ -96,6 +96,9 @@ from shadow_ml.rolling import (
     RollingDynamicsTracker,
 )
 from shadow_ml.history import materialize_training_history
+from shadow_ml.publication_confirm import (
+    apply_rolling_to90_publication_confirm,
+)
 from shadow_candidates import (
     AppendOnlyCandidateJournal,
     CandidateLayer,
@@ -706,6 +709,21 @@ ROLLING_DYNAMICS_SEED_WORKERS = max(
 SHADOW_ML_AUTO_RETRAIN = _parse_env_bool("SHADOW_ML_AUTO_RETRAIN", True)
 SHADOW_ML_ROLLING_AUTO_RETRAIN = _parse_env_bool(
     "SHADOW_ML_ROLLING_AUTO_RETRAIN", True
+)
+SHADOW_ML_ROLLING_PUBLICATION_CONFIRM = _parse_env_bool(
+    "SHADOW_ML_ROLLING_PUBLICATION_CONFIRM", False
+)
+SHADOW_ML_ROLLING_PUBLICATION_CONFIRM_MIN_TO90 = min(
+    100.0,
+    max(
+        0.0,
+        float(
+            os.environ.get(
+                "SHADOW_ML_ROLLING_PUBLICATION_CONFIRM_MIN_TO90",
+                "75",
+            )
+        ),
+    ),
 )
 SHADOW_ML_MODEL_FILE = os.environ.get(
     "SHADOW_ML_MODEL_FILE", os.path.join("stats", "shadow_ml_model.json")
@@ -23815,12 +23833,49 @@ def route_publication_with_balanced_two_rule(
                 automatic_champion_selection
             )
         passed_members = list(evaluation.get("passed_members") or [])
+        champion_allow = bool(passed_members)
+        rolling_confirm = apply_rolling_to90_publication_confirm(
+            champion_allow=champion_allow,
+            rolling_prediction=rolling_prediction
+            if isinstance(rolling_prediction, dict)
+            else None,
+            enabled=SHADOW_ML_ROLLING_PUBLICATION_CONFIRM,
+            min_to90_pct=SHADOW_ML_ROLLING_PUBLICATION_CONFIRM_MIN_TO90,
+        )
+        if rolling_confirm.get("applied"):
+            logger.info(
+                "[ROLLING_ML_PUBLICATION_CONFIRM] fixture_id=%s minute=%s "
+                "enabled=%s applied=%s allow=%s reason=%s "
+                "rolling_to90_pct=%s min_to90_pct=%s model_status=%s "
+                "champion_allow=%s",
+                fixture_id,
+                minute,
+                rolling_confirm.get("enabled"),
+                rolling_confirm.get("applied"),
+                rolling_confirm.get("allow"),
+                rolling_confirm.get("reason"),
+                rolling_confirm.get("rolling_to90_pct"),
+                rolling_confirm.get("min_to90_pct"),
+                rolling_confirm.get("model_status"),
+                champion_allow,
+            )
+        publication_reason = str(
+            evaluation.get("reason") or "no_member_passed"
+        )
+        if (
+            champion_allow
+            and rolling_confirm.get("applied")
+            and rolling_confirm.get("reason")
+            not in {"fail_open_unavailable", "fail_open_not_offline_ready"}
+        ):
+            publication_reason = str(rolling_confirm.get("reason") or publication_reason)
         return {
             "applied": True,
-            "allow": bool(passed_members),
+            "allow": bool(rolling_confirm.get("allow")),
             "source": spec.portfolio_id,
-            "reason": str(evaluation.get("reason") or "no_member_passed"),
+            "reason": publication_reason,
             "rule_id": spec.rule_id,
+            "rolling_ml_confirm": rolling_confirm,
             "automatic_champion_applied": automatic_champion_applied,
             "generation": (
                 automatic_champion_selection.generation
