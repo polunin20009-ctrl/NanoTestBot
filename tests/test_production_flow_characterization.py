@@ -576,6 +576,63 @@ def test_balanced_two_rule_can_allow_when_base_filter_failed(monkeypatch) -> Non
 
     assert decision["allow"] is True
     assert decision["source"] == bot.BALANCED_TWO_RULE_PORTFOLIO_ID
+    assert decision["rolling_ml_confirm"]["enabled"] is False
+
+
+def test_rolling_ml_publication_confirm_can_block_champion_pass(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(bot, "SHADOW_ML_ROLLING_PUBLICATION_CONFIRM", True)
+    monkeypatch.setattr(bot, "SHADOW_ML_ROLLING_PUBLICATION_CONFIRM_MIN_TO90", 75.0)
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: {
+            "observation_id": "1:50:WIDE_ROUTER:v3",
+            "created_at_utc": "2026-01-01T00:00:00+00:00",
+            "market_research": {},
+        },
+    )
+
+    def _prediction(observation, rolling):
+        if not rolling:
+            return None
+        return {
+            "model_id": "shadow_ml_rolling:test",
+            "model_status": "offline_ready",
+            "predictions": {
+                "to90": {
+                    "status": "ok",
+                    "calibrated_probability_pct": 70.0,
+                }
+            },
+        }
+
+    monkeypatch.setattr(
+        bot, "_build_shadow_candidate_prediction_record", _prediction
+    )
+    monkeypatch.setattr(
+        bot,
+        "evaluate_frozen_portfolio",
+        lambda *args, **kwargs: {
+            "reason": "pass",
+            "portfolio_hash": "hash",
+            "passed_members": ["member-a"],
+            "members": [],
+        },
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={},
+        current_filter_allow=True,
+    )
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "confirm_below_threshold"
+    assert decision["rolling_ml_confirm"]["rolling_to90_pct"] == 70.0
 
 
 def test_automatic_champion_routes_through_validated_active_spec(
