@@ -917,20 +917,31 @@ def test_reconciler_reuses_events_response_and_preserves_unavailable_quality(
     assert captured_payloads == [None]
 
 
-def test_reconciler_marks_cancelled_fixture_void(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status_short", "void_reason"),
+    [
+        ("CANC", "fixture_status_canc"),
+        ("INT", "fixture_status_int"),
+        ("SUSP", "fixture_status_susp"),
+        ("PST", "fixture_status_pst"),
+    ],
+)
+def test_reconciler_marks_cancelled_or_interrupted_fixture_void(
+    monkeypatch, tmp_path: Path, status_short: str, void_reason: str
+) -> None:
     _configure_store(monkeypatch, tmp_path)
     assert nanotest.append_decision_snapshot(_decision("101:46:WINDOW_1:v2")) is True
 
     class Client:
         def fetch_fixture(self, fixture_id: int) -> dict:
-            return {"fixture": {"id": fixture_id, "status": {"short": "CANC"}}}
+            return {"fixture": {"id": fixture_id, "status": {"short": status_short}}}
 
     summary = nanotest.reconcile_pending_decision_outcomes(Client(), set(), now_ts=1_000.0)
     joined = nanotest.load_joined_decision_snapshots()
 
     assert summary["void_fixtures"] == 1
     assert joined[0]["outcome"]["status"] == "void"
-    assert joined[0]["outcome"]["void_reason"] == "fixture_status_canc"
+    assert joined[0]["outcome"]["void_reason"] == void_reason
 
 
 def test_reconciler_voids_old_evidence_when_fixture_id_is_rescheduled(

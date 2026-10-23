@@ -143,6 +143,7 @@ from wide_research.health_snapshot import ProfileSnapshotSpec
 from match_period import (
     EventTime,
     GoalScope,
+    INTERRUPTED_STATUSES,
     MatchPeriod,
     OutcomeScope,
     classify_goal_scope,
@@ -27951,7 +27952,7 @@ def reconcile_pending_decision_outcomes(
                         reschedule_reason,
                     )
                     continue
-            if status_short in {"CANC", "ABD", "AWD", "WO", "PST"}:
+            if status_short in {"CANC", "ABD", "AWD", "WO"} | INTERRUPTED_STATUSES:
                 written = void_decision_snapshot_outcomes(
                     fixture_id,
                     f"fixture_status_{status_short.lower()}",
