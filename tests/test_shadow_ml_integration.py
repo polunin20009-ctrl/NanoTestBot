@@ -182,6 +182,244 @@ def test_rolling_challenger_writes_only_its_separate_journal(monkeypatch) -> Non
     assert record["production_applied"] is False
 
 
+def test_ready_rolling_ml_atomically_replaces_primary_probabilities(
+    monkeypatch,
+) -> None:
+    base = {
+        "prob_next_15": 55.0,
+        "prob_to90": 80.0,
+        "prob_until_end_decision": 80.0,
+        "other": {"unchanged": True},
+    }
+    before = copy.deepcopy(base)
+    monkeypatch.setattr(bot, "ENABLE_ROLLING_ML_PRIMARY_PROBABILITY", True)
+    monkeypatch.setattr(
+        bot,
+        "load_shadow_rolling_model_cached",
+        lambda: {
+            "model_id": "shadow_ml_rolling:ready",
+            "status": "offline_ready",
+            "algorithm_version": "rolling-v2",
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "predict_shadow_rolling",
+        lambda artifact, observation: {
+            "status": "ok",
+            "model_id": artifact["model_id"],
+            "targets": {
+                "next15": {
+                    "status": "ok",
+                    "calibrated_probability_pct": 61.5,
+                },
+                "to90": {
+                    "status": "ok",
+                    "calibrated_probability_pct": 84.25,
+                },
+            },
+        },
+    )
+
+    result = bot.apply_primary_rolling_ml_probability(
+        base,
+        _pending_observation(),
+    )
+
+    assert base == before
+    assert result["prob_next_15"] == 61.5
+    assert result["prob_to90"] == 84.25
+    assert result["prob_until_end_decision"] == 84.25
+    assert result["pre_ml_prob_next_15"] == 55.0
+    assert result["pre_ml_prob_to90"] == 80.0
+    assert result["rolling_ml_primary"]["applied"] is True
+    assert result["rolling_ml_primary"]["source"] == "rolling_ml_primary"
+
+
+def test_rolling_ml_primary_partial_prediction_falls_back_as_one_unit(
+    monkeypatch,
+) -> None:
+    base = {"prob_next_15": 55.0, "prob_to90": 80.0}
+    monkeypatch.setattr(bot, "ENABLE_ROLLING_ML_PRIMARY_PROBABILITY", True)
+    monkeypatch.setattr(
+        bot,
+        "load_shadow_rolling_model_cached",
+        lambda: {"model_id": "rolling:ready", "status": "offline_ready"},
+    )
+    monkeypatch.setattr(
+        bot,
+        "predict_shadow_rolling",
+        lambda artifact, observation: {
+            "status": "partial",
+            "targets": {
+                "next15": {
+                    "status": "ok",
+                    "calibrated_probability_pct": 99.0,
+                },
+                "to90": {"status": "unavailable"},
+            },
+        },
+    )
+
+    result = bot.apply_primary_rolling_ml_probability(
+        base,
+        _pending_observation(),
+    )
+
+    assert result["prob_next_15"] == 55.0
+    assert result["prob_to90"] == 80.0
+    assert result["rolling_ml_primary"]["applied"] is False
+    assert result["rolling_ml_primary"]["fallback_reason"] == "partial"
+
+
+def test_rolling_ml_primary_contract_mismatch_falls_back_and_requests_refresh(
+    monkeypatch,
+) -> None:
+    noted: list[bool] = []
+    monkeypatch.setattr(bot, "ENABLE_ROLLING_ML_PRIMARY_PROBABILITY", True)
+    monkeypatch.setattr(
+        bot,
+        "load_shadow_rolling_model_cached",
+        lambda: {"model_id": "rolling:ready", "status": "offline_ready"},
+    )
+    monkeypatch.setattr(
+        bot,
+        "predict_shadow_rolling",
+        lambda artifact, observation: {
+            "status": "invalid_observation",
+            "reason": "feature_contract_mismatch",
+            "targets": {},
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "note_shadow_rolling_contract_mismatch",
+        lambda: noted.append(True),
+    )
+
+    result = bot.apply_primary_rolling_ml_probability(
+        {"prob_next_15": 55.0, "prob_to90": 80.0},
+        _pending_observation(),
+    )
+
+    assert result["prob_next_15"] == 55.0
+    assert result["prob_to90"] == 80.0
+    assert result["rolling_ml_primary"]["fallback_reason"] == (
+        "feature_contract_mismatch"
+    )
+    assert noted == [True]
+
+
+def test_rolling_ml_primary_rejects_out_of_range_probability(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(bot, "ENABLE_ROLLING_ML_PRIMARY_PROBABILITY", True)
+    monkeypatch.setattr(
+        bot,
+        "load_shadow_rolling_model_cached",
+        lambda: {"model_id": "rolling:ready", "status": "offline_ready"},
+    )
+    monkeypatch.setattr(
+        bot,
+        "predict_shadow_rolling",
+        lambda artifact, observation: {
+            "status": "ok",
+            "targets": {
+                "next15": {
+                    "status": "ok",
+                    "calibrated_probability_pct": 101.0,
+                },
+                "to90": {
+                    "status": "ok",
+                    "calibrated_probability_pct": 82.0,
+                },
+            },
+        },
+    )
+
+    result = bot.apply_primary_rolling_ml_probability(
+        {"prob_next_15": 55.0, "prob_to90": 80.0},
+        _pending_observation(),
+    )
+
+    assert result["prob_next_15"] == 55.0
+    assert result["prob_to90"] == 80.0
+    assert result["rolling_ml_primary"]["fallback_reason"] == (
+        "next15_invalid_probability"
+    )
+
+
+def test_monitor_observation_keeps_pre_ml_base_and_primary_provenance() -> None:
+    observation = bot.build_wide_monitor_observation(
+        fixture_id=101,
+        minute=46,
+        fixture_metrics={},
+        probability_result={
+            "prob_next_15": 61.0,
+            "prob_to90": 84.0,
+            "pre_ml_prob_next_15": 55.0,
+            "pre_ml_prob_to90": 80.0,
+            "rolling_ml_primary": {
+                "applied": True,
+                "model_id": "rolling:ready",
+            },
+        },
+    )
+
+    assert observation["probabilities"]["prob_next_15"] == 61.0
+    assert observation["probabilities"]["prob_to90"] == 84.0
+    assert observation["probabilities"]["pre_ml_prob_next_15"] == 55.0
+    assert observation["probabilities"]["pre_ml_prob_to90"] == 80.0
+    assert observation["rolling_ml_primary"]["applied"] is True
+
+
+def test_probability_wrapper_exposes_ml_values_and_preserves_training_base(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(bot, "ENABLE_ROLLING_ML_PRIMARY_PROBABILITY", True)
+    monkeypatch.setattr(
+        bot,
+        "compute_probability_45_plus",
+        lambda fixture, minute: {"prob_next_15": 50.0, "prob_to90": 75.0},
+    )
+    monkeypatch.setattr(
+        bot,
+        "apply_signal_reputation_to_probability_result",
+        lambda fixture, minute, result, *, application_context: {
+            **result,
+            "prob_next_15": 52.0,
+            "prob_to90": 78.0,
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: _pending_observation(),
+    )
+    monkeypatch.setattr(
+        bot,
+        "apply_primary_rolling_ml_probability",
+        lambda result, observation: {
+            **result,
+            "pre_ml_prob_next_15": result["prob_next_15"],
+            "pre_ml_prob_to90": result["prob_to90"],
+            "prob_next_15": 59.0,
+            "prob_to90": 83.0,
+        },
+    )
+
+    result = bot.compute_probability_45_plus_with_reputation(
+        {"fixture": {"id": 101}},
+        46,
+        application_context="send",
+    )
+
+    assert result["prob_next_15"] == 59.0
+    assert result["prob_to90"] == 83.0
+    assert result["pre_ml_prob_next_15"] == 52.0
+    assert result["pre_ml_prob_to90"] == 78.0
+
+
 def test_rolling_retrain_hint_survives_when_static_ml_is_disabled(
     monkeypatch,
 ) -> None:

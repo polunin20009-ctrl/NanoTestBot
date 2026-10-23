@@ -692,6 +692,9 @@ ENABLE_SHADOW_ML = _parse_env_bool("ENABLE_SHADOW_ML", True)
 ENABLE_SHADOW_ML_ROLLING_CHALLENGER = _parse_env_bool(
     "ENABLE_SHADOW_ML_ROLLING_CHALLENGER", True
 )
+ENABLE_ROLLING_ML_PRIMARY_PROBABILITY = _parse_env_bool(
+    "ENABLE_ROLLING_ML_PRIMARY_PROBABILITY", False
+)
 ENABLE_ROLLING_DYNAMICS_SHADOW = _parse_env_bool(
     "ENABLE_ROLLING_DYNAMICS_SHADOW", True
 )
@@ -16023,6 +16026,12 @@ def build_decision_snapshot(
         "prob_next_25": _decision_float(probability_result, "prob_next_25"),
         "prob_to75": _decision_float(probability_result, "prob_to75"),
         "prob_to90": prob_to90,
+        "pre_ml_prob_next_15": _decision_float(
+            probability_result, "pre_ml_prob_next_15", prob_next15
+        ),
+        "pre_ml_prob_to90": _decision_float(
+            probability_result, "pre_ml_prob_to90", prob_to90
+        ),
         "prob_until_end_decision": prob_until_end,
         "decision_remain_metric": str(probability_result.get("decision_remain_metric") or "prob_to90"),
         "baseline_prob_next_15": _decision_float(probability_result, "baseline_prob_next_15"),
@@ -16111,6 +16120,9 @@ def build_decision_snapshot(
         "probabilities": probabilities,
         "reputation_application": dict(
             probability_result.get("reputation_application") or {}
+        ),
+        "rolling_ml_primary": dict(
+            probability_result.get("rolling_ml_primary") or {}
         ),
         "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
         "normal_time_boundary_mode": NORMAL_TIME_BOUNDARY_MODE,
@@ -16391,6 +16403,9 @@ def _observation_config_snapshot() -> Dict[str, Any]:
         "signal_reputation_expanded_production_apply": bool(
             ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY
         ),
+        "rolling_ml_primary_enabled": bool(
+            ENABLE_ROLLING_ML_PRIMARY_PROBABILITY
+        ),
         "signal_reputation_blend_to90_telegram_weight": float(
             SIGNAL_REPUTATION_BLEND_TELEGRAM_WEIGHT
         ),
@@ -16567,6 +16582,9 @@ def build_observation_from_decision(
             "sample_confidence": probability_result.get("sample_confidence"),
         },
         "probabilities": dict(decision_snapshot.get("probabilities") or {}),
+        "rolling_ml_primary": dict(
+            decision_snapshot.get("rolling_ml_primary") or {}
+        ),
         "gates": dict(decision_snapshot.get("gates") or {}),
         "decision": dict(decision_snapshot.get("decision") or {}),
         "publication_policy": dict(
@@ -16624,6 +16642,14 @@ def build_wide_monitor_observation(
         "prob_next_25": probability_result.get("prob_next_25"),
         "prob_to75": probability_result.get("prob_to75"),
         "prob_to90": probability_result.get("prob_to90"),
+        "pre_ml_prob_next_15": probability_result.get(
+            "pre_ml_prob_next_15",
+            probability_result.get("prob_next_15"),
+        ),
+        "pre_ml_prob_to90": probability_result.get(
+            "pre_ml_prob_to90",
+            probability_result.get("prob_to90"),
+        ),
         "prob_until_end_decision": probability_result.get("prob_to90"),
         "baseline_prob_next_15": probability_result.get(
             "baseline_prob_next_15"
@@ -16698,6 +16724,9 @@ def build_wide_monitor_observation(
             "sample_confidence": probability_result.get("sample_confidence"),
         },
         "probabilities": probability_fields,
+        "rolling_ml_primary": dict(
+            probability_result.get("rolling_ml_primary") or {}
+        ),
         "gates": {
             "readiness_passed": True,
             "other_hard_gates_passed": True,
@@ -20521,6 +20550,139 @@ def predict_and_append_shadow_rolling_ml(
             observation_id,
         )
         return False
+
+
+def apply_primary_rolling_ml_probability(
+    probability_result: Mapping[str, Any],
+    observation: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Atomically replace both output horizons with a ready rolling model."""
+    result = copy.deepcopy(dict(probability_result))
+    observation_view = observation if isinstance(observation, Mapping) else {}
+    base_next15 = _safe_float(result.get("prob_next_15"), float("nan"))
+    base_to90 = _safe_float(result.get("prob_to90"), float("nan"))
+    provenance: Dict[str, Any] = {
+        "enabled": bool(ENABLE_ROLLING_ML_PRIMARY_PROBABILITY),
+        "applied": False,
+        "source": "base_probability",
+        "fallback_reason": None,
+        "model_id": None,
+        "model_status": None,
+    }
+
+    def fallback(reason: str) -> Dict[str, Any]:
+        provenance["fallback_reason"] = reason
+        result["rolling_ml_primary"] = provenance
+        logger.warning(
+            "[ROLLING_ML_PRIMARY] observation_id=%s fixture_id=%s minute=%s "
+            "applied=false fallback_reason=%s",
+            observation_view.get("observation_key")
+            or observation_view.get("observation_id"),
+            observation_view.get("fixture_id"),
+            observation_view.get("minute"),
+            reason,
+        )
+        return result
+
+    if not ENABLE_ROLLING_ML_PRIMARY_PROBABILITY:
+        provenance["fallback_reason"] = "disabled"
+        result["rolling_ml_primary"] = provenance
+        return result
+    if not isinstance(observation, Mapping):
+        return fallback("invalid_observation")
+    if not math.isfinite(base_next15) or not math.isfinite(base_to90):
+        return fallback("invalid_base_probability")
+
+    try:
+        artifact = load_shadow_rolling_model_cached()
+        if not isinstance(artifact, Mapping):
+            return fallback("model_unavailable")
+        provenance["model_id"] = str(artifact.get("model_id") or "") or None
+        provenance["model_status"] = str(artifact.get("status") or "") or None
+        if provenance["model_status"] != "offline_ready":
+            return fallback("model_not_offline_ready")
+
+        prediction = predict_shadow_rolling(artifact, observation_view)
+        prediction_status = str(prediction.get("status") or "")
+        if (
+            prediction_status == "invalid_observation"
+            and str(prediction.get("reason") or "")
+            == "feature_contract_mismatch"
+        ):
+            note_shadow_rolling_contract_mismatch()
+            return fallback("feature_contract_mismatch")
+        if prediction_status != "ok":
+            return fallback(
+                str(prediction.get("reason") or prediction_status or "prediction_failed")
+            )
+        targets = (
+            prediction.get("targets")
+            if isinstance(prediction.get("targets"), Mapping)
+            else {}
+        )
+        calibrated: Dict[str, float] = {}
+        for target_name in ("next15", "to90"):
+            payload = targets.get(target_name)
+            if (
+                not isinstance(payload, Mapping)
+                or str(payload.get("status") or "") != "ok"
+            ):
+                return fallback(f"{target_name}_unavailable")
+            raw_value = payload.get("calibrated_probability_pct")
+            if isinstance(raw_value, bool):
+                return fallback(f"{target_name}_invalid_probability")
+            value = _safe_float(raw_value, float("nan"))
+            if not math.isfinite(value) or not 0.0 <= value <= 100.0:
+                return fallback(f"{target_name}_invalid_probability")
+            calibrated[target_name] = value
+
+        result["pre_ml_prob_next_15"] = base_next15
+        result["pre_ml_prob_to90"] = base_to90
+        result["prob_next_15"] = calibrated["next15"]
+        result["prob_to90"] = calibrated["to90"]
+        result["prob_until_end_decision"] = calibrated["to90"]
+        provenance.update(
+            {
+                "applied": True,
+                "source": "rolling_ml_primary",
+                "fallback_reason": None,
+                "model_id": str(
+                    prediction.get("model_id")
+                    or artifact.get("model_id")
+                    or ""
+                )
+                or None,
+                "algorithm_version": prediction.get("algorithm_version")
+                or artifact.get("algorithm_version"),
+                "base_prob_next_15": base_next15,
+                "base_prob_to90": base_to90,
+                "prob_next_15": calibrated["next15"],
+                "prob_to90": calibrated["to90"],
+            }
+        )
+        result["rolling_ml_primary"] = provenance
+        logger.info(
+            "[ROLLING_ML_PRIMARY] observation_id=%s fixture_id=%s minute=%s "
+            "applied=true model_id=%s base_next15=%.2f ml_next15=%.2f "
+            "base_to90=%.2f ml_to90=%.2f",
+            observation_view.get("observation_key")
+            or observation_view.get("observation_id"),
+            observation_view.get("fixture_id"),
+            observation_view.get("minute"),
+            provenance["model_id"],
+            base_next15,
+            calibrated["next15"],
+            base_to90,
+            calibrated["to90"],
+        )
+        return result
+    except Exception as exc:
+        logger.exception(
+            "[ROLLING_ML_PRIMARY_ERROR] observation_id=%s action=fallback_base",
+            observation_view.get("observation_key")
+            or observation_view.get("observation_id"),
+        )
+        return fallback(f"exception:{type(exc).__name__}")
 
 
 _shadow_candidate_layer_lock = threading.RLock()
@@ -26849,11 +27011,32 @@ def compute_probability_45_plus_with_reputation(
 ) -> Dict[str, Any]:
     """Single 45+ probability path used by both Telegram send and updates."""
     base_result = compute_probability_45_plus(fixture_metrics, minute)
-    return apply_signal_reputation_to_probability_result(
+    reputation_result = apply_signal_reputation_to_probability_result(
         fixture_metrics,
         minute,
         base_result,
         application_context=application_context,
+    )
+    if not ENABLE_ROLLING_ML_PRIMARY_PROBABILITY:
+        return reputation_result
+    try:
+        observation = build_wide_router_observation(
+            fixture_id=_safe_int(get_fixture_id(fixture_metrics), 0),
+            minute=int(minute),
+            fixture_metrics=fixture_metrics,
+            probability_result=reputation_result,
+        )
+    except Exception:
+        logger.exception(
+            "[ROLLING_ML_PRIMARY_OBSERVATION_ERROR] context=%s minute=%s "
+            "action=fallback_base",
+            application_context,
+            minute,
+        )
+        observation = {}
+    return apply_primary_rolling_ml_probability(
+        reputation_result,
+        observation,
     )
 
 
