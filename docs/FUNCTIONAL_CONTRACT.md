@@ -251,7 +251,7 @@ All profiles: conjunction DSL (`>=`, `<=`, `==`) on an allowlisted numeric featu
 - target hit rate **90%**, null **85%**, Wilson lower **≥ 85%**
 - **200** resolved in the closed look and **10** calendar span days
 - ≥ 8 leagues, max league share 35%, ≥ 2 stable weekly windows (≥ **85%**), ≥ 2 triggers/week
-- at the 200-result pool selection, rules below 90% pause; rules at or above 90% continue to later registered looks
+- at the 200-result pool selection, rules below 86% pause; rules at or above 86% continue to later registered looks
 - Holm α = 0.05
 - degradation: fast n=50 rate 0.80; slow n=150 vs null 0.90
 - Telegram publication champion uses its separate 200-result / 10-day policy

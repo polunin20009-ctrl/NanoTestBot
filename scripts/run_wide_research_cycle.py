@@ -29,7 +29,10 @@ _WORKER_MEMORY_LIMIT_MB = apply_worker_memory_limit(
     env_name="GOALBOT_WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB"
 )
 
-from wide_research.controller import WideResearchController  # noqa: E402
+from wide_research.controller import (  # noqa: E402
+    POOL_SELECTION_MIN_HIT_RATE,
+    WideResearchController,
+)
 from wide_research.discovery import (  # noqa: E402
     DiscoveryConfig,
     JournalJoinStore,
@@ -504,11 +507,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     allowed_looks=(50, 100, 200, 300, 500, 750, 1000),
                 ),
                 "terminal_review_enabled": True,
-                "terminal_review_min_hit_rate": 0.90,
+                "terminal_review_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
                 "pool_lifecycle_policy": {
                     "version": "wide_pool_lifecycle_v2",
                     "selection_look": 200,
-                    "selection_min_hit_rate": 0.90,
+                    "selection_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
                     "terminal_look": 1000,
                     "max_age_days": 365,
                 },

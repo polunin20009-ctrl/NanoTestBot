@@ -117,7 +117,10 @@ from wide_research.automatic_champion import (
     retire_exhausted_discovery_nominations,
     select_ready_discovery_nominations,
 )
-from wide_research.controller import WideResearchController
+from wide_research.controller import (
+    POOL_SELECTION_MIN_HIT_RATE,
+    WideResearchController,
+)
 from market_benchmark.research import CausalQuoteCache
 from wide_research.discovery import (
     ATOMIC_GRID_VERSION as WIDE_RESEARCH_ATOMIC_GRID_VERSION,
@@ -924,7 +927,7 @@ WIDE_RESEARCH_MAX_SHADOW_RULES = max(
 WIDE_RESEARCH_POOL_LIFECYCLE_POLICY = {
     "version": "wide_pool_lifecycle_v2",
     "selection_look": 200,
-    "selection_min_hit_rate": 0.90,
+    "selection_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
     "terminal_look": 1000,
     "max_age_days": 180,
 }
@@ -1299,7 +1302,7 @@ WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY = LifecyclePolicy(
 WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY = {
     "version": "wide_pool_lifecycle_v2",
     "selection_look": 200,
-    "selection_min_hit_rate": 0.90,
+    "selection_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
     "terminal_look": 1000,
     "max_age_days": 365,
 }
@@ -23009,7 +23012,9 @@ def _get_wide_research_rare_precision_components() -> Tuple[
                     ),
                     policy=WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY,
                     terminal_review_enabled=True,
-                    terminal_review_min_hit_rate=0.90,
+                    terminal_review_min_hit_rate=(
+                        POOL_SELECTION_MIN_HIT_RATE
+                    ),
                     pool_lifecycle_policy=(
                         WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY
                     ),
@@ -25454,7 +25459,8 @@ def _wide_research_rare_precision_summary_is_current(
             == WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY
             and terminal_review.get("enabled") is True
             and int(terminal_review.get("final_look")) == 200
-            and float(terminal_review.get("min_point_hit_rate")) == 0.90
+            and float(terminal_review.get("min_point_hit_rate"))
+            == POOL_SELECTION_MIN_HIT_RATE
             and str(payload.get("prospective_start_utc") or "")
             == str(WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC)
             and requested_memory_mb == WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB

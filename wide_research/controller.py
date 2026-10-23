@@ -38,6 +38,7 @@ IMPORT_IDENTITY_STATUSES = (*EVALUATED_STATUSES, "paused")
 TERMINAL_REVIEW_POLICY_VERSION = "wide_terminal_review_v1"
 POOL_LIFECYCLE_POLICY_VERSION = "wide_pool_lifecycle_v2"
 LEGACY_POOL_LIFECYCLE_POLICY_VERSION = "wide_pool_lifecycle_v1"
+POOL_SELECTION_MIN_HIT_RATE = 0.86
 MAX_EVALUATED_PHASES = 64
 
 
@@ -299,6 +300,21 @@ def _pool_policy_can_advance(
 ) -> bool:
     if current == desired:
         return True
+    if (
+        current
+        and desired
+        and current.get("version") == POOL_LIFECYCLE_POLICY_VERSION
+        and desired.get("version") == POOL_LIFECYCLE_POLICY_VERSION
+        and int(current.get("selection_look") or 0)
+        == int(desired.get("selection_look") or -1)
+        and int(current.get("terminal_look") or 0)
+        == int(desired.get("terminal_look") or -1)
+        and int(current.get("max_age_days") or 0)
+        == int(desired.get("max_age_days") or -1)
+        and float(desired.get("selection_min_hit_rate") or 0.0)
+        <= float(current.get("selection_min_hit_rate") or 0.0)
+    ):
+        return True
     return bool(
         current
         and desired
@@ -306,6 +322,24 @@ def _pool_policy_can_advance(
         and desired.get("version") == POOL_LIFECYCLE_POLICY_VERSION
         and int(current.get("terminal_look") or 0)
         == int(desired.get("selection_look") or -1)
+    )
+
+
+def _terminal_review_policy_can_relax(
+    current: Optional[Mapping[str, Any]],
+    desired: Optional[Mapping[str, Any]],
+) -> bool:
+    if current == desired:
+        return True
+    return bool(
+        current
+        and desired
+        and current.get("version") == desired.get("version")
+        and current.get("enabled") is desired.get("enabled")
+        and int(current.get("final_look") or 0)
+        == int(desired.get("final_look") or -1)
+        and float(desired.get("min_point_hit_rate") or 0.0)
+        <= float(current.get("min_point_hit_rate") or 0.0)
     )
 
 
@@ -1570,6 +1604,7 @@ class WideResearchController:
 
         if self.pool_lifecycle_policy is None:
             return []
+        desired_terminal = self._terminal_review_manifest()
         phase_ids = []
         replacements = []
         for phase in self.store.list_phases(
@@ -1590,19 +1625,45 @@ class WideResearchController:
                     phase_ids.append(str(phase["phase_id"]))
                 continue
             normalized_existing = _phase_pool_lifecycle_policy(phase)
-            if normalized_existing == self.pool_lifecycle_policy:
-                continue
-            if _phase_pool_policy_can_advance(
-                phase, self.pool_lifecycle_policy, self.policy
+            existing_terminal = _phase_terminal_review_policy(phase)
+            terminal_matches = (
+                existing_terminal == desired_terminal
+                if self.terminal_review_enabled
+                else True
+            )
+            if (
+                normalized_existing == self.pool_lifecycle_policy
+                and terminal_matches
             ):
-                replacements.append(
-                    {
-                        "phase_id": str(phase["phase_id"]),
-                        "expected_status": str(phase["status"]),
-                        "previous_policy": dict(existing),
-                        "pool_lifecycle_policy": self.pool_lifecycle_policy,
-                    }
-                )
+                continue
+            pool_can_advance = _phase_pool_policy_can_advance(
+                phase, self.pool_lifecycle_policy, self.policy
+            )
+            terminal_can_relax = _terminal_review_policy_can_relax(
+                existing_terminal,
+                desired_terminal,
+            ) if self.terminal_review_enabled else True
+            if pool_can_advance and terminal_can_relax:
+                replacement = {
+                    "phase_id": str(phase["phase_id"]),
+                    "expected_status": str(phase["status"]),
+                    "previous_policy": dict(existing),
+                    "pool_lifecycle_policy": self.pool_lifecycle_policy,
+                }
+                if not terminal_matches:
+                    replacement.update(
+                        {
+                            "previous_terminal_review": dict(
+                                _mapping(
+                                    _mapping(phase.get("policy")).get(
+                                        "terminal_review"
+                                    )
+                                )
+                            ),
+                            "terminal_review_policy": desired_terminal,
+                        }
+                    )
+                replacements.append(replacement)
             elif str(phase["status"]) != "paused":
                 raise ValueError(
                     "phase has an invalid or different frozen pool lifecycle policy"
@@ -1773,10 +1834,16 @@ class WideResearchController:
         for row in phase_rows:
             status = str(row.get("status"))
             terminal_review = _phase_terminal_review_policy(row)
+            pool_lifecycle = _phase_pool_lifecycle_policy(row)
             if status not in {"candidate", "shadow", "ready"} and not (
                 status == "paused"
-                and terminal_review is not None
-                and terminal_review["enabled"]
+                and (
+                    (
+                        terminal_review is not None
+                        and terminal_review["enabled"]
+                    )
+                    or pool_lifecycle is not None
+                )
             ):
                 continue
             if _phase_runtime_compatible(row):
@@ -2093,18 +2160,41 @@ class WideResearchController:
                 pool_selection is not None
                 and pool_selection["closed"]
                 and pool_selection["continue"] is True
-                and str(phase["status"]) in {"candidate", "shadow"}
             ):
-                self.store.note_phase_lifecycle_event_once(
-                    phase_id,
-                    expected_status=str(phase["status"]),
-                    reason="pool_selection_finalist_continued",
-                    metadata={
-                        "selection": pool_selection,
-                        "pool_lifecycle": pool_lifecycle,
-                    },
-                    changed_at_utc=_utc_iso(now),
-                )
+                if str(phase["status"]) == "paused":
+                    if age_expired:
+                        readiness[-1]["resume_deferred"] = (
+                            "pool_calendar_age_expired"
+                        )
+                        continue
+                    if available_resume_slots <= 0:
+                        readiness[-1]["resume_deferred"] = "pool_capacity"
+                        continue
+                    self.store.transition_phase(
+                        phase_id,
+                        "shadow",
+                        expected_status="paused",
+                        reason="pool_selection_finalist_resumed",
+                        metadata={
+                            "selection": pool_selection,
+                            "pool_lifecycle": pool_lifecycle,
+                            "future_evidence_only": True,
+                        },
+                        changed_at_utc=_utc_iso(now),
+                    )
+                    available_resume_slots -= 1
+                    continue
+                if str(phase["status"]) in {"candidate", "shadow"}:
+                    self.store.note_phase_lifecycle_event_once(
+                        phase_id,
+                        expected_status=str(phase["status"]),
+                        reason="pool_selection_finalist_continued",
+                        metadata={
+                            "selection": pool_selection,
+                            "pool_lifecycle": pool_lifecycle,
+                        },
+                        changed_at_utc=_utc_iso(now),
+                    )
             if (
                 pool_selection is not None
                 and pool_selection["closed"]

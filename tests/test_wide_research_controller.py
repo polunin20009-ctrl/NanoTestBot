@@ -1155,6 +1155,86 @@ def test_staged_terminal_review_continues_reviewable_hard_shadow(
     assert len(layer.process_snapshot(_snapshot(3302, observed))["claimed"]) == 1
 
 
+@pytest.mark.parametrize("terminal_review_enabled", (False, True))
+def test_relaxed_pool_selection_resumes_a_newly_eligible_phase(
+    tmp_path,
+    terminal_review_enabled: bool,
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    policy = replace(_policy(), allowed_looks=(2, 3))
+    old_pool_policy = {
+        "version": "wide_pool_lifecycle_v2",
+        "selection_look": 2,
+        "selection_min_hit_rate": 0.90,
+        "terminal_look": 3,
+        "max_age_days": 180,
+    }
+    old = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        production_enabled=False,
+        policy=policy,
+        terminal_review_enabled=terminal_review_enabled,
+        terminal_review_min_hit_rate=0.90,
+        pool_lifecycle_policy=old_pool_policy,
+    )
+    old.import_report(
+        _purged_successor(_report(), run_id="purged-pool"),
+        imported_at_utc="2026-08-28T00:00:00+00:00",
+    )
+    layer = WideShadowLayer(store, refresh_seconds=0)
+    for index, won in enumerate((True, False)):
+        observed = datetime(2026, 8, 28, 12 + index, tzinfo=UTC)
+        snapshot = _snapshot(3350 + index, observed)
+        layer.process_snapshot(snapshot)
+        layer.process_outcomes(
+            [
+                {
+                    "observation_id": snapshot["observation_id"],
+                    "outcome_schema_version": 1,
+                    "created_at_utc": (
+                        observed + timedelta(hours=2)
+                    ).isoformat(),
+                    "outcome": {
+                        "status": "resolved",
+                        "goal_to90_normal_time": won,
+                        "resolved_at_utc": (
+                            observed + timedelta(hours=2)
+                        ).isoformat(),
+                    },
+                }
+            ]
+        )
+
+    old.reconcile(now_utc="2026-08-29T00:00:00+00:00")
+    assert store.list_phases()[0]["status"] == "paused"
+
+    relaxed_pool_policy = {
+        **old_pool_policy,
+        "selection_min_hit_rate": 0.50,
+    }
+    relaxed = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        production_enabled=False,
+        policy=policy,
+        terminal_review_enabled=terminal_review_enabled,
+        terminal_review_min_hit_rate=0.50,
+        pool_lifecycle_policy=relaxed_pool_policy,
+    )
+    result = relaxed.reconcile(now_utc="2026-08-29T01:00:00+00:00")
+
+    phase = store.list_phases()[0]
+    assert phase["status"] == "shadow"
+    assert phase["policy"]["pool_lifecycle"] == relaxed_pool_policy
+    assert result["pool_policy_migrated_phase_ids"] == [phase["phase_id"]]
+    assert result["readiness"][0]["pool_lifecycle"]["selection"][
+        "continue"
+    ] is True
+
+
 def test_pool_calendar_expiry_is_outcome_independent(tmp_path) -> None:
     store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
     controller = WideResearchController(

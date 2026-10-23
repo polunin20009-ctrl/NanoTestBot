@@ -2581,7 +2581,16 @@ class WideResearchStore:
     ) -> list[Dict[str, Any]]:
         """Audit an explicit migration from one known pool policy to another."""
 
-        normalized: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
+        normalized: list[
+            tuple[
+                str,
+                str,
+                dict[str, Any],
+                dict[str, Any],
+                Optional[dict[str, Any]],
+                Optional[dict[str, Any]],
+            ]
+        ] = []
         seen: set[str] = set()
         for item in updates:
             if not isinstance(item, Mapping):
@@ -2601,24 +2610,65 @@ class WideResearchStore:
                 raise ValueError(
                     "previous_policy and pool_lifecycle_policy must be mappings"
                 )
+            previous_terminal = item.get("previous_terminal_review")
+            replacement_terminal = item.get("terminal_review_policy")
+            if (previous_terminal is None) != (replacement_terminal is None):
+                raise ValueError(
+                    "terminal review predecessor and replacement must be paired"
+                )
+            if previous_terminal is not None and (
+                not isinstance(previous_terminal, Mapping)
+                or not isinstance(replacement_terminal, Mapping)
+            ):
+                raise ValueError("terminal review policies must be mappings")
             normalized.append(
                 (
                     phase,
                     expected_status,
                     dict(previous),
                     dict(replacement),
+                    (
+                        dict(previous_terminal)
+                        if isinstance(previous_terminal, Mapping)
+                        else None
+                    ),
+                    (
+                        dict(replacement_terminal)
+                        if isinstance(replacement_terminal, Mapping)
+                        else None
+                    ),
                 )
             )
         if not normalized:
             return []
         changed = _utc_timestamp(changed_at_utc or _utc_now(), "changed_at_utc")
         projected = sum(
-            len(_canonical_json(replacement)) + 1024
-            for _phase, _status, _previous, replacement in normalized
+            len(_canonical_json(replacement))
+            + (
+                len(_canonical_json(replacement_terminal))
+                if replacement_terminal is not None
+                else 0
+            )
+            + 1024
+            for (
+                _phase,
+                _status,
+                _previous,
+                replacement,
+                _previous_terminal,
+                replacement_terminal,
+            ) in normalized
         )
         with self._write(projected_bytes=projected) as connection:
             prepared: list[tuple[str, sqlite3.Row, str, str, dict[str, Any]]] = []
-            for phase, expected_status, previous, replacement in normalized:
+            for (
+                phase,
+                expected_status,
+                previous,
+                replacement,
+                previous_terminal,
+                replacement_terminal,
+            ) in normalized:
                 row = connection.execute(
                     "SELECT * FROM phases WHERE phase_id=?", (phase,)
                 ).fetchone()
@@ -2640,6 +2690,12 @@ class WideResearchStore:
                         f"phase {phase} pool lifecycle predecessor mismatch"
                     )
                 current_policy["pool_lifecycle"] = replacement
+                if previous_terminal is not None:
+                    if current_policy.get("terminal_review") != previous_terminal:
+                        raise ImmutableRecordError(
+                            f"phase {phase} terminal review predecessor mismatch"
+                        )
+                    current_policy["terminal_review"] = replacement_terminal
                 updated_json = _canonical_json(current_policy)
                 prepared.append(
                     (
@@ -2650,6 +2706,8 @@ class WideResearchStore:
                         {
                             "previous_pool_lifecycle": previous,
                             "pool_lifecycle": replacement,
+                            "previous_terminal_review": previous_terminal,
+                            "terminal_review": replacement_terminal,
                             "outcome_independent": True,
                         },
                     )
@@ -2671,7 +2729,14 @@ class WideResearchStore:
                     created_at_utc=changed,
                 )
             result = []
-            for phase, _status, _previous, _replacement in normalized:
+            for (
+                phase,
+                _status,
+                _previous,
+                _replacement,
+                _previous_terminal,
+                _replacement_terminal,
+            ) in normalized:
                 row = connection.execute(
                     "SELECT * FROM phases WHERE phase_id=?", (phase,)
                 ).fetchone()

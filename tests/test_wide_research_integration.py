@@ -568,7 +568,7 @@ def test_rare_precision_components_are_isolated_and_terminal_shadow_only(
     assert components[0].profile_id == "rare_precision_shadow"
     assert captured["production_enabled"] is False
     assert captured["terminal_review_enabled"] is True
-    assert captured["terminal_review_min_hit_rate"] == 0.90
+    assert captured["terminal_review_min_hit_rate"] == 0.86
     assert captured["policy"].allowed_looks == (
         50,
         100,
@@ -867,7 +867,7 @@ def test_rare_precision_summary_requires_mode_specific_frozen_contract(
             "terminal_review": {
                 "enabled": True,
                 "final_look": 200,
-                "min_point_hit_rate": 0.90,
+                    "min_point_hit_rate": 0.86,
             },
         },
         "search_config": {
