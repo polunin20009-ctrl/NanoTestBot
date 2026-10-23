@@ -111,6 +111,7 @@ from wide_research.automatic_champion import (
     AutomaticChampionController,
     AutomaticChampionLayer,
     discovery_nomination_family,
+    import_ready_discovery_evidence,
     is_discovery_nomination,
     load_discovery_nomination_specs,
     retire_exhausted_discovery_nominations,
@@ -1364,10 +1365,10 @@ ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS = _parse_env_bool(
 AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS = max(
     1,
     min(
-        5,
+        1,
         int(
             os.environ.get(
-                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "5"
+                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "1"
             )
         ),
     ),
@@ -23215,12 +23216,14 @@ def _get_automatic_publication_champion_components(
         fixed_specs = _automatic_publication_champion_specs()
         persisted_dynamic = load_discovery_nomination_specs(store)
         selected: Tuple[FrozenPortfolioSpec, ...] = ()
+        precision_store: Optional[WideResearchStore] = None
         if (
             ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS
             and ENABLE_WIDE_RESEARCH_PRECISION
         ):
+            precision_store = _get_wide_research_precision_components()[0]
             selected = select_ready_discovery_nominations(
-                _get_wide_research_precision_components()[0],
+                precision_store,
                 target_store=store,
                 source_profile="precision_shadow",
                 existing_specs=fixed_specs + persisted_dynamic,
@@ -23239,6 +23242,21 @@ def _get_automatic_publication_champion_components(
         for spec in specs:
             if is_discovery_nomination(spec):
                 families[spec.portfolio_id] = discovery_nomination_family(spec)
+        if precision_store is not None:
+            for spec in selected:
+                imported = import_ready_discovery_evidence(
+                    precision_store,
+                    store,
+                    spec,
+                    family_id=families[spec.portfolio_id],
+                )
+                logger.info(
+                    "[AUTOMATIC_CHAMPION_NOMINATION] portfolio_id=%s "
+                    "claimed=%s outcomes=%s source=precision_ready",
+                    spec.portfolio_id,
+                    imported.get("claimed"),
+                    imported.get("outcomes"),
+                )
         phase_statuses = {
             str(row.get("rule_id") or ""): str(row.get("status") or "")
             for row in store.list_phases()

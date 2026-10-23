@@ -12,6 +12,7 @@ from wide_research.automatic_champion import (
     AutomaticChampionPolicy,
     AutomaticChampionUnavailable,
     discovery_nomination_family,
+    import_ready_discovery_evidence,
     retire_exhausted_discovery_nominations,
     select_ready_discovery_nominations,
 )
@@ -125,14 +126,7 @@ def _permissive_policy() -> AutomaticChampionPolicy:
         prior_strength=2.0,
         min_resolved=4,
         min_span_days=1.0,
-        min_trigger_days=2,
-        min_leagues=2,
-        max_league_share=1.0,
-        min_triggers_per_week=0.0,
-        min_posterior_lower=0.5,
         superiority_margin=0.0,
-        superiority_probability=0.55,
-        champion_min_tenure_days=1.0,
         degradation_window=4,
         degradation_rate=0.5,
     )
@@ -178,6 +172,88 @@ def test_ready_discovery_rule_is_frozen_into_a_fresh_duel(tmp_path) -> None:
     admitted = target.list_phases(rule_id=nomination.rule_id)[0]
     assert datetime.fromisoformat(admitted["starts_at_utc"]) >= before
     assert target.list_triggers(phase_id=nomination.phase_id) == []
+
+
+def test_ready_discovery_evidence_is_reused_without_historical_backfill(
+    tmp_path,
+) -> None:
+    source = _source_store(tmp_path)
+    started = datetime.now(UTC) - timedelta(days=12)
+    manifest = RuleManifest(
+        "wide-certified",
+        "v1",
+        (Clause("bot.prob_to90", ">=", 88.0),),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+    source.register_rule_and_phase(
+        rule_id=manifest.rule_id,
+        manifest=manifest.as_dict(),
+        phase_id="wide-certified:prospective",
+        status="ready",
+        starts_at_utc=started.isoformat(),
+        policy={"prospective": True},
+        created_at_utc=started.isoformat(),
+    )
+    for index, won in enumerate((True, False)):
+        observed = started + timedelta(days=index + 1)
+        observation_id = f"certified-{index}"
+        source.claim_first_trigger(
+            phase_id="wide-certified:prospective",
+            rule_id=manifest.rule_id,
+            fixture_id=100 + index,
+            observation_id=observation_id,
+            triggered_at_utc=observed.isoformat(),
+            minute=50,
+            league=index + 1,
+        )
+        source.attach_outcomes(
+            {
+                "observation_id": observation_id,
+                "outcome_version": 1,
+                "outcome_status": "win" if won else "loss",
+                "outcome_at_utc": (
+                    observed + timedelta(hours=2)
+                ).isoformat(),
+                "payload": {"source": "prospective_test"},
+            }
+        )
+    target = _store(tmp_path)
+    nomination = select_ready_discovery_nominations(
+        source,
+        target_store=target,
+        source_profile="precision_shadow",
+        existing_specs=(),
+        max_active=1,
+    )[0]
+    family = discovery_nomination_family(nomination)
+
+    imported = import_ready_discovery_evidence(
+        source, target, nomination, family_id=family
+    )
+    repeated = import_ready_discovery_evidence(
+        source, target, nomination, family_id=family
+    )
+    AutomaticChampionLayer(
+        target,
+        (nomination,),
+        families={nomination.portfolio_id: family},
+    )
+
+    assert imported["claimed"] == 2
+    assert imported["outcomes"] == 2
+    metrics = target.metrics_for_phase(nomination.phase_id)
+    assert metrics["total"] == 2
+    assert metrics["pending"] == 0
+    assert metrics["win"] == 1
+    assert metrics["loss"] == 1
+    assert metrics["invalid"] == 0
+    phase = target.list_phases(rule_id=nomination.rule_id)[0]
+    assert datetime.fromisoformat(phase["starts_at_utc"]) == started
+    assert phase["policy"]["automatic_champion"][
+        "ready_evidence_imported"
+    ] is True
+    assert repeated["claimed"] == 0
+    assert repeated["inserted_outcomes"] == 0
 
 
 def test_append_only_candidate_catalog_keeps_active_champion_valid(
@@ -355,19 +431,14 @@ def test_default_policy_promotes_only_after_full_prospective_gates(
 
     for day in range(20):
         for slot, (probability, won) in enumerate(
-            (
-                (90.0, True),
-                (50.0, False),
-                (90.0, True),
-                (50.0, False),
-            )
+            ((90.0, True),) * 10 + ((50.0, False),) * 2
         ):
             observed = started + timedelta(
                 days=day + 1,
                 hours=slot,
             )
             snapshot = _snapshot(
-                1000 + day * 4 + slot,
+                1000 + day * 20 + slot,
                 probability,
                 observed,
                 league_id=(day % 8) + 1,
@@ -384,10 +455,105 @@ def test_default_policy_promotes_only_after_full_prospective_gates(
         if row["portfolio_id"] == "challenger"
     )
 
-    assert challenger_row["metrics"]["resolved"] == 40
+    assert challenger_row["metrics"]["resolved"] == 200
+    assert challenger_row["metrics"]["hit_rate"] == 1.0
     assert challenger_row["eligible"] is True
     assert result["switched"] is True
     assert result["active_portfolio_id"] == "challenger"
+
+
+@pytest.mark.parametrize(
+    ("challenger_wins", "expected_switch", "expected_reason"),
+    (
+        (178, False, "hit_rate_below_gate"),
+        (180, True, None),
+    ),
+)
+def test_default_policy_uses_plain_hit_rate_and_margin_gates(
+    tmp_path,
+    challenger_wins: int,
+    expected_switch: bool,
+    expected_reason: str | None,
+) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    layer = AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    controller = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+    )
+    controller.reconcile(now_utc=started.isoformat())
+
+    for index in range(200):
+        observed = started + timedelta(minutes=index)
+        snapshot = _snapshot(
+            2000 + index,
+            90.0,
+            observed,
+            league_id=1,
+        )
+        layer.process_snapshot(snapshot)
+        _resolve(
+            layer,
+            snapshot,
+            observed,
+            won=index < challenger_wins,
+        )
+    for index in range(5):
+        observed = started + timedelta(minutes=240 + index)
+        baseline_only = _snapshot(
+            3000 + index,
+            50.0,
+            observed,
+            league_id=1,
+        )
+        layer.process_snapshot(baseline_only)
+        _resolve(layer, baseline_only, observed, won=False)
+
+    too_early = controller.reconcile(
+        now_utc=(started + timedelta(days=9)).isoformat()
+    )
+    early_challenger = next(
+        row
+        for row in too_early["evaluations"]
+        if row["portfolio_id"] == "challenger"
+    )
+    assert "insufficient_span_days" in early_challenger["reasons"]
+    assert too_early["switched"] is False
+
+    result = controller.reconcile(
+        now_utc=(started + timedelta(days=12)).isoformat()
+    )
+    challenger_row = next(
+        row
+        for row in result["evaluations"]
+        if row["portfolio_id"] == "challenger"
+    )
+
+    assert challenger_row["metrics"]["resolved"] == 200
+    assert challenger_row["metrics"]["hit_rate"] == (
+        challenger_wins / 200
+    )
+    assert challenger_row["metrics"]["trigger_days"] == 1
+    assert challenger_row["metrics"]["leagues"] == 1
+    assert challenger_row["metrics"]["span_days"] < 1.0
+    assert challenger_row["metrics"]["elapsed_days"] == 12.0
+    assert challenger_row["hit_rate_advantage"] >= 0.02
+    assert result["switched"] is expected_switch
+    if expected_reason is None:
+        assert challenger_row["eligible"] is True
+        assert (
+            challenger_row["required_superiority_probability"] is None
+        )
+    else:
+        assert expected_reason in challenger_row["reasons"]
 
 
 def test_strong_mature_challenger_swaps_pointer_atomically(tmp_path) -> None:
@@ -782,3 +948,38 @@ def test_staged_production_mode_change_reauthorizes_pointer(tmp_path) -> None:
     assert second["status"] == "ok"
     assert second["selector_started_at_utc"] == first["selector_started_at_utc"]
     assert live.active_selection().generation == 2
+
+
+def test_v2_policy_migrates_without_resetting_active_champion(tmp_path) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    old = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+        policy=AutomaticChampionPolicy(version="automatic_champion_v2"),
+    )
+    first = old.reconcile(now_utc=started.isoformat())
+
+    current = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+    )
+    migrated = current.reconcile(
+        now_utc=(started + timedelta(minutes=1)).isoformat()
+    )
+
+    assert migrated["status"] == "ok"
+    assert migrated["active_portfolio_id"] == "baseline"
+    assert migrated["active_since_utc"] == first["active_since_utc"]
+    assert current.active_selection().generation == 2

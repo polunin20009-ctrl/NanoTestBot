@@ -254,7 +254,7 @@ All profiles: conjunction DSL (`>=`, `<=`, `==`) on an allowlisted numeric featu
 - at the 200-result pool selection, rules below 90% pause; rules at or above 90% continue to later registered looks
 - Holm α = 0.05
 - degradation: fast n=50 rate 0.80; slow n=150 vs null 0.90
-- Telegram publication champion stays on its separate stricter 40-match policy
+- Telegram publication champion uses its separate 200-result / 10-day policy
 
 Phases: candidate → shadow → ready → active/champion; also paused/degraded. This lifecycle state does not grant Telegram publication authority.
 
@@ -269,19 +269,20 @@ book for the fixed candidate catalog. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION
 additionally permits an atomic production swap; with that flag off, the
 controller only writes recommendations.
 
-- every candidate starts from zero in this store; frozen-portfolio and source
-  rule history is never imported as switching evidence;
+- source-controlled candidates start from zero in this store; a READY discovery
+  finalist reuses only the prospective evidence that earned READY, never
+  historical or backfilled discovery results;
 - adjacent thresholds and near-identical portfolios share one family;
-- a challenger needs at least 40 resolved outcomes, 14 calendar days, 10
-  trigger-days, 8 leagues, no league above 30%, and at least 2 triggers/week;
-- ranking uses a beta posterior with an 83% / 40-match prior and its lower 90%
-  bound; that bound must be at least 82%;
-- the challenger must exceed the champion by at least 2 percentage points with
-  family-count-adjusted posterior probability (base 95%);
-- both rules are compared from the same later timestamp, and a champion has a
-  14-day minimum tenure;
+- one discovery finalist is admitted at a time;
+- a challenger needs at least 200 resolved outcomes, at least 10 elapsed days
+  since its comparable period began, at least 90% hit rate, and at least a
+  2 percentage-point advantage;
+- both rules are compared from the same later timestamp, with at least 200
+  resolved champion outcomes in that period;
+- posterior and superiority-probability values are diagnostic/ranking fields,
+  not promotion gates; there is no 99.55% gate or minimum champion tenure;
 - the SQLite phase swap and checksummed pointer update are one transaction;
-- a non-baseline champion below 75% over its last 40 resolved triggers returns
+- a non-baseline champion below 80% over its last 40 resolved triggers returns
   atomically to `balanced-two-rule`;
 - the baseline at the same degradation level suspends publication until its
   rolling rate reaches 80% or a fully eligible challenger takes over;

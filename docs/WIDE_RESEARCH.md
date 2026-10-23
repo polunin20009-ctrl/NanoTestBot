@@ -216,24 +216,27 @@ they do not grant publication authority.
 ## Automatic publication Champion–Challenger
 
 The publication selector uses a separate
-`data/automatic_publication_champion.sqlite3` store and never imports outcomes
-from discovery or frozen-portfolio books. `balanced-two-rule` is registered as
-the initial champion. Every other source-controlled candidate begins a fresh
-prospective clock when first admitted.
+`data/automatic_publication_champion.sqlite3` store. `balanced-two-rule` is
+registered as the initial champion. Source-controlled candidates begin a fresh
+prospective clock when first admitted. A READY discovery finalist is different:
+the selector imports only the already prospective observations that earned the
+READY certificate, never historical or backfilled discovery results.
 
-Automatic replacement requires 40 resolved outcomes over at least 14 days,
-10 trigger-days, 8 leagues, no league above 30%, and at least 2 triggers per
-week. A beta posterior (83% prior with strength 40) must have a lower 90% bound
-of at least 82%. On the same calendar window, the challenger must exceed the
-champion by at least 2 percentage points with a base posterior probability of
-95%, tightened for the number of candidate families. Near-duplicate rules
-share one family and cannot cause threshold churn.
+Automatic replacement uses four plain gates: at least 200 resolved outcomes,
+at least 10 elapsed days since the comparable candidate period began, at least
+90% hit rate, and at least a 2 percentage-point hit-rate advantage over the
+current champion on the same comparison period. The champion must also have 200
+resolved outcomes in that period so the direct comparison is defined. Beta
+posterior values and superiority probability remain in the report for
+diagnostics and deterministic ranking; they do not authorize or block a swap.
+There is no 99.55% probability gate and no separate minimum champion tenure.
+Near-duplicate rules share one family and cannot cause threshold churn.
 
 `ENABLE_AUTOMATIC_PUBLICATION_CHAMPION` enables the isolated evidence book and
 recommendation report. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY`
 permits an eligible recommendation to swap the active pointer. Demotion,
 promotion, lifecycle audit events, and the checksummed pointer update happen
-in one SQLite transaction. After a switch, a champion below 75% over its last
+in one SQLite transaction. After a switch, a champion below 80% over its last
 40 resolved triggers is atomically returned to `balanced-two-rule`. If the
 baseline itself has the same sustained degradation, publication is suspended;
 it resumes only after its rolling rate reaches 80% or a fully eligible
@@ -241,14 +244,14 @@ challenger replaces it.
 
 A READY precision rule may be admitted automatically as a frozen singleton
 challenger when `ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS=true`.
-Admission copies only the immutable rule definition and starts a new
-Champion–Challenger clock; outcomes used to earn READY are never imported.
-At most `AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS` discovery nominees
-collect concurrently. A nominee that has not qualified by the fixed
+Admission copies its immutable rule definition and its existing prospective
+READY evidence. Import is idempotent, preserves observation IDs and outcome
+versions, and does not copy pre-prospective history. Exactly one discovery
+finalist collects at a time. A finalist that has not qualified by the fixed
 `AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON` is rejected and frees its
-slot. Every admitted family remains in the multiplicity count, so successive
-generations cannot make the superiority test easier. Adding a challenger is
-an append-only catalog update and preserves the active champion and its tenure.
+slot unless it is still waiting for the 10-day calendar or comparable champion
+sample. Adding a challenger is an append-only catalog update and preserves the
+active champion, its evidence, and its tenure metadata.
 
 A changed policy or non-append-only catalog mutation, invalid or suspended
 pointer, pointer-generation change during evaluation, or evaluation error
