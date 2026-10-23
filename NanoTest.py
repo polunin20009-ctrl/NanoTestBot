@@ -1371,10 +1371,10 @@ ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS = _parse_env_bool(
 AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS = max(
     1,
     min(
-        8,
+        20,
         int(
             os.environ.get(
-                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "8"
+                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "20"
             )
         ),
     ),
