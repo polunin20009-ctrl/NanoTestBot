@@ -222,11 +222,11 @@ prospective clock when first admitted. A READY discovery finalist is different:
 the selector imports only the already prospective observations that earned the
 READY certificate, never historical or backfilled discovery results.
 
-Automatic replacement uses four plain gates: at least 200 resolved outcomes,
-at least 10 elapsed days since the comparable candidate period began, at least
-90% hit rate, and at least a 2 percentage-point hit-rate advantage over the
-current champion on the same comparison period. The champion must also have 200
-resolved outcomes in that period so the direct comparison is defined. Beta
+Automatic replacement uses three plain gates: at least 200 resolved outcomes,
+at least 10 elapsed days since the comparable candidate period began, and at
+least a 2 percentage-point hit-rate advantage over the current champion on the
+same comparison period. There is no absolute hit-rate floor. The champion must
+also have 200 resolved outcomes in that period so the direct comparison is defined. Beta
 posterior values and superiority probability remain in the report for
 diagnostics and deterministic ranking; they do not authorize or block a swap.
 There is no 99.55% probability gate and no separate minimum champion tenure.

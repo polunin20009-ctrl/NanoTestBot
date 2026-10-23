@@ -275,8 +275,8 @@ controller only writes recommendations.
 - adjacent thresholds and near-identical portfolios share one family;
 - one discovery finalist is admitted at a time;
 - a challenger needs at least 200 resolved outcomes, at least 10 elapsed days
-  since its comparable period began, at least 90% hit rate, and at least a
-  2 percentage-point advantage;
+  since its comparable period began, and at least a 2 percentage-point
+  advantage; there is no absolute hit-rate floor;
 - both rules are compared from the same later timestamp, with at least 200
   resolved champion outcomes in that period;
 - posterior and superiority-probability values are diagnostic/ranking fields,

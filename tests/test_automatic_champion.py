@@ -463,15 +463,21 @@ def test_default_policy_promotes_only_after_full_prospective_gates(
 
 
 @pytest.mark.parametrize(
-    ("challenger_wins", "expected_switch", "expected_reason"),
     (
-        (178, False, "hit_rate_below_gate"),
-        (180, True, None),
+        "challenger_wins",
+        "baseline_only_losses",
+        "expected_switch",
+        "expected_reason",
+    ),
+    (
+        (180, 4, False, "hit_rate_margin_below_gate"),
+        (178, 5, True, None),
     ),
 )
-def test_default_policy_uses_plain_hit_rate_and_margin_gates(
+def test_default_policy_uses_relative_margin_without_absolute_hit_rate(
     tmp_path,
     challenger_wins: int,
+    baseline_only_losses: int,
     expected_switch: bool,
     expected_reason: str | None,
 ) -> None:
@@ -506,7 +512,7 @@ def test_default_policy_uses_plain_hit_rate_and_margin_gates(
             observed,
             won=index < challenger_wins,
         )
-    for index in range(5):
+    for index in range(baseline_only_losses):
         observed = started + timedelta(minutes=240 + index)
         baseline_only = _snapshot(
             3000 + index,
@@ -545,14 +551,16 @@ def test_default_policy_uses_plain_hit_rate_and_margin_gates(
     assert challenger_row["metrics"]["leagues"] == 1
     assert challenger_row["metrics"]["span_days"] < 1.0
     assert challenger_row["metrics"]["elapsed_days"] == 12.0
-    assert challenger_row["hit_rate_advantage"] >= 0.02
     assert result["switched"] is expected_switch
     if expected_reason is None:
+        assert challenger_row["metrics"]["hit_rate"] < 0.90
+        assert challenger_row["hit_rate_advantage"] >= 0.02
         assert challenger_row["eligible"] is True
         assert (
             challenger_row["required_superiority_probability"] is None
         )
     else:
+        assert challenger_row["hit_rate_advantage"] < 0.02
         assert expected_reason in challenger_row["reasons"]
 
 
@@ -950,7 +958,14 @@ def test_staged_production_mode_change_reauthorizes_pointer(tmp_path) -> None:
     assert live.active_selection().generation == 2
 
 
-def test_v2_policy_migrates_without_resetting_active_champion(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "previous_version",
+    ("automatic_champion_v2", "automatic_champion_v3"),
+)
+def test_supported_policy_migrates_without_resetting_active_champion(
+    tmp_path,
+    previous_version: str,
+) -> None:
     baseline = _spec("baseline", 0.0)
     challenger = _spec("challenger", 80.0)
     specs = (baseline, challenger)
@@ -964,7 +979,7 @@ def test_v2_policy_migrates_without_resetting_active_champion(tmp_path) -> None:
         families=families,
         baseline_portfolio_id="baseline",
         production_enabled=True,
-        policy=AutomaticChampionPolicy(version="automatic_champion_v2"),
+        policy=AutomaticChampionPolicy(version=previous_version),
     )
     first = old.reconcile(now_utc=started.isoformat())
 

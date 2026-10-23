@@ -32,7 +32,7 @@ from .schema import canonical_hash
 from .store import WideResearchStore
 
 
-AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v3"
+AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v4"
 AUTOMATIC_CHAMPION_POINTER = "automatic_publication_champion"
 AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION = 1
 DISCOVERY_NOMINATION_PREFIX = "discovery-ready-"
@@ -84,7 +84,6 @@ class AutomaticChampionPolicy:
     credible_lower_probability: float = 0.10
     min_resolved: int = 200
     min_span_days: float = 10.0
-    min_hit_rate: float = 0.90
     superiority_margin: float = 0.02
     degradation_window: int = 40
     degradation_rate: float = 0.80
@@ -94,7 +93,6 @@ class AutomaticChampionPolicy:
         probabilities = (
             self.prior_hit_rate,
             self.credible_lower_probability,
-            self.min_hit_rate,
             self.superiority_margin,
             self.degradation_rate,
             self.degradation_recovery_rate,
@@ -752,10 +750,13 @@ class AutomaticChampionController:
         *,
         now: datetime,
     ) -> Mapping[str, Any]:
-        """Apply the explicitly supported v2→v3 selector-policy migration."""
+        """Apply an explicitly supported selector-policy migration."""
 
         previous_policy = _mapping(payload.get("policy"))
-        if previous_policy.get("version") != "automatic_champion_v2":
+        if previous_policy.get("version") not in {
+            "automatic_champion_v2",
+            "automatic_champion_v3",
+        }:
             raise AutomaticChampionUnavailable(
                 "automatic champion policy migration is not authorized"
             )
@@ -772,7 +773,7 @@ class AutomaticChampionController:
                 else None
             ),
             decision={
-                "reason": "selector_policy_v3_activated",
+                "reason": "selector_policy_v4_activated",
                 "previous_policy_hash": payload.get("policy_hash"),
                 "policy_hash": self.policy_hash,
             },
@@ -965,11 +966,6 @@ class AutomaticChampionController:
             reasons.append("insufficient_resolved")
         if float(metrics["elapsed_days"]) < self.policy.min_span_days:
             reasons.append("insufficient_span_days")
-        if (
-            metrics.get("hit_rate") is None
-            or float(metrics["hit_rate"]) < self.policy.min_hit_rate
-        ):
-            reasons.append("hit_rate_below_gate")
         return reasons
 
     def reconcile(self, *, now_utc: Optional[str] = None) -> dict[str, Any]:
@@ -986,9 +982,10 @@ class AutomaticChampionController:
         if set(contract_reasons) == {
             "policy_hash_mismatch",
             "policy_manifest_mismatch",
-        } and _mapping(payload.get("policy")).get("version") == (
-            "automatic_champion_v2"
-        ):
+        } and _mapping(payload.get("policy")).get("version") in {
+            "automatic_champion_v2",
+            "automatic_champion_v3",
+        }:
             pointer = self._refresh_policy(pointer, payload, now=now)
             payload, contract_reasons = self._validate_pointer(pointer)
         if (
