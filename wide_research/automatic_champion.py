@@ -1,8 +1,9 @@
 """Prospective Champion–Challenger selection for publication portfolios.
 
-The selector deliberately owns a fresh evidence store.  Existing research
-results can nominate candidates, but only outcomes observed after registration
-in this store may authorize a production switch.
+The selector owns an isolated evidence store. Source-controlled candidates
+start a fresh prospective clock here. A READY discovery finalist may reuse the
+prospective evidence that earned its certificate; pre-prospective discovery
+history is never accepted.
 """
 
 from __future__ import annotations
@@ -19,14 +20,22 @@ from statistics import NormalDist
 from typing import Any, Mapping, Optional, Sequence
 
 from .live import WideShadowLayer
-from .portfolio import FrozenPortfolioLayer, FrozenPortfolioSpec
+from .lifecycle import wilson_interval
+from .portfolio import (
+    FrozenPortfolioLayer,
+    FrozenPortfolioMember,
+    FrozenPortfolioSpec,
+    frozen_portfolio_spec_from_dict,
+)
+from .rules import rule_manifest_from_dict
 from .schema import canonical_hash
 from .store import WideResearchStore
 
 
-AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v2"
+AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v4"
 AUTOMATIC_CHAMPION_POINTER = "automatic_publication_champion"
 AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION = 1
+DISCOVERY_NOMINATION_PREFIX = "discovery-ready-"
 
 
 class AutomaticChampionUnavailable(RuntimeError):
@@ -73,28 +82,18 @@ class AutomaticChampionPolicy:
     prior_hit_rate: float = 0.83
     prior_strength: float = 40.0
     credible_lower_probability: float = 0.10
-    min_resolved: int = 40
-    min_span_days: float = 14.0
-    min_trigger_days: int = 10
-    min_leagues: int = 8
-    max_league_share: float = 0.30
-    min_triggers_per_week: float = 2.0
-    min_posterior_lower: float = 0.82
+    min_resolved: int = 200
+    min_span_days: float = 10.0
     superiority_margin: float = 0.02
-    superiority_probability: float = 0.95
-    champion_min_tenure_days: float = 14.0
     degradation_window: int = 40
-    degradation_rate: float = 0.75
+    degradation_rate: float = 0.80
     degradation_recovery_rate: float = 0.80
 
     def __post_init__(self) -> None:
         probabilities = (
             self.prior_hit_rate,
             self.credible_lower_probability,
-            self.max_league_share,
-            self.min_posterior_lower,
             self.superiority_margin,
-            self.superiority_probability,
             self.degradation_rate,
             self.degradation_recovery_rate,
         )
@@ -105,8 +104,6 @@ class AutomaticChampionPolicy:
             raise ValueError("automatic champion rates must be in [0, 1]")
         if not 0.0 < self.credible_lower_probability < 0.5:
             raise ValueError("credible lower probability must be in (0, 0.5)")
-        if not 0.5 < self.superiority_probability < 1.0:
-            raise ValueError("superiority probability must be in (0.5, 1)")
         if self.degradation_recovery_rate < self.degradation_rate:
             raise ValueError(
                 "degradation recovery rate must be at least degradation rate"
@@ -116,16 +113,10 @@ class AutomaticChampionPolicy:
             or self.prior_strength <= 0.0
             or not math.isfinite(self.min_span_days)
             or self.min_span_days < 0.0
-            or not math.isfinite(self.min_triggers_per_week)
-            or self.min_triggers_per_week < 0.0
-            or not math.isfinite(self.champion_min_tenure_days)
-            or self.champion_min_tenure_days < 0.0
         ):
             raise ValueError("automatic champion scales must be finite")
         counts = (
             self.min_resolved,
-            self.min_trigger_days,
-            self.min_leagues,
             self.degradation_window,
         )
         if any(type(value) is not int or value <= 0 for value in counts):
@@ -143,10 +134,8 @@ def posterior_summary(
 ) -> dict[str, float]:
     """Return a conservative beta-posterior summary.
 
-    At the registered minimum of forty outcomes the normal approximation to
-    the beta posterior is stable enough for ranking.  Eligibility also
-    requires diversity and calendar-span gates, so this score is never used
-    by itself to authorize a switch.
+    The score remains useful for diagnostics and deterministic ranking, but it
+    does not authorize or block a switch.
     """
 
     successes = int(wins)
@@ -214,39 +203,333 @@ class AutomaticChampionLayer(FrozenPortfolioLayer):
         if any(not value for value in normalized_families.values()):
             raise ValueError("every automatic champion candidate needs a family")
 
-        stored_starts = {
-            str(row.get("rule_id") or ""): str(row.get("starts_at_utc") or "")
+        stored_phases = {
+            str(row.get("rule_id") or ""): row
             for row in store.list_phases()
             if str(row.get("rule_id") or "") in identities
         }
         fresh_start = datetime.now(timezone.utc).isoformat()
         for spec in normalized:
-            cohort_start = stored_starts.get(spec.rule_id) or fresh_start
-            store.register_rule_and_phase(
-                rule_id=spec.rule_id,
-                manifest=spec.manifest(),
-                phase_id=spec.phase_id,
-                status="shadow",
-                starts_at_utc=cohort_start,
-                policy={
+            stored_phase = stored_phases.get(spec.rule_id)
+            cohort_start = (
+                str(stored_phase.get("starts_at_utc") or "")
+                if stored_phase is not None
+                else fresh_start
+            )
+            policy = (
+                dict(_mapping(stored_phase.get("policy")))
+                if stored_phase is not None
+                else {
                     "automatic_champion": {
                         "version": AUTOMATIC_CHAMPION_POLICY_VERSION,
                         "family_id": normalized_families[spec.rule_id],
                         "continuous_prospective_evidence": True,
                     },
                     "production_applied": False,
-                },
+                }
             )
-        self.specs = normalized
+            store.register_rule_and_phase(
+                rule_id=spec.rule_id,
+                manifest=spec.manifest(),
+                phase_id=spec.phase_id,
+                status="shadow",
+                starts_at_utc=cohort_start,
+                policy=policy,
+            )
+        statuses = {
+            str(row.get("rule_id") or ""): str(row.get("status") or "")
+            for row in store.list_phases()
+        }
+        self.specs = tuple(
+            spec
+            for spec in normalized
+            if statuses.get(spec.rule_id)
+            in {"candidate", "shadow", "ready", "active"}
+        )
         self.families = normalized_families
         WideShadowLayer.__init__(
             self,
             store,
-            max_active_rules=len(normalized),
+            max_active_rules=max(1, len(self.specs)),
             refresh_seconds=0.0,
             max_prediction_lag_seconds=max_prediction_lag_seconds,
         )
         self.include_extended = True
+
+
+def is_discovery_nomination(spec: FrozenPortfolioSpec) -> bool:
+    return spec.portfolio_id.startswith(DISCOVERY_NOMINATION_PREFIX)
+
+
+def discovery_nomination_family(spec: FrozenPortfolioSpec) -> str:
+    """Group threshold variants of the same discovered rule shape."""
+
+    member = spec.members[0]
+    shape = {
+        "source_profile": member.source_profile,
+        "clauses": [
+            {"feature": clause.feature, "op": clause.op}
+            for clause in member.manifest.clauses
+        ],
+    }
+    return "discovery-" + canonical_hash(shape)[:16]
+
+
+def discovery_nomination_source_key(
+    spec: FrozenPortfolioSpec,
+) -> tuple[str, str]:
+    if not is_discovery_nomination(spec) or len(spec.members) != 1:
+        raise ValueError("not a singleton discovery nomination")
+    member = spec.members[0]
+    return member.source_profile, member.manifest.rule_id
+
+
+def load_discovery_nomination_specs(
+    store: WideResearchStore,
+) -> tuple[FrozenPortfolioSpec, ...]:
+    """Restore every admitted nomination, including closed generations."""
+
+    specs = []
+    for row in store.list_manifests():
+        manifest = row.get("manifest")
+        if not isinstance(manifest, Mapping):
+            continue
+        if not str(manifest.get("portfolio_id") or "").startswith(
+            DISCOVERY_NOMINATION_PREFIX
+        ):
+            continue
+        specs.append(frozen_portfolio_spec_from_dict(manifest))
+    specs.sort(key=lambda value: value.rule_id)
+    return tuple(specs)
+
+
+def select_ready_discovery_nominations(
+    source_store: WideResearchStore,
+    *,
+    target_store: WideResearchStore,
+    source_profile: str,
+    existing_specs: Sequence[FrozenPortfolioSpec],
+    max_active: int,
+) -> tuple[FrozenPortfolioSpec, ...]:
+    """Select the strongest READY rules for currently available duel slots."""
+
+    limit = max(0, int(max_active))
+    admitted_keys = {
+        discovery_nomination_source_key(spec)
+        for spec in existing_specs
+        if is_discovery_nomination(spec)
+    }
+    target_phases = {
+        str(row.get("rule_id") or ""): str(row.get("status") or "")
+        for row in target_store.list_phases()
+    }
+    active_dynamic = sum(
+        1
+        for spec in existing_specs
+        if is_discovery_nomination(spec)
+        and target_phases.get(spec.rule_id)
+        in {"candidate", "shadow", "ready", "active"}
+    )
+    available = max(0, limit - active_dynamic)
+    if available == 0:
+        return ()
+
+    ranked: list[tuple[tuple[Any, ...], Mapping[str, Any]]] = []
+    for phase in source_store.list_phases(statuses=("ready",)):
+        key = (str(source_profile), str(phase.get("rule_id") or ""))
+        if key in admitted_keys:
+            continue
+        wins = 0
+        resolved = 0
+        for trigger in source_store.list_triggers(
+            phase_id=str(phase.get("phase_id") or "")
+        ):
+            status = str(trigger.get("latest_outcome_status") or "pending")
+            if status not in {"win", "loss", "invalid"}:
+                continue
+            resolved += 1
+            wins += int(status == "win")
+        lower, _upper = wilson_interval(wins, resolved)
+        ranked.append(
+            (
+                (
+                    -float(lower),
+                    -(wins / resolved if resolved else 0.0),
+                    -resolved,
+                    str(phase.get("rule_id") or ""),
+                ),
+                phase,
+            )
+        )
+    ranked.sort(key=lambda item: item[0])
+
+    selected = []
+    profile_slug = str(source_profile).replace("_", "-")
+    for _score, phase in ranked[:available]:
+        manifest_payload = phase.get("manifest")
+        if not isinstance(manifest_payload, Mapping):
+            continue
+        manifest = rule_manifest_from_dict(manifest_payload)
+        member = FrozenPortfolioMember(
+            source_profile=str(source_profile),
+            source_store_hash=str(phase.get("manifest_hash") or ""),
+            manifest=manifest,
+        )
+        selected.append(
+            FrozenPortfolioSpec(
+                portfolio_id=(
+                    f"{DISCOVERY_NOMINATION_PREFIX}{profile_slug}-"
+                    f"{manifest.rule_id}"
+                ),
+                version="v1",
+                members=(member,),
+            )
+        )
+    return tuple(selected)
+
+
+def import_ready_discovery_evidence(
+    source_store: WideResearchStore,
+    target_store: WideResearchStore,
+    spec: FrozenPortfolioSpec,
+    *,
+    family_id: str,
+) -> dict[str, int]:
+    """Copy already prospective READY evidence into the direct duel book.
+
+    Discovery history before the source phase remains excluded. The copied
+    rows retain their original observation identities and outcome versions, so
+    retries are idempotent and corrections continue to reconcile normally.
+    """
+
+    source_profile, source_rule_id = discovery_nomination_source_key(spec)
+    source_rows = source_store.list_phases(
+        statuses=("ready",), rule_id=source_rule_id
+    )
+    if len(source_rows) != 1:
+        raise ValueError("discovery nomination source is not uniquely READY")
+    source_phase = source_rows[0]
+    target_store.register_rule_and_phase(
+        rule_id=spec.rule_id,
+        manifest=spec.manifest(),
+        phase_id=spec.phase_id,
+        status="shadow",
+        starts_at_utc=str(source_phase["starts_at_utc"]),
+        policy={
+            "automatic_champion": {
+                "version": AUTOMATIC_CHAMPION_POLICY_VERSION,
+                "family_id": str(family_id),
+                "continuous_prospective_evidence": True,
+                "ready_evidence_imported": True,
+                "source_profile": source_profile,
+                "source_phase_id": str(source_phase["phase_id"]),
+            },
+            "production_applied": False,
+        },
+        created_at_utc=str(source_phase["created_at_utc"]),
+    )
+    claimed = 0
+    outcomes = []
+    for trigger in source_store.list_triggers(
+        phase_id=str(source_phase["phase_id"])
+    ):
+        inserted = target_store.claim_first_trigger(
+            phase_id=spec.phase_id,
+            rule_id=spec.rule_id,
+            fixture_id=trigger.get("fixture_id"),
+            observation_id=trigger.get("observation_id"),
+            triggered_at_utc=trigger.get("triggered_at_utc"),
+            minute=trigger.get("minute"),
+            league=trigger.get("league"),
+            input_data={
+                "nomination_evidence": True,
+                "source_profile": source_profile,
+                "source_phase_id": str(source_phase["phase_id"]),
+                "source_input": dict(_mapping(trigger.get("input"))),
+            },
+        )
+        claimed += int(inserted)
+        status = str(
+            trigger.get("latest_outcome_status") or "pending"
+        )
+        if status == "pending":
+            continue
+        outcomes.append(
+            {
+                "observation_id": trigger.get("observation_id"),
+                "outcome_version": trigger.get("latest_outcome_version") or 1,
+                "outcome_status": status,
+                "outcome_label": trigger.get("latest_outcome_label"),
+                "outcome_at_utc": trigger.get("latest_outcome_at_utc"),
+                "received_at_utc": trigger.get("updated_at_utc"),
+                "payload": dict(
+                    _mapping(trigger.get("latest_outcome"))
+                ),
+            }
+        )
+    attached = target_store.attach_outcomes(outcomes)
+    return {
+        "claimed": claimed,
+        "outcomes": len(outcomes),
+        "inserted_outcomes": int(attached.get("inserted") or 0),
+        "updated_triggers": int(attached.get("updated_triggers") or 0),
+    }
+
+
+def retire_exhausted_discovery_nominations(
+    store: WideResearchStore,
+    decision: Mapping[str, Any],
+    *,
+    terminal_horizon: int = 200,
+) -> tuple[str, ...]:
+    """Close failed duels at a fixed horizon so later READY rules get a slot."""
+
+    if str(decision.get("status") or "") == "blocked":
+        return ()
+    active_rule_id = str(decision.get("active_rule_id") or "")
+    retired = []
+    phases = {
+        str(row.get("rule_id") or ""): row for row in store.list_phases()
+    }
+    for evaluation in decision.get("evaluations") or []:
+        if not isinstance(evaluation, Mapping):
+            continue
+        rule_id = str(evaluation.get("rule_id") or "")
+        portfolio_id = str(evaluation.get("portfolio_id") or "")
+        if (
+            not portfolio_id.startswith(DISCOVERY_NOMINATION_PREFIX)
+            or rule_id == active_rule_id
+            or evaluation.get("eligible") is True
+        ):
+            continue
+        metrics = _mapping(evaluation.get("metrics"))
+        if int(metrics.get("resolved") or 0) < int(terminal_horizon):
+            continue
+        reasons = {str(value) for value in evaluation.get("reasons") or []}
+        if reasons & {
+            "insufficient_span_days",
+            "champion_comparison_insufficient_resolved",
+        }:
+            # Fast collection must not recreate the old "hit the sample cap,
+            # then freeze while calendar gates catch up" failure mode.
+            continue
+        phase = phases.get(rule_id)
+        if phase is None or str(phase.get("status") or "") != "shadow":
+            continue
+        phase_id = str(phase.get("phase_id") or "")
+        store.transition_phase(
+            phase_id,
+            "rejected",
+            expected_status="shadow",
+            reason="automatic_challenger_terminal_review_failed",
+            actor="automatic_champion",
+            metadata={
+                "terminal_horizon": int(terminal_horizon),
+                "evaluation": dict(evaluation),
+            },
+        )
+        retired.append(phase_id)
+    return tuple(retired)
 
 
 class AutomaticChampionController:
@@ -380,11 +663,17 @@ class AutomaticChampionController:
             reasons.append("pointer_schema_mismatch")
         if payload.get("policy_hash") != self.policy_hash:
             reasons.append("policy_hash_mismatch")
-        if payload.get("catalog_hash") != self.catalog_hash:
-            reasons.append("catalog_hash_mismatch")
         if _mapping(payload.get("policy")) != self.policy_manifest:
             reasons.append("policy_manifest_mismatch")
-        if _mapping(payload.get("catalog")) != self.catalog:
+        stored_catalog = _mapping(payload.get("catalog"))
+        catalog_is_append_only = bool(stored_catalog) and all(
+            self.catalog.get(str(rule_id)) == entry
+            for rule_id, entry in stored_catalog.items()
+        )
+        if (
+            payload.get("catalog_hash") != self.catalog_hash
+            or stored_catalog != self.catalog
+        ) and not catalog_is_append_only:
             reasons.append("catalog_manifest_mismatch")
         if payload.get("production_enabled") is not self.production_enabled:
             reasons.append("production_mode_mismatch")
@@ -412,6 +701,96 @@ class AutomaticChampionController:
             if str(phase.get("status") or "") != "active":
                 reasons.append("active_phase_not_active")
         return payload, reasons
+
+    def _refresh_catalog(
+        self,
+        pointer: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> Mapping[str, Any]:
+        """Authorize append-only challengers without resetting the champion."""
+
+        metadata = self._pointer_metadata(
+            selector_started_at_utc=_utc_iso(
+                _parse_utc(payload.get("selector_started_at_utc"))
+            ),
+            active_since_utc=_utc_iso(
+                _parse_utc(payload.get("active_since_utc"))
+            ),
+            previous_rule_id=(
+                str(payload.get("previous_rule_id"))
+                if payload.get("previous_rule_id")
+                else None
+            ),
+            decision={
+                "reason": "candidate_catalog_extended",
+                "previous_catalog_hash": payload.get("catalog_hash"),
+                "catalog_hash": self.catalog_hash,
+            },
+            publication_suspended=bool(payload.get("publication_suspended")),
+            suspension_reason=(
+                str(payload.get("suspension_reason"))
+                if payload.get("suspension_reason")
+                else None
+            ),
+        )
+        return self.store.set_active_pointer(
+            self.pointer_name,
+            phase_id=str(pointer["phase_id"]),
+            expected_generation=int(pointer["generation"]),
+            metadata=metadata,
+            updated_at_utc=_utc_iso(now),
+        )
+
+    def _refresh_policy(
+        self,
+        pointer: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> Mapping[str, Any]:
+        """Apply an explicitly supported selector-policy migration."""
+
+        previous_policy = _mapping(payload.get("policy"))
+        if previous_policy.get("version") not in {
+            "automatic_champion_v2",
+            "automatic_champion_v3",
+        }:
+            raise AutomaticChampionUnavailable(
+                "automatic champion policy migration is not authorized"
+            )
+        metadata = self._pointer_metadata(
+            selector_started_at_utc=_utc_iso(
+                _parse_utc(payload.get("selector_started_at_utc"))
+            ),
+            active_since_utc=_utc_iso(
+                _parse_utc(payload.get("active_since_utc"))
+            ),
+            previous_rule_id=(
+                str(payload.get("previous_rule_id"))
+                if payload.get("previous_rule_id")
+                else None
+            ),
+            decision={
+                "reason": "selector_policy_v4_activated",
+                "previous_policy_hash": payload.get("policy_hash"),
+                "policy_hash": self.policy_hash,
+            },
+            publication_suspended=bool(payload.get("publication_suspended")),
+            suspension_reason=(
+                str(payload.get("suspension_reason"))
+                if payload.get("suspension_reason")
+                else None
+            ),
+        )
+        return self.store.set_active_pointer(
+            self.pointer_name,
+            phase_id=str(pointer["phase_id"]),
+            expected_generation=int(pointer["generation"]),
+            metadata=metadata,
+            updated_at_utc=_utc_iso(now),
+        )
 
     def active_selection(self) -> ActiveChampionSelection:
         """Return one validated pointer generation or fail publication closed."""
@@ -585,24 +964,8 @@ class AutomaticChampionController:
         reasons: list[str] = []
         if int(metrics["resolved"]) < self.policy.min_resolved:
             reasons.append("insufficient_resolved")
-        if float(metrics["span_days"]) < self.policy.min_span_days:
+        if float(metrics["elapsed_days"]) < self.policy.min_span_days:
             reasons.append("insufficient_span_days")
-        if int(metrics["trigger_days"]) < self.policy.min_trigger_days:
-            reasons.append("insufficient_trigger_days")
-        if int(metrics["leagues"]) < self.policy.min_leagues:
-            reasons.append("insufficient_leagues")
-        if float(metrics["max_league_share"]) > self.policy.max_league_share:
-            reasons.append("league_concentration")
-        if (
-            float(metrics["triggers_per_week"])
-            < self.policy.min_triggers_per_week
-        ):
-            reasons.append("insufficient_frequency")
-        if (
-            float(_mapping(metrics["posterior"])["lower"])
-            < self.policy.min_posterior_lower
-        ):
-            reasons.append("posterior_lower_below_gate")
         return reasons
 
     def reconcile(self, *, now_utc: Optional[str] = None) -> dict[str, Any]:
@@ -616,6 +979,24 @@ class AutomaticChampionController:
                 pointer, payload, now=now
             )
             payload, contract_reasons = self._validate_pointer(pointer)
+        if set(contract_reasons) == {
+            "policy_hash_mismatch",
+            "policy_manifest_mismatch",
+        } and _mapping(payload.get("policy")).get("version") in {
+            "automatic_champion_v2",
+            "automatic_champion_v3",
+        }:
+            pointer = self._refresh_policy(pointer, payload, now=now)
+            payload, contract_reasons = self._validate_pointer(pointer)
+        if (
+            not contract_reasons
+            and (
+                payload.get("catalog_hash") != self.catalog_hash
+                or _mapping(payload.get("catalog")) != self.catalog
+            )
+        ):
+            pointer = self._refresh_catalog(pointer, payload, now=now)
+            payload, contract_reasons = self._validate_pointer(pointer)
         selector_started = _parse_utc(payload.get("selector_started_at_utc"))
         active_since = _parse_utc(payload.get("active_since_utc"))
         active_rule_id = str(pointer.get("rule_id") or "")
@@ -624,9 +1005,6 @@ class AutomaticChampionController:
         if active_rule_id not in phases:
             contract_reasons.append("active_phase_missing")
 
-        tenure_days = max(
-            0.0, (now - active_since).total_seconds() / 86400.0
-        )
         active_family = self.families.get(active_rule_id)
         distinct_challenger_families = {
             family
@@ -634,9 +1012,6 @@ class AutomaticChampionController:
             if rule_id != active_rule_id and family != active_family
         }
         family_count = max(1, len(distinct_challenger_families))
-        adjusted_probability = 1.0 - (
-            (1.0 - self.policy.superiority_probability) / family_count
-        )
 
         evaluations: list[dict[str, Any]] = []
         for spec in self.specs:
@@ -663,6 +1038,9 @@ class AutomaticChampionController:
                 str(phase["phase_id"]),
                 starts_at=comparison_start,
             )
+            metrics["elapsed_days"] = max(
+                0.0, (now - comparison_start).total_seconds() / 86400.0
+            )
             row = {
                 "rule_id": spec.rule_id,
                 "portfolio_id": spec.portfolio_id,
@@ -676,6 +1054,12 @@ class AutomaticChampionController:
                 evaluations.append(row)
                 continue
             reasons = self._eligibility_reasons(metrics)
+            if str(phase.get("status") or "") not in {
+                "candidate",
+                "shadow",
+                "ready",
+            }:
+                reasons.append("candidate_not_competing")
             if self.families[spec.rule_id] == active_family:
                 reasons.append("same_family_as_champion")
             active_metrics = self._metrics(
@@ -687,24 +1071,26 @@ class AutomaticChampionController:
                 _mapping(active_metrics["posterior"]),
                 margin=self.policy.superiority_margin,
             )
-            mean_advantage = (
-                float(_mapping(metrics["posterior"])["mean"])
-                - float(_mapping(active_metrics["posterior"])["mean"])
+            point_advantage = (
+                float(metrics.get("hit_rate") or 0.0)
+                - float(active_metrics.get("hit_rate") or 0.0)
             )
             if int(active_metrics["resolved"]) < self.policy.min_resolved:
                 reasons.append("champion_comparison_insufficient_resolved")
-            if tenure_days < self.policy.champion_min_tenure_days:
-                reasons.append("champion_minimum_tenure")
-            if mean_advantage < self.policy.superiority_margin:
-                reasons.append("posterior_margin_below_gate")
-            if probability < adjusted_probability:
-                reasons.append("multiple_testing_superiority_gate")
+            if point_advantage < self.policy.superiority_margin:
+                reasons.append("hit_rate_margin_below_gate")
             row.update(
                 {
                     "champion_metrics": active_metrics,
-                    "posterior_mean_advantage": mean_advantage,
+                    "hit_rate_advantage": point_advantage,
+                    "posterior_mean_advantage": (
+                        float(_mapping(metrics["posterior"])["mean"])
+                        - float(
+                            _mapping(active_metrics["posterior"])["mean"]
+                        )
+                    ),
                     "superiority_probability": probability,
-                    "required_superiority_probability": adjusted_probability,
+                    "required_superiority_probability": None,
                     "eligible": not reasons and not contract_reasons,
                     "reasons": reasons + list(contract_reasons),
                 }
@@ -818,13 +1204,16 @@ class AutomaticChampionController:
                 "comparison_started_at_utc": _mapping(
                     recommended["metrics"]
                 ).get("starts_at_utc"),
+                "hit_rate_advantage": recommended.get(
+                    "hit_rate_advantage"
+                ),
                 "posterior_mean_advantage": recommended.get(
                     "posterior_mean_advantage"
                 ),
                 "superiority_probability": recommended.get(
                     "superiority_probability"
                 ),
-                "required_superiority_probability": adjusted_probability,
+                "required_superiority_probability": None,
             }
             target_degraded = bool(
                 _mapping(recommended.get("metrics")).get("degraded")

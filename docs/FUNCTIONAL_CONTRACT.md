@@ -242,18 +242,19 @@ All profiles: conjunction DSL (`>=`, `<=`, `==`) on an allowlisted numeric featu
 | primary | `ENABLE_WIDE_RESEARCH` | up to 3 clauses typical; max 10 shadow rules | 50…1000 incl. 200 | **Yes**, as research state only |
 | 4f | four-factor | exact depth 4; beam 32; budget 40k | same family | **No** (hard shadow) |
 | precision | high-precision | up to 8 clauses; portfolio; frequency bands | same | **No** |
-| rare_precision | rare high precision | extended/nonlinear + market features | **50, 100, 150, 200** | **No** |
+| rare_precision | rare high precision | extended/nonlinear + market features | **50, 100, 200, 300, 400, 500, 600, 750, 800, 1000** | **No** |
 
 **Live:** `WideShadowLayer` claims first matching snapshot into sqlite; retry spool for crashes; health pending/DEFERRED.
 
-**Lifecycle (primary & precision/rare reconcile; 4f discovery-only pool):** `LifecyclePolicy` defaults (`wide_lifecycle_v2`):
+**Lifecycle (primary & precision/rare reconcile; 4f discovery-only pool):** `LifecyclePolicy` defaults (`wide_lifecycle_v3`):
 
 - target hit rate **90%**, null **85%**, Wilson lower **≥ 85%**
-- **150** resolved in the closed look, **28** span days, **14** trigger-days
-- ≥ 8 leagues, max league share 35%, ≥ 4 stable weekly windows (≥ **85%**), ≥ 2 triggers/week
+- **200** resolved in the closed look and **10** calendar span days
+- ≥ 8 leagues, max league share 35%, ≥ 2 stable weekly windows (≥ **85%**), ≥ 2 triggers/week
+- at every 200-result pool-selection checkpoint (200/400/600/800), rules below 86% pause; rules at or above 86% continue to later registered looks
 - Holm α = 0.05
 - degradation: fast n=50 rate 0.80; slow n=150 vs null 0.90
-- Telegram publication champion stays on its separate stricter 40-match policy
+- Telegram publication champion uses its separate 200-result / 10-day policy
 
 Phases: candidate → shadow → ready → active/champion; also paused/degraded. This lifecycle state does not grant Telegram publication authority.
 
@@ -268,19 +269,20 @@ book for the fixed candidate catalog. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION
 additionally permits an atomic production swap; with that flag off, the
 controller only writes recommendations.
 
-- every candidate starts from zero in this store; frozen-portfolio and source
-  rule history is never imported as switching evidence;
+- source-controlled candidates start from zero in this store; a READY discovery
+  finalist reuses only the prospective evidence that earned READY, never
+  historical or backfilled discovery results;
 - adjacent thresholds and near-identical portfolios share one family;
-- a challenger needs at least 40 resolved outcomes, 14 calendar days, 10
-  trigger-days, 8 leagues, no league above 30%, and at least 2 triggers/week;
-- ranking uses a beta posterior with an 83% / 40-match prior and its lower 90%
-  bound; that bound must be at least 82%;
-- the challenger must exceed the champion by at least 2 percentage points with
-  family-count-adjusted posterior probability (base 95%);
-- both rules are compared from the same later timestamp, and a champion has a
-  14-day minimum tenure;
+- one discovery finalist is admitted at a time;
+- a challenger needs at least 200 resolved outcomes, at least 10 elapsed days
+  since its comparable period began, and at least a 2 percentage-point
+  advantage; there is no absolute hit-rate floor;
+- both rules are compared from the same later timestamp, with at least 200
+  resolved champion outcomes in that period;
+- posterior and superiority-probability values are diagnostic/ranking fields,
+  not promotion gates; there is no 99.55% gate or minimum champion tenure;
 - the SQLite phase swap and checksummed pointer update are one transaction;
-- a non-baseline champion below 75% over its last 40 resolved triggers returns
+- a non-baseline champion below 80% over its last 40 resolved triggers returns
   atomically to `balanced-two-rule`;
 - the baseline at the same degradation level suspends publication until its
   rolling rate reaches 80% or a fully eligible challenger takes over;

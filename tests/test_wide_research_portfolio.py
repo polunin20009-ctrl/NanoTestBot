@@ -10,6 +10,7 @@ from wide_research.portfolio import (
     FrozenPortfolioSpec,
     balanced_two_rule_spec,
     evaluate_frozen_portfolio,
+    frozen_portfolio_spec_from_dict,
     with_level_score,
 )
 from wide_research.store import WideResearchStore
@@ -93,6 +94,16 @@ def test_pure_portfolio_evaluation_uses_any_member_or_semantics() -> None:
 
     assert result["status"] == "PASS"
     assert result["passed_members"] == ["low"]
+
+
+def test_persisted_frozen_portfolio_round_trips_with_checksum() -> None:
+    spec = FrozenPortfolioSpec(
+        "persisted", "v1", (_member("source", 82.0),)
+    )
+
+    restored = frozen_portfolio_spec_from_dict(spec.manifest())
+
+    assert restored == spec
 
 
 def test_frozen_portfolios_claim_union_once_and_attach_outcome(tmp_path) -> None:

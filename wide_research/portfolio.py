@@ -14,7 +14,13 @@ from typing import Any, Mapping, Optional, Sequence
 
 from .features import FEATURE_SCHEMA_VERSION, evaluate_universe, extract_features
 from .live import WideShadowLayer
-from .rules import Clause, RuleManifest, evaluate_rule, evaluate_snapshot
+from .rules import (
+    Clause,
+    RuleManifest,
+    evaluate_rule,
+    evaluate_snapshot,
+    rule_manifest_from_dict,
+)
 from .schema import DEFAULT_UNIVERSE, FAIL, PASS, canonical_hash
 from .store import WideResearchStore
 
@@ -136,6 +142,54 @@ class FrozenPortfolioSpec:
             },
             "production_applied": False,
         }
+
+
+def frozen_portfolio_spec_from_dict(
+    payload: Mapping[str, Any],
+) -> FrozenPortfolioSpec:
+    """Rebuild and verify one persisted immutable portfolio definition."""
+
+    body = dict(payload)
+    supplied_hash = str(body.pop("portfolio_hash", "") or "")
+    if not supplied_hash or supplied_hash != canonical_hash(body):
+        raise ValueError("frozen portfolio checksum mismatch")
+    if body.get("schema_version") != 1:
+        raise ValueError("unsupported frozen portfolio schema")
+    if body.get("semantics") != "earliest_first_trigger_per_fixture_any_member_v1":
+        raise ValueError("unsupported frozen portfolio semantics")
+    if body.get("production_enabled") is not False:
+        raise ValueError("persisted frozen portfolio must be shadow-defined")
+    members_payload = body.get("members")
+    if not isinstance(members_payload, list) or not members_payload:
+        raise ValueError("persisted frozen portfolio members are missing")
+    members = []
+    for value in members_payload:
+        member = _mapping(value)
+        manifest_payload = member.get("manifest")
+        if not isinstance(manifest_payload, Mapping):
+            raise ValueError("persisted portfolio member manifest is missing")
+        manifest = rule_manifest_from_dict(manifest_payload)
+        if str(member.get("source_rule_id") or "") != manifest.rule_id:
+            raise ValueError("persisted portfolio source rule identity mismatch")
+        members.append(
+            FrozenPortfolioMember(
+                source_profile=str(member.get("source_profile") or ""),
+                source_store_hash=str(member.get("source_store_hash") or ""),
+                manifest=manifest,
+            )
+        )
+    spec = FrozenPortfolioSpec(
+        portfolio_id=str(body.get("portfolio_id") or ""),
+        version=str(body.get("version") or ""),
+        members=tuple(members),
+    )
+    if str(body.get("rule_id") or "") != spec.rule_id:
+        raise ValueError("persisted frozen portfolio rule identity mismatch")
+    if int(body.get("feature_schema_version") or 0) != FEATURE_SCHEMA_VERSION:
+        raise ValueError("persisted frozen portfolio feature schema mismatch")
+    if spec.manifest()["portfolio_hash"] != supplied_hash:
+        raise ValueError("persisted frozen portfolio did not round-trip")
+    return spec
 
 
 BALANCED_TWO_RULE_PORTFOLIO_ID = "balanced-two-rule"

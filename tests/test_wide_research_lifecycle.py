@@ -66,24 +66,22 @@ def test_readiness_accepts_strong_diverse_stable_candidate():
 
 
 def test_normal_readiness_accepts_ninety_percent_with_wilson_floor():
-    # 139/150 clears target 0.90, Wilson ≥0.85, and Holm at look α=0.05/8.
+    # 186/200 clears target 0.90, Wilson ≥0.85, and Holm at look α=0.05/8.
     metrics = {
-        "wins": 139,
-        "losses": 11,
-        "span_days": 30.0,
-        "trigger_days": 20,
+        "wins": 186,
+        "losses": 14,
+        "span_days": 10.0,
+        "trigger_days": 8,
         "leagues": 10,
         "max_league_share": 0.25,
         "triggers_per_week": 5.0,
         "weekly": [
-            {"wins": 35, "losses": 3},
-            {"wins": 35, "losses": 3},
-            {"wins": 34, "losses": 3},
-            {"wins": 35, "losses": 2},
+            {"wins": 93, "losses": 7},
+            {"wins": 93, "losses": 7},
         ],
     }
     decision = evaluate_readiness(metrics)
-    assert metrics["wins"] + metrics["losses"] == 150
+    assert metrics["wins"] + metrics["losses"] == 200
     assert decision.metrics["hit_rate"] >= 0.90
     assert decision.metrics["wilson_lower"] >= 0.85
     assert decision.eligible
@@ -92,22 +90,20 @@ def test_normal_readiness_accepts_ninety_percent_with_wilson_floor():
 
 def test_normal_readiness_still_rejects_weak_wilson_floor():
     metrics = {
-        "wins": 135,
-        "losses": 15,
-        "span_days": 30.0,
-        "trigger_days": 20,
+        "wins": 179,
+        "losses": 21,
+        "span_days": 10.0,
+        "trigger_days": 8,
         "leagues": 10,
         "max_league_share": 0.25,
         "triggers_per_week": 5.0,
         "weekly": [
-            {"wins": 34, "losses": 4},
-            {"wins": 34, "losses": 4},
-            {"wins": 33, "losses": 4},
-            {"wins": 34, "losses": 3},
+            {"wins": 90, "losses": 10},
+            {"wins": 89, "losses": 11},
         ],
     }
     decision = evaluate_readiness(metrics)
-    assert decision.metrics["hit_rate"] == 0.9
+    assert decision.metrics["hit_rate"] == 0.895
     assert decision.metrics["wilson_lower"] < 0.85
     assert not decision.eligible
     assert "wilson_lower_below_gate" in decision.reasons

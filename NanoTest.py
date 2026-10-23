@@ -110,8 +110,17 @@ from market_benchmark import (
 from wide_research.automatic_champion import (
     AutomaticChampionController,
     AutomaticChampionLayer,
+    discovery_nomination_family,
+    import_ready_discovery_evidence,
+    is_discovery_nomination,
+    load_discovery_nomination_specs,
+    retire_exhausted_discovery_nominations,
+    select_ready_discovery_nominations,
 )
-from wide_research.controller import WideResearchController
+from wide_research.controller import (
+    POOL_SELECTION_MIN_HIT_RATE,
+    WideResearchController,
+)
 from market_benchmark.research import CausalQuoteCache
 from wide_research.discovery import (
     ATOMIC_GRID_VERSION as WIDE_RESEARCH_ATOMIC_GRID_VERSION,
@@ -686,6 +695,9 @@ ENABLE_SHADOW_ML = _parse_env_bool("ENABLE_SHADOW_ML", True)
 ENABLE_SHADOW_ML_ROLLING_CHALLENGER = _parse_env_bool(
     "ENABLE_SHADOW_ML_ROLLING_CHALLENGER", True
 )
+ENABLE_ROLLING_ML_PRIMARY_PROBABILITY = _parse_env_bool(
+    "ENABLE_ROLLING_ML_PRIMARY_PROBABILITY", False
+)
 ENABLE_ROLLING_DYNAMICS_SHADOW = _parse_env_bool(
     "ENABLE_ROLLING_DYNAMICS_SHADOW", True
 )
@@ -903,7 +915,7 @@ WIDE_RESEARCH_PHASE_REFRESH_SECONDS = max(
 )
 WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS = max(
     300,
-    int(os.environ.get("WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS", "1800")),
+    int(os.environ.get("WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS", "5400")),
 )
 WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB = max(
     512,
@@ -913,8 +925,10 @@ WIDE_RESEARCH_MAX_SHADOW_RULES = max(
     1, min(20, int(os.environ.get("WIDE_RESEARCH_MAX_SHADOW_RULES", "10")))
 )
 WIDE_RESEARCH_POOL_LIFECYCLE_POLICY = {
-    "version": "wide_pool_lifecycle_v1",
-    "terminal_look": 200,
+    "version": "wide_pool_lifecycle_v2",
+    "selection_look": 200,
+    "selection_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
+    "terminal_look": 1000,
     "max_age_days": 180,
 }
 WIDE_RESEARCH_MAX_DB_BYTES = max(
@@ -1282,13 +1296,14 @@ WIDE_RESEARCH_RARE_PRECISION_PORTFOLIO_BEAM_WIDTH = 128
 WIDE_RESEARCH_RARE_PRECISION_ALLOW_FEATURE_RANGES = True
 WIDE_RESEARCH_RARE_PRECISION_VALIDATION_WINDOW_COUNT = 4
 WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY = LifecyclePolicy(
-    min_resolved=150,
     min_triggers_per_week=0.0,
-    allowed_looks=(50, 100, 150, 200),
+    allowed_looks=(50, 100, 200, 300, 400, 500, 600, 750, 800, 1000),
 )
 WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY = {
-    "version": "wide_pool_lifecycle_v1",
-    "terminal_look": 200,
+    "version": "wide_pool_lifecycle_v2",
+    "selection_look": 200,
+    "selection_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
+    "terminal_look": 1000,
     "max_age_days": 365,
 }
 WIDE_RESEARCH_RARE_PRECISION_MAX_DB_BYTES = max(
@@ -1347,6 +1362,28 @@ AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES = max(
         os.environ.get(
             "AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES",
             str(512 * 1024 * 1024),
+        )
+    ),
+)
+ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS = _parse_env_bool(
+    "ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS", True
+)
+AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS = max(
+    1,
+    min(
+        1,
+        int(
+            os.environ.get(
+                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "1"
+            )
+        ),
+    ),
+)
+AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON = max(
+    40,
+    int(
+        os.environ.get(
+            "AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON", "200"
         )
     ),
 )
@@ -2016,11 +2053,16 @@ def log_feature_flags() -> None:
     )
     logger.info(
         "[AUTOMATIC_CHAMPION_CONFIG] enabled=%s production_apply=%s "
-        "db=%s report=%s candidates=28 prospective_only=true",
+        "db=%s report=%s candidates=28 prospective_only=true "
+        "discovery_nominations=%s discovery_max_challengers=%s "
+        "discovery_terminal_horizon=%s",
         ENABLE_AUTOMATIC_PUBLICATION_CHAMPION,
         AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY,
         AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE,
         AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE,
+        ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS,
+        AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS,
+        AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON,
     )
     logger.info(
         "[ROLLING_DYNAMICS_CONFIG] enabled=%s shadow_only=true production_apply=false schema=%s windows=5,10 max_extra_minutes=%s seed_minutes=36,39,41,44 seed_max_fetch_attempts=%s seed_workers=%s",
@@ -2053,8 +2095,12 @@ def log_feature_flags() -> None:
         SHADOW_ML_PREDICTION_ROTATE_MAX_BYTES,
     )
     logger.info(
-        "[SHADOW_ML_ROLLING_CONFIG] enabled=%s shadow_only=true production_apply=false auto_retrain=%s feature_profile=%s rolling_schema=%s windows=5,10 model_file=%s predictions_file=%s rotate_max_bytes=%s",
+        "[SHADOW_ML_ROLLING_CONFIG] enabled=%s challenger_shadow_only=true "
+        "primary_probability_apply=%s auto_retrain=%s feature_profile=%s "
+        "rolling_schema=%s windows=5,10 model_file=%s predictions_file=%s "
+        "rotate_max_bytes=%s",
         ENABLE_SHADOW_ML_ROLLING_CHALLENGER,
+        ENABLE_ROLLING_ML_PRIMARY_PROBABILITY,
         SHADOW_ML_ROLLING_AUTO_RETRAIN,
         ROLLING_FEATURE_PROFILE,
         ROLLING_DYNAMICS_SCHEMA_VERSION,
@@ -15987,6 +16033,12 @@ def build_decision_snapshot(
         "prob_next_25": _decision_float(probability_result, "prob_next_25"),
         "prob_to75": _decision_float(probability_result, "prob_to75"),
         "prob_to90": prob_to90,
+        "pre_ml_prob_next_15": _decision_float(
+            probability_result, "pre_ml_prob_next_15", prob_next15
+        ),
+        "pre_ml_prob_to90": _decision_float(
+            probability_result, "pre_ml_prob_to90", prob_to90
+        ),
         "prob_until_end_decision": prob_until_end,
         "decision_remain_metric": str(probability_result.get("decision_remain_metric") or "prob_to90"),
         "baseline_prob_next_15": _decision_float(probability_result, "baseline_prob_next_15"),
@@ -16075,6 +16127,9 @@ def build_decision_snapshot(
         "probabilities": probabilities,
         "reputation_application": dict(
             probability_result.get("reputation_application") or {}
+        ),
+        "rolling_ml_primary": dict(
+            probability_result.get("rolling_ml_primary") or {}
         ),
         "outcome_scope": OutcomeScope.TO_90_NORMAL_TIME.value,
         "normal_time_boundary_mode": NORMAL_TIME_BOUNDARY_MODE,
@@ -16355,6 +16410,9 @@ def _observation_config_snapshot() -> Dict[str, Any]:
         "signal_reputation_expanded_production_apply": bool(
             ENABLE_SIGNAL_REPUTATION_EXPANDED_AUTO_APPLY
         ),
+        "rolling_ml_primary_enabled": bool(
+            ENABLE_ROLLING_ML_PRIMARY_PROBABILITY
+        ),
         "signal_reputation_blend_to90_telegram_weight": float(
             SIGNAL_REPUTATION_BLEND_TELEGRAM_WEIGHT
         ),
@@ -16531,6 +16589,9 @@ def build_observation_from_decision(
             "sample_confidence": probability_result.get("sample_confidence"),
         },
         "probabilities": dict(decision_snapshot.get("probabilities") or {}),
+        "rolling_ml_primary": dict(
+            decision_snapshot.get("rolling_ml_primary") or {}
+        ),
         "gates": dict(decision_snapshot.get("gates") or {}),
         "decision": dict(decision_snapshot.get("decision") or {}),
         "publication_policy": dict(
@@ -16588,6 +16649,14 @@ def build_wide_monitor_observation(
         "prob_next_25": probability_result.get("prob_next_25"),
         "prob_to75": probability_result.get("prob_to75"),
         "prob_to90": probability_result.get("prob_to90"),
+        "pre_ml_prob_next_15": probability_result.get(
+            "pre_ml_prob_next_15",
+            probability_result.get("prob_next_15"),
+        ),
+        "pre_ml_prob_to90": probability_result.get(
+            "pre_ml_prob_to90",
+            probability_result.get("prob_to90"),
+        ),
         "prob_until_end_decision": probability_result.get("prob_to90"),
         "baseline_prob_next_15": probability_result.get(
             "baseline_prob_next_15"
@@ -16662,6 +16731,9 @@ def build_wide_monitor_observation(
             "sample_confidence": probability_result.get("sample_confidence"),
         },
         "probabilities": probability_fields,
+        "rolling_ml_primary": dict(
+            probability_result.get("rolling_ml_primary") or {}
+        ),
         "gates": {
             "readiness_passed": True,
             "other_hard_gates_passed": True,
@@ -20487,6 +20559,139 @@ def predict_and_append_shadow_rolling_ml(
         return False
 
 
+def apply_primary_rolling_ml_probability(
+    probability_result: Mapping[str, Any],
+    observation: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Atomically replace both output horizons with a ready rolling model."""
+    result = copy.deepcopy(dict(probability_result))
+    observation_view = observation if isinstance(observation, Mapping) else {}
+    base_next15 = _safe_float(result.get("prob_next_15"), float("nan"))
+    base_to90 = _safe_float(result.get("prob_to90"), float("nan"))
+    provenance: Dict[str, Any] = {
+        "enabled": bool(ENABLE_ROLLING_ML_PRIMARY_PROBABILITY),
+        "applied": False,
+        "source": "base_probability",
+        "fallback_reason": None,
+        "model_id": None,
+        "model_status": None,
+    }
+
+    def fallback(reason: str) -> Dict[str, Any]:
+        provenance["fallback_reason"] = reason
+        result["rolling_ml_primary"] = provenance
+        logger.warning(
+            "[ROLLING_ML_PRIMARY] observation_id=%s fixture_id=%s minute=%s "
+            "applied=false fallback_reason=%s",
+            observation_view.get("observation_key")
+            or observation_view.get("observation_id"),
+            observation_view.get("fixture_id"),
+            observation_view.get("minute"),
+            reason,
+        )
+        return result
+
+    if not ENABLE_ROLLING_ML_PRIMARY_PROBABILITY:
+        provenance["fallback_reason"] = "disabled"
+        result["rolling_ml_primary"] = provenance
+        return result
+    if not isinstance(observation, Mapping):
+        return fallback("invalid_observation")
+    if not math.isfinite(base_next15) or not math.isfinite(base_to90):
+        return fallback("invalid_base_probability")
+
+    try:
+        artifact = load_shadow_rolling_model_cached()
+        if not isinstance(artifact, Mapping):
+            return fallback("model_unavailable")
+        provenance["model_id"] = str(artifact.get("model_id") or "") or None
+        provenance["model_status"] = str(artifact.get("status") or "") or None
+        if provenance["model_status"] != "offline_ready":
+            return fallback("model_not_offline_ready")
+
+        prediction = predict_shadow_rolling(artifact, observation_view)
+        prediction_status = str(prediction.get("status") or "")
+        if (
+            prediction_status == "invalid_observation"
+            and str(prediction.get("reason") or "")
+            == "feature_contract_mismatch"
+        ):
+            note_shadow_rolling_contract_mismatch()
+            return fallback("feature_contract_mismatch")
+        if prediction_status != "ok":
+            return fallback(
+                str(prediction.get("reason") or prediction_status or "prediction_failed")
+            )
+        targets = (
+            prediction.get("targets")
+            if isinstance(prediction.get("targets"), Mapping)
+            else {}
+        )
+        calibrated: Dict[str, float] = {}
+        for target_name in ("next15", "to90"):
+            payload = targets.get(target_name)
+            if (
+                not isinstance(payload, Mapping)
+                or str(payload.get("status") or "") != "ok"
+            ):
+                return fallback(f"{target_name}_unavailable")
+            raw_value = payload.get("calibrated_probability_pct")
+            if isinstance(raw_value, bool):
+                return fallback(f"{target_name}_invalid_probability")
+            value = _safe_float(raw_value, float("nan"))
+            if not math.isfinite(value) or not 0.0 <= value <= 100.0:
+                return fallback(f"{target_name}_invalid_probability")
+            calibrated[target_name] = value
+
+        result["pre_ml_prob_next_15"] = base_next15
+        result["pre_ml_prob_to90"] = base_to90
+        result["prob_next_15"] = calibrated["next15"]
+        result["prob_to90"] = calibrated["to90"]
+        result["prob_until_end_decision"] = calibrated["to90"]
+        provenance.update(
+            {
+                "applied": True,
+                "source": "rolling_ml_primary",
+                "fallback_reason": None,
+                "model_id": str(
+                    prediction.get("model_id")
+                    or artifact.get("model_id")
+                    or ""
+                )
+                or None,
+                "algorithm_version": prediction.get("algorithm_version")
+                or artifact.get("algorithm_version"),
+                "base_prob_next_15": base_next15,
+                "base_prob_to90": base_to90,
+                "prob_next_15": calibrated["next15"],
+                "prob_to90": calibrated["to90"],
+            }
+        )
+        result["rolling_ml_primary"] = provenance
+        logger.info(
+            "[ROLLING_ML_PRIMARY] observation_id=%s fixture_id=%s minute=%s "
+            "applied=true model_id=%s base_next15=%.2f ml_next15=%.2f "
+            "base_to90=%.2f ml_to90=%.2f",
+            observation_view.get("observation_key")
+            or observation_view.get("observation_id"),
+            observation_view.get("fixture_id"),
+            observation_view.get("minute"),
+            provenance["model_id"],
+            base_next15,
+            calibrated["next15"],
+            base_to90,
+            calibrated["to90"],
+        )
+        return result
+    except Exception as exc:
+        logger.exception(
+            "[ROLLING_ML_PRIMARY_ERROR] observation_id=%s action=fallback_base",
+            observation_view.get("observation_key")
+            or observation_view.get("observation_id"),
+        )
+        return fallback(f"exception:{type(exc).__name__}")
+
+
 _shadow_candidate_layer_lock = threading.RLock()
 _shadow_candidate_layer: Optional[CandidateLayer] = None
 _shadow_candidate_layer_signature: Tuple[Any, ...] = ()
@@ -22807,7 +23012,9 @@ def _get_wide_research_rare_precision_components() -> Tuple[
                     ),
                     policy=WIDE_RESEARCH_RARE_PRECISION_LIFECYCLE_POLICY,
                     terminal_review_enabled=True,
-                    terminal_review_min_hit_rate=0.90,
+                    terminal_review_min_hit_rate=(
+                        POOL_SELECTION_MIN_HIT_RATE
+                    ),
                     pool_lifecycle_policy=(
                         WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY
                     ),
@@ -23139,7 +23346,9 @@ def _automatic_publication_champion_specs() -> Tuple[
     return specs
 
 
-def _get_automatic_publication_champion_components() -> Tuple[
+def _get_automatic_publication_champion_components(
+    *, refresh_nominations: bool = False
+) -> Tuple[
     WideResearchStore,
     AutomaticChampionLayer,
     AutomaticChampionController,
@@ -23149,44 +23358,104 @@ def _get_automatic_publication_champion_components() -> Tuple[
     global _automatic_publication_champion_controller
     global _automatic_publication_champion_signature
 
-    specs = _automatic_publication_champion_specs()
-    signature: Tuple[Any, ...] = (
-        os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE),
-        os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE),
-        int(AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES),
-        bool(AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY),
-        tuple(
-            (
-                spec.rule_id,
-                spec.manifest()["portfolio_hash"],
-                AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES.get(
-                    spec.portfolio_id, spec.portfolio_id
-                ),
-            )
-            for spec in specs
-        ),
-    )
     with _wide_research_lock:
         if (
-            _automatic_publication_champion_store is None
-            or _automatic_publication_champion_layer is None
-            or _automatic_publication_champion_controller is None
-            or _automatic_publication_champion_signature != signature
+            not refresh_nominations
+            and _automatic_publication_champion_store is not None
+            and _automatic_publication_champion_layer is not None
+            and _automatic_publication_champion_controller is not None
         ):
-            _assert_wide_research_runtime_paths()
+            return (
+                _automatic_publication_champion_store,
+                _automatic_publication_champion_layer,
+                _automatic_publication_champion_controller,
+            )
+        _assert_wide_research_runtime_paths()
+        if _automatic_publication_champion_store is None:
             project_root = os.path.dirname(os.path.abspath(__file__))
-            store = WideResearchStore(
+            _automatic_publication_champion_store = WideResearchStore(
                 AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE,
                 allowed_root=project_root,
                 max_db_bytes=(
                     AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES
                 ),
             )
-            store.bind_profile("automatic_champion")
+            _automatic_publication_champion_store.bind_profile(
+                "automatic_champion"
+            )
+        store = _automatic_publication_champion_store
+        fixed_specs = _automatic_publication_champion_specs()
+        persisted_dynamic = load_discovery_nomination_specs(store)
+        selected: Tuple[FrozenPortfolioSpec, ...] = ()
+        precision_store: Optional[WideResearchStore] = None
+        if (
+            ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS
+            and ENABLE_WIDE_RESEARCH_PRECISION
+        ):
+            precision_store = _get_wide_research_precision_components()[0]
+            selected = select_ready_discovery_nominations(
+                precision_store,
+                target_store=store,
+                source_profile="precision_shadow",
+                existing_specs=fixed_specs + persisted_dynamic,
+                max_active=(
+                    AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS
+                ),
+            )
+        dynamic_specs = tuple(
+            sorted(
+                (*persisted_dynamic, *selected),
+                key=lambda value: value.rule_id,
+            )
+        )
+        specs = fixed_specs + dynamic_specs
+        families = dict(AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES)
+        for spec in specs:
+            if is_discovery_nomination(spec):
+                families[spec.portfolio_id] = discovery_nomination_family(spec)
+        if precision_store is not None:
+            for spec in selected:
+                imported = import_ready_discovery_evidence(
+                    precision_store,
+                    store,
+                    spec,
+                    family_id=families[spec.portfolio_id],
+                )
+                logger.info(
+                    "[AUTOMATIC_CHAMPION_NOMINATION] portfolio_id=%s "
+                    "claimed=%s outcomes=%s source=precision_ready",
+                    spec.portfolio_id,
+                    imported.get("claimed"),
+                    imported.get("outcomes"),
+                )
+        phase_statuses = {
+            str(row.get("rule_id") or ""): str(row.get("status") or "")
+            for row in store.list_phases()
+        }
+        signature: Tuple[Any, ...] = (
+            os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_DB_FILE),
+            os.path.abspath(AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE),
+            int(AUTOMATIC_PUBLICATION_CHAMPION_MAX_DB_BYTES),
+            bool(AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY),
+            tuple(
+                (
+                    spec.rule_id,
+                    spec.manifest()["portfolio_hash"],
+                    families.get(spec.portfolio_id, spec.portfolio_id),
+                    phase_statuses.get(spec.rule_id),
+                )
+                for spec in specs
+            ),
+        )
+        if (
+            _automatic_publication_champion_layer is None
+            or _automatic_publication_champion_controller is None
+            or _automatic_publication_champion_signature != signature
+        ):
             layer = AutomaticChampionLayer(
                 store,
                 specs,
-                families=AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES,
+                families=families,
                 max_prediction_lag_seconds=(
                     SHADOW_CANDIDATE_MAX_PREDICTION_LAG_SECONDS
                 ),
@@ -23194,17 +23463,32 @@ def _get_automatic_publication_champion_components() -> Tuple[
             controller = AutomaticChampionController(
                 store,
                 specs,
-                families=AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES,
+                families=families,
                 baseline_portfolio_id=BALANCED_TWO_RULE_PORTFOLIO_ID,
                 report_path=AUTOMATIC_PUBLICATION_CHAMPION_REPORT_FILE,
                 production_enabled=(
                     AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY
                 ),
             )
-            _automatic_publication_champion_store = store
             _automatic_publication_champion_layer = layer
             _automatic_publication_champion_controller = controller
-            _automatic_publication_champion_signature = signature
+            _automatic_publication_champion_signature = (
+                *signature[:-1],
+                tuple(
+                    (
+                        spec.rule_id,
+                        spec.manifest()["portfolio_hash"],
+                        families.get(spec.portfolio_id, spec.portfolio_id),
+                        {
+                            str(row.get("rule_id") or ""): str(
+                                row.get("status") or ""
+                            )
+                            for row in store.list_phases()
+                        }.get(spec.rule_id),
+                    )
+                    for spec in specs
+                ),
+            )
         return (
             _automatic_publication_champion_store,
             _automatic_publication_champion_layer,
@@ -25102,9 +25386,12 @@ def _wide_research_rare_precision_summary_is_current(
     if not isinstance(profile_contract, Mapping):
         return False
     lifecycle_policy = profile_contract.get("lifecycle_policy")
+    pool_lifecycle = profile_contract.get("pool_lifecycle")
     terminal_review = profile_contract.get("terminal_review")
-    if not isinstance(lifecycle_policy, Mapping) or not isinstance(
-        terminal_review, Mapping
+    if (
+        not isinstance(lifecycle_policy, Mapping)
+        or not isinstance(pool_lifecycle, Mapping)
+        or not isinstance(terminal_review, Mapping)
     ):
         return False
     expected_lifecycle_policy = (
@@ -25168,9 +25455,12 @@ def _wide_research_rare_precision_summary_is_current(
             and int(profile_contract.get("max_shadow_rules"))
             == WIDE_RESEARCH_RARE_PRECISION_MAX_SHADOW_RULES
             and dict(lifecycle_policy) == expected_lifecycle_policy
+            and dict(pool_lifecycle)
+            == WIDE_RESEARCH_RARE_PRECISION_POOL_LIFECYCLE_POLICY
             and terminal_review.get("enabled") is True
             and int(terminal_review.get("final_look")) == 200
-            and float(terminal_review.get("min_point_hit_rate")) == 0.90
+            and float(terminal_review.get("min_point_hit_rate"))
+            == POOL_SELECTION_MIN_HIT_RATE
             and str(payload.get("prospective_start_utc") or "")
             == str(WIDE_RESEARCH_RARE_PRECISION_PROSPECTIVE_START_UTC)
             and requested_memory_mb == WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB
@@ -25316,13 +25606,23 @@ def wide_research_daemon() -> None:
                 champion_layer, log_tag="AUTOMATIC_CHAMPION"
             ):
                 decision = champion_controller.reconcile()
+                retired_nominations = (
+                    retire_exhausted_discovery_nominations(
+                        champion_store,
+                        decision,
+                        terminal_horizon=(
+                            AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON
+                        ),
+                    )
+                )
                 logger.info(
                     "[AUTOMATIC_CHAMPION_RECOVERY] recovery=%s "
-                    "active=%s recommended=%s switched=%s",
+                    "active=%s recommended=%s switched=%s retired=%s",
                     recovery,
                     decision.get("active_portfolio_id"),
                     decision.get("recommended_portfolio_id"),
                     decision.get("switched"),
+                    len(retired_nominations),
                 )
         except Exception:
             logger.exception(
@@ -25833,7 +26133,9 @@ def wide_research_daemon() -> None:
                         _champion_store,
                         champion_layer,
                         champion_controller,
-                    ) = _get_automatic_publication_champion_components()
+                    ) = _get_automatic_publication_champion_components(
+                        refresh_nominations=True
+                    )
                     retries_clear = _wide_research_retry_gate(
                         champion_layer, log_tag="AUTOMATIC_CHAMPION"
                     )
@@ -25842,18 +26144,31 @@ def wide_research_daemon() -> None:
                         if retries_clear
                         else {}
                     )
+                    retired_nominations = (
+                        retire_exhausted_discovery_nominations(
+                            _champion_store,
+                            decision,
+                            terminal_horizon=(
+                                AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON
+                            ),
+                        )
+                        if decision
+                        else ()
+                    )
                     if (
                         decision.get("switched")
                         or decision.get("recommended_rule_id")
                         or decision.get("status") == "blocked"
+                        or retired_nominations
                     ):
                         logger.info(
                             "[AUTOMATIC_CHAMPION_DECISION] active=%s "
-                            "recommended=%s switched=%s status=%s "
+                            "recommended=%s switched=%s retired=%s status=%s "
                             "production_apply=%s",
                             decision.get("active_portfolio_id"),
                             decision.get("recommended_portfolio_id"),
                             decision.get("switched"),
+                            len(retired_nominations),
                             decision.get("status"),
                             AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY,
                         )
@@ -26706,11 +27021,32 @@ def compute_probability_45_plus_with_reputation(
 ) -> Dict[str, Any]:
     """Single 45+ probability path used by both Telegram send and updates."""
     base_result = compute_probability_45_plus(fixture_metrics, minute)
-    return apply_signal_reputation_to_probability_result(
+    reputation_result = apply_signal_reputation_to_probability_result(
         fixture_metrics,
         minute,
         base_result,
         application_context=application_context,
+    )
+    if not ENABLE_ROLLING_ML_PRIMARY_PROBABILITY:
+        return reputation_result
+    try:
+        observation = build_wide_router_observation(
+            fixture_id=_safe_int(get_fixture_id(fixture_metrics), 0),
+            minute=int(minute),
+            fixture_metrics=fixture_metrics,
+            probability_result=reputation_result,
+        )
+    except Exception:
+        logger.exception(
+            "[ROLLING_ML_PRIMARY_OBSERVATION_ERROR] context=%s minute=%s "
+            "action=fallback_base",
+            application_context,
+            minute,
+        )
+        observation = {}
+    return apply_primary_rolling_ml_probability(
+        reputation_result,
+        observation,
     )
 
 

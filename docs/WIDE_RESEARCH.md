@@ -146,24 +146,26 @@ fields.
 ### READY gates
 
 Readiness is checked only at pre-registered resolved-sample milestones:
-`50, 100, 150, 200, 300, 500, 750, 1000`. The default policy cannot pass before
+`50, 100, 150, 200, 300, 400, 500, 600, 750, 800, 1000`. The default policy cannot pass before
 200 resolved triggers. At a closed look, all of these gates must pass:
 
-- observed hit rate is at least 95%;
-- the lower bound of the 95% Wilson interval is at least 90%;
-- the prospective span is at least 28 days;
-- triggers occurred on at least 14 distinct days;
+- observed hit rate is at least 90%;
+- the lower bound of the 95% Wilson interval is at least 85%;
+- the prospective span is at least 10 calendar days;
 - at least 8 leagues are represented;
 - no league contributes more than 35% of resolved triggers;
 - frequency is at least 2 resolved triggers per week;
-- at least 4 weekly windows have a hit rate of at least 90%;
-- a one-sided binomial test beats the 90% null after correction for both the
+- at least 2 weekly windows have a hit rate of at least 85%;
+- a one-sided binomial test beats the 85% null after correction for both the
   fixed discovery-run candidate family, repeated milestone looks, and the
   telescoping alpha budget spent across successive discovery runs.
 
-If a rule fails at 200, extra results do not continuously move that same test;
-the next fresh decision point is the next configured milestone. This avoids
-repeatedly checking after every favorable result.
+Every 200 closed results are a pool-selection checkpoint (200/400/600/800). A
+rule below 86% at any checkpoint stops and frees its slot. A rule at or above
+86% keeps collecting, even when those results arrived in fewer than 10 days,
+and receives fresh READY decisions only at the pre-registered later milestones.
+This avoids both the old impossible "stop at 200, then wait for time to pass"
+state and repeated checking after every single favorable result.
 
 Historical holdout, historical Telegram signals, and outcomes before the phase
 boundary are never added to these gates.
@@ -214,34 +216,48 @@ they do not grant publication authority.
 ## Automatic publication Champion–Challenger
 
 The publication selector uses a separate
-`data/automatic_publication_champion.sqlite3` store and never imports outcomes
-from discovery or frozen-portfolio books. `balanced-two-rule` is registered as
-the initial champion. Every other source-controlled candidate begins a fresh
-prospective clock when first admitted.
+`data/automatic_publication_champion.sqlite3` store. `balanced-two-rule` is
+registered as the initial champion. Source-controlled candidates begin a fresh
+prospective clock when first admitted. A READY discovery finalist is different:
+the selector imports only the already prospective observations that earned the
+READY certificate, never historical or backfilled discovery results.
 
-Automatic replacement requires 40 resolved outcomes over at least 14 days,
-10 trigger-days, 8 leagues, no league above 30%, and at least 2 triggers per
-week. A beta posterior (83% prior with strength 40) must have a lower 90% bound
-of at least 82%. On the same calendar window, the challenger must exceed the
-champion by at least 2 percentage points with a base posterior probability of
-95%, tightened for the number of candidate families. Near-duplicate rules
-share one family and cannot cause threshold churn.
+Automatic replacement uses three plain gates: at least 200 resolved outcomes,
+at least 10 elapsed days since the comparable candidate period began, and at
+least a 2 percentage-point hit-rate advantage over the current champion on the
+same comparison period. There is no absolute hit-rate floor. The champion must
+also have 200 resolved outcomes in that period so the direct comparison is defined. Beta
+posterior values and superiority probability remain in the report for
+diagnostics and deterministic ranking; they do not authorize or block a swap.
+There is no 99.55% probability gate and no separate minimum champion tenure.
+Near-duplicate rules share one family and cannot cause threshold churn.
 
 `ENABLE_AUTOMATIC_PUBLICATION_CHAMPION` enables the isolated evidence book and
 recommendation report. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY`
 permits an eligible recommendation to swap the active pointer. Demotion,
 promotion, lifecycle audit events, and the checksummed pointer update happen
-in one SQLite transaction. After a switch, a champion below 75% over its last
+in one SQLite transaction. After a switch, a champion below 80% over its last
 40 resolved triggers is atomically returned to `balanced-two-rule`. If the
 baseline itself has the same sustained degradation, publication is suspended;
 it resumes only after its rolling rate reaches 80% or a fully eligible
 challenger replaces it.
 
-A changed policy/catalog, invalid or suspended pointer, pointer-generation
-change during evaluation, or evaluation error blocks publication. It never
-silently substitutes a different rule. Switching the staged production flag
-is the one contract change that is re-authorized automatically without
-discarding already prospective evidence.
+A READY precision rule may be admitted automatically as a frozen singleton
+challenger when `ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS=true`.
+Admission copies its immutable rule definition and its existing prospective
+READY evidence. Import is idempotent, preserves observation IDs and outcome
+versions, and does not copy pre-prospective history. Exactly one discovery
+finalist collects at a time. A finalist that has not qualified by the fixed
+`AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON` is rejected and frees its
+slot unless it is still waiting for the 10-day calendar or comparable champion
+sample. Adding a challenger is an append-only catalog update and preserves the
+active champion, its evidence, and its tenure metadata.
+
+A changed policy or non-append-only catalog mutation, invalid or suspended
+pointer, pointer-generation change during evaluation, or evaluation error
+blocks publication. It never silently substitutes a different rule.
+Append-only challenger admission and switching the staged production flag are
+re-authorized atomically without discarding already prospective evidence.
 
 The manifest cache never accepts a lower generation or a corrupt update. While
 the process is alive it also rejects different content under the same
@@ -270,7 +286,7 @@ of an already registered phase.
 | `WIDE_RESEARCH_DISCOVERY_INTERVAL_SECONDS` | `604800` | Discovery cadence; minimum 86400 seconds |
 | `WIDE_RESEARCH_LIFECYCLE_INTERVAL_SECONDS` | `900` | Lifecycle cadence; minimum 300 seconds |
 | `WIDE_RESEARCH_PHASE_REFRESH_SECONDS` | `60` | Live phase-cache refresh; minimum 5 seconds |
-| `WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS` | `1800` | Discovery subprocess timeout; minimum 300 seconds |
+| `WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS` | `5400` | Discovery subprocess timeout; minimum 300 seconds |
 | `WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB` | `3072` | Hard address-space ceiling for each isolated discovery worker |
 | `WIDE_RESEARCH_MAX_SHADOW_RULES` | `10` | Simultaneously measured phases; clamped to 1--20 |
 | `WIDE_RESEARCH_MAX_DB_BYTES` | `2147483648` | SQLite/WAL storage budget; minimum 10 MiB |
@@ -394,7 +410,7 @@ Wilson ranking penalizes tiny samples, and no historical result can become
 production evidence. `precision_shadow` has a separate bound SQLite database,
 no `ActiveRuleRouter`, and hard-rejects production mode. Its lifecycle does run
 the ordinary prospective readiness checks (at least 200 resolved triggers,
-28 days, 14 trigger days, 8 leagues, Wilson lower bound at least 90%, weekly
+10 calendar days, 8 leagues, Wilson lower bound at least 85%, weekly
 stability and corrected significance). A passing phase may be marked READY in
 the laboratory database, but `production_enabled=false` makes promotion or
 Telegram routing impossible until a separately reviewed policy is implemented.
@@ -473,22 +489,23 @@ with the original evaluator. This speeds up the larger search without sampling
 or dropping observations.
 
 Each admitted rule automatically starts an immutable prospective phase at
-import time. Reviews use the first 50, 100 and 200 triggered fixtures. Poor
-interim results do not replace or restart the candidate. Once the first 200
-fixtures are claimed, further admission is capped atomically and the lifecycle
-pauses the phase, freeing its executable pool slot. Pending outcomes still
-resolve against that fixed cohort. The evidence remains on disk. Rediscovery
-of the same executable rule reuses that identity across search-version
-changes, and corrections to its outcomes remain
-visible in subsequent reports. A run with no finalists preserves ongoing
-phases. If all 64 slots are occupied, admission explicitly reports the
-unadmitted candidates; it does not evict rules based on wins and losses.
+import time. Initial reviews use the first 50, 100 and 200 triggered fixtures. Poor
+interim results do not replace or restart the candidate. At every 200-result
+checkpoint (200/400/600/800), rules below 86% pause and free their executable
+pool slots. Rules at or above 86% continue collecting fresh evidence through
+later milestones. Pending outcomes still resolve against each fixed checkpoint
+cohort. The evidence remains on disk. Rediscovery of the same executable rule
+reuses that identity across search-version changes, and corrections to its
+outcomes remain visible in subsequent reports. A run with no finalists
+preserves ongoing phases. If all 64 slots are occupied, admission explicitly
+reports the unadmitted candidates; it does not evict rules based on wins and
+losses.
 
-At the final review, observed hit rate of at least 90% is labelled
-`reviewable`; this is a request for manual examination, not proof of 93%.
-The ordinary stricter readiness gates are also reported separately. Every
-terminal phase stays paused even when those gates pass. This profile has no
-production router and cannot publish a Telegram signal.
+At each 200-result selection checkpoint, observed hit rate of at least 86% is
+labelled `reviewable` / `continue` and permits continued collection. The
+ordinary readiness gates are reported separately and can pass only from 200
+results and 10 calendar days onward. This profile has no production router and
+cannot publish a Telegram signal.
 
 #### Extended expressions and causal market scope (September 11)
 
@@ -622,8 +639,10 @@ python3.12 scripts/report_wide_research.py \
   --db data/wide_research_rare_precision.sqlite3 --json
 ```
 
-`terminal_review` reports the frozen 200-fixture result and whether its outcomes
-have all closed. Unknown outcomes are never replaced by later wins.
+`terminal_review` reports the frozen 200-fixture selection result and whether
+its outcomes have all closed. Unknown outcomes are never replaced by later
+wins. Reviewable rules keep collecting after that frozen selection cohort;
+non-reviewable rules pause.
 
 ## Commands and reports
 
@@ -738,7 +757,7 @@ the DB, pointer, phase timestamps, checksums, or artifact files by hand.
 
 ## Limitations
 
-The 95% target is a qualification policy, not a promise. Even a rule that
+The 90% target is a qualification policy, not a promise. Even a rule that
 passes all gates can perform worse later because competitions, teams, API data,
 market conditions, and match populations change. A high point estimate on a
 small or concentrated sample is specifically not enough; that is why the
@@ -750,7 +769,7 @@ conjunctions, not every possible program or causal explanation. Rare 100%
 historical rules are usually fragile and may never collect 200 prospective
 triggers. Conversely, a useful high-coverage rule can be rejected if its
 uncertainty remains too large. Automatic replacement reduces stale-rule risk
-but cannot guarantee a continuously available 95% champion; during gaps the
+but cannot guarantee a continuously available 90% champion; during gaps the
 correct behavior is the existing-filter fallback.
 
 Treat wide research as an auditable candidate factory and safety-controlled

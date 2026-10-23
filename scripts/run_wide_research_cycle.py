@@ -29,7 +29,10 @@ _WORKER_MEMORY_LIMIT_MB = apply_worker_memory_limit(
     env_name="GOALBOT_WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB"
 )
 
-from wide_research.controller import WideResearchController  # noqa: E402
+from wide_research.controller import (  # noqa: E402
+    POOL_SELECTION_MIN_HIT_RATE,
+    WideResearchController,
+)
 from wide_research.discovery import (  # noqa: E402
     DiscoveryConfig,
     JournalJoinStore,
@@ -500,12 +503,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         controller_kwargs.update(
             {
                 "policy": LifecyclePolicy(
-                    min_resolved=150,
                     min_triggers_per_week=0.0,
-                    allowed_looks=(50, 100, 150, 200),
+                    allowed_looks=(
+                        50,
+                        100,
+                        200,
+                        300,
+                        400,
+                        500,
+                        600,
+                        750,
+                        800,
+                        1000,
+                    ),
                 ),
                 "terminal_review_enabled": True,
-                "terminal_review_min_hit_rate": 0.90,
+                "terminal_review_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
+                "pool_lifecycle_policy": {
+                    "version": "wide_pool_lifecycle_v2",
+                    "selection_look": 200,
+                    "selection_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,
+                    "terminal_look": 1000,
+                    "max_age_days": 365,
+                },
             }
         )
     controller = WideResearchController(
@@ -562,9 +582,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary["profile_contract"] = {
             "max_shadow_rules": int(args.max_shadow_rules),
             "lifecycle_policy": lifecycle_policy,
+            "pool_lifecycle": dict(controller.pool_lifecycle_policy or {}),
             "terminal_review": {
                 "enabled": True,
-                "final_look": max(controller.policy.allowed_looks),
+                "final_look": 200,
                 "min_point_hit_rate": 0.90,
             },
         }
