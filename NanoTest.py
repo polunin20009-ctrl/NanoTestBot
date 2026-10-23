@@ -115,7 +115,7 @@ from wide_research.automatic_champion import (
     is_discovery_nomination,
     load_discovery_nomination_specs,
     retire_exhausted_discovery_nominations,
-    select_ready_discovery_nominations,
+    select_ready_discovery_nominations_from_profiles,
 )
 from wide_research.controller import (
     POOL_SELECTION_MIN_HIT_RATE,
@@ -1371,10 +1371,10 @@ ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS = _parse_env_bool(
 AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS = max(
     1,
     min(
-        1,
+        20,
         int(
             os.environ.get(
-                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "1"
+                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "20"
             )
         ),
     ),
@@ -23387,21 +23387,42 @@ def _get_automatic_publication_champion_components(
         fixed_specs = _automatic_publication_champion_specs()
         persisted_dynamic = load_discovery_nomination_specs(store)
         selected: Tuple[FrozenPortfolioSpec, ...] = ()
-        precision_store: Optional[WideResearchStore] = None
-        if (
-            ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS
-            and ENABLE_WIDE_RESEARCH_PRECISION
-        ):
-            precision_store = _get_wide_research_precision_components()[0]
-            selected = select_ready_discovery_nominations(
-                precision_store,
-                target_store=store,
-                source_profile="precision_shadow",
-                existing_specs=fixed_specs + persisted_dynamic,
-                max_active=(
-                    AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS
-                ),
-            )
+        nomination_sources: list[Tuple[str, WideResearchStore]] = []
+        if ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS:
+            if ENABLE_WIDE_RESEARCH_PRECISION:
+                nomination_sources.append(
+                    (
+                        "precision_shadow",
+                        _get_wide_research_precision_components()[0],
+                    )
+                )
+            if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+                nomination_sources.append(
+                    (
+                        "exact_four_shadow",
+                        _get_wide_research_four_factor_components()[0],
+                    )
+                )
+            if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+                nomination_sources.append(
+                    (
+                        "rare_precision_shadow",
+                        _get_wide_research_rare_precision_components()[0],
+                    )
+                )
+            if nomination_sources:
+                selected = select_ready_discovery_nominations_from_profiles(
+                    nomination_sources,
+                    target_store=store,
+                    existing_specs=fixed_specs + persisted_dynamic,
+                    max_active=(
+                        AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS
+                    ),
+                )
+        source_stores = {
+            profile: source_store
+            for profile, source_store in nomination_sources
+        }
         dynamic_specs = tuple(
             sorted(
                 (*persisted_dynamic, *selected),
@@ -23413,21 +23434,25 @@ def _get_automatic_publication_champion_components(
         for spec in specs:
             if is_discovery_nomination(spec):
                 families[spec.portfolio_id] = discovery_nomination_family(spec)
-        if precision_store is not None:
-            for spec in selected:
-                imported = import_ready_discovery_evidence(
-                    precision_store,
-                    store,
-                    spec,
-                    family_id=families[spec.portfolio_id],
-                )
-                logger.info(
-                    "[AUTOMATIC_CHAMPION_NOMINATION] portfolio_id=%s "
-                    "claimed=%s outcomes=%s source=precision_ready",
-                    spec.portfolio_id,
-                    imported.get("claimed"),
-                    imported.get("outcomes"),
-                )
+        for spec in selected:
+            source_profile = str(spec.members[0].source_profile)
+            source_store = source_stores.get(source_profile)
+            if source_store is None:
+                continue
+            imported = import_ready_discovery_evidence(
+                source_store,
+                store,
+                spec,
+                family_id=families[spec.portfolio_id],
+            )
+            logger.info(
+                "[AUTOMATIC_CHAMPION_NOMINATION] portfolio_id=%s "
+                "claimed=%s outcomes=%s source_profile=%s",
+                spec.portfolio_id,
+                imported.get("claimed"),
+                imported.get("outcomes"),
+                source_profile,
+            )
         phase_statuses = {
             str(row.get("rule_id") or ""): str(row.get("status") or "")
             for row in store.list_phases()
