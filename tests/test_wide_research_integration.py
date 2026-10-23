@@ -574,8 +574,11 @@ def test_rare_precision_components_are_isolated_and_terminal_shadow_only(
         100,
         200,
         300,
+        400,
         500,
+        600,
         750,
+        800,
         1000,
     )
     assert captured["policy"].min_resolved == 200

@@ -504,7 +504,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             {
                 "policy": LifecyclePolicy(
                     min_triggers_per_week=0.0,
-                    allowed_looks=(50, 100, 200, 300, 500, 750, 1000),
+                    allowed_looks=(
+                        50,
+                        100,
+                        200,
+                        300,
+                        400,
+                        500,
+                        600,
+                        750,
+                        800,
+                        1000,
+                    ),
                 ),
                 "terminal_review_enabled": True,
                 "terminal_review_min_hit_rate": POOL_SELECTION_MIN_HIT_RATE,

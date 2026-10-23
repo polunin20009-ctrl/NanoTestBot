@@ -60,6 +60,8 @@ def _relaxable_lifecycle_predecessors() -> tuple[dict[str, Any], ...]:
         "min_trigger_days": 14,
         "min_weekly_windows": 4,
     }
+    old_primary_looks = (50, 100, 150, 200, 300, 500, 750, 1000)
+    old_rare_looks = (50, 100, 200, 300, 500, 750, 1000)
     primary_v1 = _lifecycle_policy_manifest(
         LifecyclePolicy(
             version="wide_lifecycle_v1",
@@ -100,7 +102,42 @@ def _relaxable_lifecycle_predecessors() -> tuple[dict[str, Any], ...]:
             **old_common,
         )
     )
-    return (primary_v1, rare_v1, primary_v2, rare_v2)
+    # Current READY gates, but without the recurring 400/600/800 looks.
+    primary_v3_pre_recurring = _lifecycle_policy_manifest(
+        LifecyclePolicy(allowed_looks=old_primary_looks)
+    )
+    rare_v3_pre_recurring = _lifecycle_policy_manifest(
+        LifecyclePolicy(
+            min_triggers_per_week=0.0,
+            allowed_looks=old_rare_looks,
+        )
+    )
+    return (
+        primary_v1,
+        rare_v1,
+        primary_v2,
+        rare_v2,
+        primary_v3_pre_recurring,
+        rare_v3_pre_recurring,
+    )
+
+
+def _pool_selection_checkpoints(
+    pool_lifecycle: Mapping[str, Any],
+    *,
+    allowed_looks: Sequence[int],
+) -> tuple[int, ...]:
+    """Return closed-look checkpoints every selection_look until terminal."""
+
+    if "selection_look" not in pool_lifecycle:
+        return ()
+    interval = int(pool_lifecycle["selection_look"])
+    terminal = int(pool_lifecycle["terminal_look"])
+    return tuple(
+        int(look)
+        for look in allowed_looks
+        if interval <= int(look) < terminal and int(look) % interval == 0
+    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -2016,15 +2053,19 @@ class WideResearchController:
                 and milestone == int(pool_lifecycle["terminal_look"])
             )
             pool_selection = None
+            selection_checkpoints: list[dict[str, Any]] = []
             if pool_lifecycle and "selection_look" in pool_lifecycle:
-                selection_look = int(pool_lifecycle["selection_look"])
-                try:
-                    selection_rows = self.store.triggers_for_phase_look(
-                        phase_id, selection_look
-                    )
-                except KeyError:
-                    selection_rows = None
-                if selection_rows is not None:
+                min_hit_rate = float(pool_lifecycle["selection_min_hit_rate"])
+                for selection_look in _pool_selection_checkpoints(
+                    pool_lifecycle,
+                    allowed_looks=phase_policy.allowed_looks,
+                ):
+                    try:
+                        selection_rows = self.store.triggers_for_phase_look(
+                            phase_id, selection_look
+                        )
+                    except KeyError:
+                        continue
                     selection_metrics = self._prospective_metrics(
                         selection_rows, invalid_as_loss=True
                     )
@@ -2038,22 +2079,25 @@ class WideResearchController:
                         if selection_closed and selection_total
                         else None
                     )
-                    pool_selection = {
+                    checkpoint = {
                         "closed": selection_closed,
                         "look": selection_look,
                         "resolved": selection_total,
                         "pending": selection_pending,
                         "hit_rate": selection_hit_rate,
-                        "min_hit_rate": float(
-                            pool_lifecycle["selection_min_hit_rate"]
-                        ),
+                        "min_hit_rate": min_hit_rate,
                         "continue": (
-                            selection_hit_rate
-                            >= float(pool_lifecycle["selection_min_hit_rate"])
+                            selection_hit_rate >= min_hit_rate
                             if selection_hit_rate is not None
                             else None
                         ),
                     }
+                    selection_checkpoints.append(checkpoint)
+                    if selection_closed:
+                        pool_selection = checkpoint
+                    else:
+                        # Wait for this checkpoint before judging later ones.
+                        break
             if pool_lifecycle:
                 readiness[-1]["pool_lifecycle"] = {
                     **pool_lifecycle,
@@ -2061,6 +2105,7 @@ class WideResearchController:
                     "age_expired": age_expired,
                     "terminal_closed": pool_terminal_closed,
                     "selection": pool_selection,
+                    "selection_checkpoints": selection_checkpoints,
                 }
             terminal_rows = None
             if terminal_review and terminal_review["enabled"]:
@@ -2185,6 +2230,7 @@ class WideResearchController:
                     available_resume_slots -= 1
                     continue
                 if str(phase["status"]) in {"candidate", "shadow"}:
+                    # Store claim auth still keys off the first continue event.
                     self.store.note_phase_lifecycle_event_once(
                         phase_id,
                         expected_status=str(phase["status"]),
@@ -2195,11 +2241,24 @@ class WideResearchController:
                         },
                         changed_at_utc=_utc_iso(now),
                     )
+                    self.store.note_phase_lifecycle_event_once(
+                        phase_id,
+                        expected_status=str(phase["status"]),
+                        reason=(
+                            "pool_selection_checkpoint_continued_"
+                            f"{int(pool_selection['look'])}"
+                        ),
+                        metadata={
+                            "selection": pool_selection,
+                            "pool_lifecycle": pool_lifecycle,
+                        },
+                        changed_at_utc=_utc_iso(now),
+                    )
             if (
                 pool_selection is not None
                 and pool_selection["closed"]
                 and pool_selection["continue"] is False
-                and str(phase["status"]) in {"candidate", "shadow"}
+                and str(phase["status"]) in {"candidate", "shadow", "ready"}
             ):
                 self.store.transition_phase(
                     phase_id,
@@ -2209,10 +2268,12 @@ class WideResearchController:
                     metadata={
                         "pool_lifecycle": pool_lifecycle,
                         "selection": pool_selection,
+                        "selection_checkpoints": selection_checkpoints,
                         "outcome_adaptive_replacement": False,
                     },
                     changed_at_utc=_utc_iso(now),
                 )
+                continue
             elif pool_terminal_closed:
                 if decision.eligible:
                     if str(phase["status"]) != "ready":

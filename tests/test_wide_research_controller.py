@@ -1155,6 +1155,72 @@ def test_staged_terminal_review_continues_reviewable_hard_shadow(
     assert len(layer.process_snapshot(_snapshot(3302, observed))["claimed"]) == 1
 
 
+def test_recurring_pool_selection_pauses_when_second_checkpoint_fails(
+    tmp_path,
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    policy = replace(_policy(), min_resolved=2, allowed_looks=(2, 4, 6))
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        production_enabled=False,
+        policy=policy,
+        pool_lifecycle_policy={
+            "version": "wide_pool_lifecycle_v2",
+            "selection_look": 2,
+            "selection_min_hit_rate": 0.75,
+            "terminal_look": 6,
+            "max_age_days": 180,
+        },
+    )
+    controller.import_report(
+        _report(), imported_at_utc="2026-08-28T00:00:00+00:00"
+    )
+    layer = WideShadowLayer(store, refresh_seconds=0)
+    # look2: WW (100%) -> continue; look4: WWLL (50%) -> pause
+    outcomes = (True, True, False, False)
+    for index, won in enumerate(outcomes):
+        observed = datetime(2026, 8, 28, 12 + index, tzinfo=UTC)
+        snapshot = _snapshot(3500 + index, observed)
+        layer.process_snapshot(snapshot)
+        layer.process_outcomes(
+            [
+                {
+                    "observation_id": snapshot["observation_id"],
+                    "outcome_schema_version": 1,
+                    "created_at_utc": (
+                        observed + timedelta(hours=2)
+                    ).isoformat(),
+                    "outcome": {
+                        "status": "resolved",
+                        "goal_to90_normal_time": won,
+                        "resolved_at_utc": (
+                            observed + timedelta(hours=2)
+                        ).isoformat(),
+                    },
+                }
+            ]
+        )
+        controller.reconcile(
+            now_utc=(observed + timedelta(hours=3)).isoformat()
+        )
+
+    phase = store.list_phases()[0]
+    assert phase["status"] == "paused"
+    assert store.has_phase_lifecycle_event(
+        phase["phase_id"], reason="pool_selection_nonfinalist_paused"
+    )
+    assert store.has_phase_lifecycle_event(
+        phase["phase_id"], reason="pool_selection_checkpoint_continued_2"
+    )
+    final = controller.reconcile(now_utc="2026-08-29T12:00:00+00:00")
+    selection = final["readiness"][0]["pool_lifecycle"]["selection"]
+    assert selection["look"] == 4
+    assert selection["hit_rate"] == 0.5
+    assert selection["continue"] is False
+
+
 @pytest.mark.parametrize("terminal_review_enabled", (False, True))
 def test_relaxed_pool_selection_resumes_a_newly_eligible_phase(
     tmp_path,

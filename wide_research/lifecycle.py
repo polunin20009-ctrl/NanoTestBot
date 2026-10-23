@@ -124,7 +124,21 @@ class LifecyclePolicy:
     min_weekly_hit_rate: float = 0.85
     min_triggers_per_week: float = 2.0
     family_alpha: float = 0.05
-    allowed_looks: tuple[int, ...] = (50, 100, 150, 200, 300, 500, 750, 1000)
+    # Include every 200-result pool-selection checkpoint through the
+    # terminal look so reconcile can re-check hit rate at 200/400/600/800.
+    allowed_looks: tuple[int, ...] = (
+        50,
+        100,
+        150,
+        200,
+        300,
+        400,
+        500,
+        600,
+        750,
+        800,
+        1000,
+    )
     champion_min_tenure_days: float = 14.0
     degradation_fast_n: int = 50
     degradation_fast_rate: float = 0.80

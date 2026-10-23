@@ -146,7 +146,7 @@ fields.
 ### READY gates
 
 Readiness is checked only at pre-registered resolved-sample milestones:
-`50, 100, 150, 200, 300, 500, 750, 1000`. The default policy cannot pass before
+`50, 100, 150, 200, 300, 400, 500, 600, 750, 800, 1000`. The default policy cannot pass before
 200 resolved triggers. At a closed look, all of these gates must pass:
 
 - observed hit rate is at least 90%;
@@ -160,12 +160,12 @@ Readiness is checked only at pre-registered resolved-sample milestones:
   fixed discovery-run candidate family, repeated milestone looks, and the
   telescoping alpha budget spent across successive discovery runs.
 
-The first 200 results are also a pool-selection stage. A rule below 86% stops
-and frees its slot. A rule at or above 86% keeps collecting, even when those
-200 arrived in fewer than 10 days, and receives fresh READY decisions only at
-the pre-registered 300/500/750/1000 milestones. This avoids both the old
-impossible "stop at 200, then wait for time to pass" state and repeated checking
-after every favorable result.
+Every 200 closed results are a pool-selection checkpoint (200/400/600/800). A
+rule below 86% at any checkpoint stops and frees its slot. A rule at or above
+86% keeps collecting, even when those results arrived in fewer than 10 days,
+and receives fresh READY decisions only at the pre-registered later milestones.
+This avoids both the old impossible "stop at 200, then wait for time to pass"
+state and repeated checking after every single favorable result.
 
 Historical holdout, historical Telegram signals, and outcomes before the phase
 boundary are never added to these gates.
@@ -490,22 +490,22 @@ or dropping observations.
 
 Each admitted rule automatically starts an immutable prospective phase at
 import time. Initial reviews use the first 50, 100 and 200 triggered fixtures. Poor
-interim results do not replace or restart the candidate. Once the first 200
-fixtures close, rules below 86% pause and free their executable pool slots.
-Rules at or above 86% continue collecting fresh evidence through the
-300/500/750/1000 milestones. Pending outcomes still resolve against the fixed
-200-fixture selection cohort. The evidence remains on disk. Rediscovery
-of the same executable rule reuses that identity across search-version
-changes, and corrections to its outcomes remain
-visible in subsequent reports. A run with no finalists preserves ongoing
-phases. If all 64 slots are occupied, admission explicitly reports the
-unadmitted candidates; it does not evict rules based on wins and losses.
+interim results do not replace or restart the candidate. At every 200-result
+checkpoint (200/400/600/800), rules below 86% pause and free their executable
+pool slots. Rules at or above 86% continue collecting fresh evidence through
+later milestones. Pending outcomes still resolve against each fixed checkpoint
+cohort. The evidence remains on disk. Rediscovery of the same executable rule
+reuses that identity across search-version changes, and corrections to its
+outcomes remain visible in subsequent reports. A run with no finalists
+preserves ongoing phases. If all 64 slots are occupied, admission explicitly
+reports the unadmitted candidates; it does not evict rules based on wins and
+losses.
 
-At the 200-result selection review, observed hit rate of at least 86% is
-labelled `reviewable` and permits continued collection. The ordinary readiness
-gates are reported separately and can pass only from 200 results and 10
-calendar days onward. This profile has no production router and cannot publish
-a Telegram signal.
+At each 200-result selection checkpoint, observed hit rate of at least 86% is
+labelled `reviewable` / `continue` and permits continued collection. The
+ordinary readiness gates are reported separately and can pass only from 200
+results and 10 calendar days onward. This profile has no production router and
+cannot publish a Telegram signal.
 
 #### Extended expressions and causal market scope (September 11)
 
