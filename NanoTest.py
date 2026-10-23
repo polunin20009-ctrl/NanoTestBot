@@ -2092,8 +2092,12 @@ def log_feature_flags() -> None:
         SHADOW_ML_PREDICTION_ROTATE_MAX_BYTES,
     )
     logger.info(
-        "[SHADOW_ML_ROLLING_CONFIG] enabled=%s shadow_only=true production_apply=false auto_retrain=%s feature_profile=%s rolling_schema=%s windows=5,10 model_file=%s predictions_file=%s rotate_max_bytes=%s",
+        "[SHADOW_ML_ROLLING_CONFIG] enabled=%s challenger_shadow_only=true "
+        "primary_probability_apply=%s auto_retrain=%s feature_profile=%s "
+        "rolling_schema=%s windows=5,10 model_file=%s predictions_file=%s "
+        "rotate_max_bytes=%s",
         ENABLE_SHADOW_ML_ROLLING_CHALLENGER,
+        ENABLE_ROLLING_ML_PRIMARY_PROBABILITY,
         SHADOW_ML_ROLLING_AUTO_RETRAIN,
         ROLLING_FEATURE_PROFILE,
         ROLLING_DYNAMICS_SCHEMA_VERSION,
