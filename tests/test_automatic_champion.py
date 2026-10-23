@@ -15,6 +15,7 @@ from wide_research.automatic_champion import (
     import_ready_discovery_evidence,
     retire_exhausted_discovery_nominations,
     select_ready_discovery_nominations,
+    select_ready_discovery_nominations_from_profiles,
 )
 from wide_research.portfolio import (
     FrozenPortfolioMember,
@@ -130,6 +131,102 @@ def _permissive_policy() -> AutomaticChampionPolicy:
         degradation_window=4,
         degradation_rate=0.5,
     )
+
+
+def test_mature_paused_discovery_rule_is_nominated_across_profiles(
+    tmp_path,
+) -> None:
+    rare = WideResearchStore(
+        tmp_path / "rare.sqlite3", allowed_root=tmp_path
+    )
+    rare.bind_profile("rare_precision_shadow")
+    precision = _source_store(tmp_path)
+    started = datetime.now(UTC) - timedelta(days=40)
+    mature = RuleManifest(
+        "wide-mature-paused",
+        "v1",
+        (Clause("bot.prob_to90", ">=", 88.0),),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+    weak_ready = RuleManifest(
+        "wide-weak-ready",
+        "v1",
+        (Clause("bot.prob_to90", ">=", 70.0),),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+    rare.register_rule_and_phase(
+        rule_id=mature.rule_id,
+        manifest=mature.as_dict(),
+        phase_id="wide-mature-paused:prospective",
+        status="shadow",
+        starts_at_utc=started.isoformat(),
+        policy={"prospective": True},
+        created_at_utc=started.isoformat(),
+    )
+    for index in range(200):
+        observed = started + timedelta(hours=index + 1)
+        observation_id = f"mature-{index}"
+        assert rare.claim_first_trigger(
+            phase_id="wide-mature-paused:prospective",
+            rule_id=mature.rule_id,
+            fixture_id=10_000 + index,
+            observation_id=observation_id,
+            triggered_at_utc=observed.isoformat(),
+            minute=50,
+            league=(index % 12) + 1,
+        )
+        rare.attach_outcomes(
+            {
+                "observation_id": observation_id,
+                "outcome_version": 1,
+                "outcome_status": "win" if index < 181 else "loss",
+                "outcome_at_utc": (
+                    observed + timedelta(hours=2)
+                ).isoformat(),
+                "payload": {"source": "mature_paused_test"},
+            }
+        )
+    rare.transition_phase(
+        "wide-mature-paused:prospective",
+        "paused",
+        expected_status="shadow",
+        reason="legacy_terminal_stop",
+    )
+    precision.register_rule_and_phase(
+        rule_id=weak_ready.rule_id,
+        manifest=weak_ready.as_dict(),
+        phase_id="wide-weak-ready:prospective",
+        status="ready",
+        starts_at_utc=started.isoformat(),
+        policy={"prospective": True},
+    )
+    target = _store(tmp_path)
+
+    selected = select_ready_discovery_nominations_from_profiles(
+        (
+            ("precision_shadow", precision),
+            ("rare_precision_shadow", rare),
+        ),
+        target_store=target,
+        existing_specs=(),
+        max_active=1,
+    )
+
+    assert len(selected) == 1
+    nomination = selected[0]
+    assert nomination.members[0].manifest == mature
+    assert nomination.members[0].source_profile == "rare_precision_shadow"
+    imported = import_ready_discovery_evidence(
+        rare,
+        target,
+        nomination,
+        family_id=discovery_nomination_family(nomination),
+    )
+    assert imported["claimed"] == 200
+    assert imported["outcomes"] == 200
+    metrics = target.metrics_for_phase(nomination.phase_id)
+    assert metrics["win"] == 181
+    assert metrics["loss"] == 19
 
 
 def test_ready_discovery_rule_is_frozen_into_a_fresh_duel(tmp_path) -> None:

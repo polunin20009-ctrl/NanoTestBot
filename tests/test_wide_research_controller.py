@@ -1090,6 +1090,94 @@ def test_staged_pool_keeps_strong_selection_collecting_past_first_look(
     assert capped["claimed"] == []
 
 
+def test_full_pool_yields_weaker_shadow_to_resume_paused_finalist(
+    tmp_path,
+) -> None:
+    store = WideResearchStore(tmp_path / "wide.sqlite3", allowed_root=tmp_path)
+    policy = replace(_policy(), min_resolved=2, allowed_looks=(2, 3))
+    pool_policy = {
+        "version": "wide_pool_lifecycle_v2",
+        "selection_look": 2,
+        "selection_min_hit_rate": 0.75,
+        "terminal_look": 3,
+        "max_age_days": 365,
+    }
+    importer = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        production_enabled=False,
+        policy=policy,
+        max_shadow_rules=2,
+        terminal_review_enabled=True,
+        terminal_review_min_hit_rate=0.75,
+        pool_lifecycle_policy=pool_policy,
+    )
+    imported = importer.import_report(
+        _generation_report("capacity-yield", "cap", 2),
+        imported_at_utc="2026-08-28T00:00:00+00:00",
+    )
+    phases = {row["rule_id"]: row for row in imported["imported"]}
+    finalist_id = phases["wide-cap-0"]["phase_id"]
+    weak_id = phases["wide-cap-1"]["phase_id"]
+    layer = WideShadowLayer(store, refresh_seconds=0)
+    # prob 70.5 matches only wide-cap-0 (>=70), not wide-cap-1 (>=71).
+    for index in range(2):
+        observed = datetime(2026, 8, 28, 12 + index, tzinfo=UTC)
+        snapshot = _snapshot(3400 + index, observed)
+        snapshot["probabilities"] = {"prob_to90": 70.5}
+        layer.process_snapshot(snapshot)
+        layer.process_outcomes(
+            [
+                {
+                    "observation_id": snapshot["observation_id"],
+                    "outcome_schema_version": 1,
+                    "created_at_utc": (
+                        observed + timedelta(hours=2)
+                    ).isoformat(),
+                    "outcome": {
+                        "status": "resolved",
+                        "goal_to90_normal_time": True,
+                        "resolved_at_utc": (
+                            observed + timedelta(hours=2)
+                        ).isoformat(),
+                    },
+                }
+            ]
+        )
+    # Force the classic stranded state: reviewable finalist paused, pool full.
+    store.transition_phase(
+        finalist_id,
+        "paused",
+        expected_status="shadow",
+        reason="legacy_terminal_stop",
+    )
+    assert store.list_phases(rule_id="wide-cap-1")[0]["status"] == "shadow"
+
+    controller = WideResearchController(
+        store,
+        active_manifest_path=str(tmp_path / "active.json"),
+        prospective_start_utc="2026-08-28T00:00:00+00:00",
+        production_enabled=False,
+        policy=policy,
+        max_shadow_rules=1,
+        terminal_review_enabled=True,
+        terminal_review_min_hit_rate=0.75,
+        pool_lifecycle_policy=pool_policy,
+    )
+    result = controller.reconcile(now_utc="2026-08-29T00:00:00+00:00")
+    by_phase = {row["phase_id"]: row for row in result["readiness"]}
+    assert store.list_phases(rule_id="wide-cap-0")[0]["status"] == "shadow"
+    assert store.list_phases(rule_id="wide-cap-1")[0]["status"] == "paused"
+    assert by_phase[finalist_id]["pool_capacity_yielded_phase_id"] == weak_id
+    assert store.has_phase_lifecycle_event(
+        weak_id, reason="pool_capacity_yielded_to_finalist"
+    )
+    assert store.has_phase_lifecycle_event(
+        finalist_id, reason="terminal_review_finalist_resumed"
+    )
+
+
 def test_staged_terminal_review_continues_reviewable_hard_shadow(
     tmp_path,
 ) -> None:
