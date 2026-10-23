@@ -27819,8 +27819,17 @@ def reconcile_pending_decision_outcomes(
             retry_ids = set(_second_half_incomplete_retry)
         missing_second_half_ids.update(retry_ids - stored_second_half_ids)
         _prune_second_half_incomplete_retries(stored_second_half_ids)
+    # Oldest unresolved evidence first so interrupted/stuck fixtures are not
+    # starved behind a rotating set of newer pending ids under the reconcile limit.
     prioritized_fixture_ids = [
-        *sorted(pending_fixture_ids),
+        *sorted(
+            pending_fixture_ids,
+            key=lambda fixture_id: (
+                pending_observation_times.get(int(fixture_id))
+                or "9999-12-31T00:00:00Z",
+                int(fixture_id),
+            ),
+        ),
         *sorted(missing_second_half_ids - pending_fixture_ids),
     ]
     for fixture_id in prioritized_fixture_ids:

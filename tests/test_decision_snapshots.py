@@ -944,6 +944,55 @@ def test_reconciler_marks_cancelled_or_interrupted_fixture_void(
     assert joined[0]["outcome"]["void_reason"] == void_reason
 
 
+def test_reconciler_prioritizes_oldest_pending_observation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _configure_store(monkeypatch, tmp_path)
+    monkeypatch.setattr(nanotest, "ENABLE_OBSERVATION_HISTORY", True)
+    monkeypatch.setattr(nanotest, "DECISION_OUTCOME_RECONCILE_LIMIT", 1)
+    nanotest._decision_outcome_last_checked.clear()
+
+    newer = nanotest.build_prefilter_observation(
+        fixture_id=10,
+        minute=46,
+        reason="candidate",
+        raw_fixture={
+            "fixture": {"id": 10, "status": {"short": "2H"}},
+            "goals": {"home": 0, "away": 0},
+        },
+    )
+    newer["created_at_utc"] = "2026-10-23T15:00:00+00:00"
+    older = nanotest.build_prefilter_observation(
+        fixture_id=999999,
+        minute=46,
+        reason="candidate",
+        raw_fixture={
+            "fixture": {"id": 999999, "status": {"short": "2H"}},
+            "goals": {"home": 0, "away": 0},
+        },
+    )
+    older["created_at_utc"] = "2026-10-14T14:29:31+00:00"
+    assert nanotest.append_observation_history(newer) is True
+    assert nanotest.append_observation_history(older) is True
+
+    fetched: list[int] = []
+
+    class Client:
+        def fetch_fixture(self, fixture_id: int) -> dict:
+            fetched.append(int(fixture_id))
+            return {
+                "fixture": {"id": fixture_id, "status": {"short": "INT"}},
+            }
+
+    summary = nanotest.reconcile_pending_decision_outcomes(
+        Client(), set(), now_ts=1_000.0
+    )
+
+    assert fetched == [999999]
+    assert summary["void_fixtures"] == 1
+    assert summary["checked"] == 1
+
+
 def test_reconciler_voids_old_evidence_when_fixture_id_is_rescheduled(
     monkeypatch, tmp_path: Path
 ) -> None:
