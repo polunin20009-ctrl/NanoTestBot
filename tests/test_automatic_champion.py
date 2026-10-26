@@ -839,7 +839,7 @@ def test_invalid_atomic_replacement_rolls_back_everything(tmp_path) -> None:
     assert phases[challenger.rule_id]["status"] == "retired"
 
 
-def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
+def test_degraded_champion_stays_without_baseline_fallback(tmp_path) -> None:
     baseline = _spec("baseline", 0.0)
     challenger = _spec("challenger", 80.0)
     specs = (baseline, challenger)
@@ -847,13 +847,21 @@ def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
     store = _store(tmp_path)
     layer = AutomaticChampionLayer(store, specs, families=families)
     started = datetime.now(UTC) + timedelta(seconds=1)
+    policy = AutomaticChampionPolicy(
+        **{
+            **_permissive_policy().manifest(),
+            # Keep the production margin so a tied/weak baseline cannot reclaim
+            # the crown as an ordinary challenger during this isolation test.
+            "superiority_margin": 0.02,
+        }
+    )
     controller = AutomaticChampionController(
         store,
         specs,
         families=families,
         baseline_portfolio_id="baseline",
         production_enabled=True,
-        policy=_permissive_policy(),
+        policy=policy,
     )
     controller.reconcile(now_utc=started.isoformat())
 
@@ -881,7 +889,11 @@ def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
         now_utc=(started + timedelta(days=8)).isoformat()
     )
     assert promoted["active_portfolio_id"] == "challenger"
+    promoted_since = promoted["active_since_utc"]
 
+    # Bad streak for the live champion only. Do not feed the baseline extra
+    # wins: otherwise it can "fairly" reclaim the crown as a normal challenger
+    # and the test would no longer isolate the removed fallback path.
     for index, won in enumerate((False, False, False, True)):
         observed = started + timedelta(days=9 + index)
         snapshot = _snapshot(
@@ -892,34 +904,20 @@ def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
         )
         layer.process_snapshot(snapshot)
         _resolve(layer, snapshot, observed, won=won)
-        baseline_only_observed = observed + timedelta(hours=1)
-        baseline_only = _snapshot(
-            550 + index,
-            50.0,
-            baseline_only_observed,
-            league_id=(index % 2) + 1,
-        )
-        layer.process_snapshot(baseline_only)
-        _resolve(
-            layer,
-            baseline_only,
-            baseline_only_observed,
-            won=True,
-        )
 
-    recovered = controller.reconcile(
+    held = controller.reconcile(
         now_utc=(started + timedelta(days=14)).isoformat()
     )
 
-    assert recovered["switched"] is True
-    assert recovered["switch_reason"] == "degraded_champion_fallback"
-    assert recovered["degradation_fallback"] is True
-    assert recovered["active_portfolio_id"] == "baseline"
-    assert recovered["publication_suspended"] is False
+    assert held["switched"] is False
+    assert held["degradation_fallback"] is False
+    assert held["active_degraded"] is True
+    assert held["active_portfolio_id"] == "challenger"
+    assert held["active_since_utc"] == promoted_since
+    assert held["publication_suspended"] is False
     pointer = store.get_active_pointer("automatic_publication_champion")
-    assert pointer["rule_id"] == baseline.rule_id
-    assert pointer["payload"]["publication_suspended"] is False
-    assert controller.active_selection().spec.portfolio_id == "baseline"
+    assert pointer["rule_id"] == challenger.rule_id
+    assert controller.active_selection().spec.portfolio_id == "challenger"
 
 
 def test_degraded_baseline_suspends_until_hysteresis_recovery(tmp_path) -> None:

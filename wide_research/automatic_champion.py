@@ -1246,30 +1246,10 @@ class AutomaticChampionController:
         degradation_detected = bool(
             active_metrics_before.get("degraded")
         )
-        degradation_fallback = bool(
-            degradation_detected
-            and active_rule_id != self.baseline.rule_id
-            and not contract_reasons
-        )
-        if degradation_fallback:
-            baseline_evaluation = next(
-                (
-                    row
-                    for row in evaluations
-                    if row.get("rule_id") == self.baseline.rule_id
-                ),
-                None,
-            )
-            if baseline_evaluation is None:
-                contract_reasons.append("baseline_evaluation_missing")
-                recommended = None
-                degradation_fallback = False
-            else:
-                recommended = {
-                    **baseline_evaluation,
-                    "eligible": True,
-                    "reasons": ["degraded_champion_fallback"],
-                }
+        # Degraded champions stay on the throne until a prospective challenger
+        # wins fairly. Auto-falling back to a "stable" baseline reset every
+        # challenger's comparison window and erased hard-earned duel progress.
+        degradation_fallback = False
 
         was_suspended = bool(payload.get("publication_suspended"))
         active_recovered = bool(
@@ -1284,11 +1264,7 @@ class AutomaticChampionController:
         if recommended is not None and self.production_enabled:
             previous_rule_id = active_rule_id
             now_text = _utc_iso(now)
-            switch_reason = (
-                "degraded_champion_fallback"
-                if degradation_fallback
-                else "prospective_challenger_superior"
-            )
+            switch_reason = "prospective_challenger_superior"
             decision = {
                 "reason": switch_reason,
                 "from_rule_id": active_rule_id,
@@ -1307,22 +1283,13 @@ class AutomaticChampionController:
                 ),
                 "required_superiority_probability": None,
             }
-            target_degraded = bool(
-                _mapping(recommended.get("metrics")).get("degraded")
-            )
             metadata = self._pointer_metadata(
                 selector_started_at_utc=_utc_iso(selector_started),
                 active_since_utc=now_text,
                 previous_rule_id=active_rule_id,
                 decision=decision,
-                publication_suspended=bool(
-                    degradation_fallback and target_degraded
-                ),
-                suspension_reason=(
-                    "baseline_degraded"
-                    if degradation_fallback and target_degraded
-                    else None
-                ),
+                publication_suspended=False,
+                suspension_reason=None,
             )
             transaction = self.store.swap_active_pointer(
                 self.pointer_name,
