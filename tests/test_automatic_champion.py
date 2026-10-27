@@ -15,6 +15,7 @@ from wide_research.automatic_champion import (
     import_ready_discovery_evidence,
     retire_exhausted_discovery_nominations,
     select_ready_discovery_nominations,
+    select_ready_discovery_nominations_from_profiles,
 )
 from wide_research.portfolio import (
     FrozenPortfolioMember,
@@ -130,6 +131,102 @@ def _permissive_policy() -> AutomaticChampionPolicy:
         degradation_window=4,
         degradation_rate=0.5,
     )
+
+
+def test_mature_paused_discovery_rule_is_nominated_across_profiles(
+    tmp_path,
+) -> None:
+    rare = WideResearchStore(
+        tmp_path / "rare.sqlite3", allowed_root=tmp_path
+    )
+    rare.bind_profile("rare_precision_shadow")
+    precision = _source_store(tmp_path)
+    started = datetime.now(UTC) - timedelta(days=40)
+    mature = RuleManifest(
+        "wide-mature-paused",
+        "v1",
+        (Clause("bot.prob_to90", ">=", 88.0),),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+    weak_ready = RuleManifest(
+        "wide-weak-ready",
+        "v1",
+        (Clause("bot.prob_to90", ">=", 70.0),),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+    rare.register_rule_and_phase(
+        rule_id=mature.rule_id,
+        manifest=mature.as_dict(),
+        phase_id="wide-mature-paused:prospective",
+        status="shadow",
+        starts_at_utc=started.isoformat(),
+        policy={"prospective": True},
+        created_at_utc=started.isoformat(),
+    )
+    for index in range(200):
+        observed = started + timedelta(hours=index + 1)
+        observation_id = f"mature-{index}"
+        assert rare.claim_first_trigger(
+            phase_id="wide-mature-paused:prospective",
+            rule_id=mature.rule_id,
+            fixture_id=10_000 + index,
+            observation_id=observation_id,
+            triggered_at_utc=observed.isoformat(),
+            minute=50,
+            league=(index % 12) + 1,
+        )
+        rare.attach_outcomes(
+            {
+                "observation_id": observation_id,
+                "outcome_version": 1,
+                "outcome_status": "win" if index < 181 else "loss",
+                "outcome_at_utc": (
+                    observed + timedelta(hours=2)
+                ).isoformat(),
+                "payload": {"source": "mature_paused_test"},
+            }
+        )
+    rare.transition_phase(
+        "wide-mature-paused:prospective",
+        "paused",
+        expected_status="shadow",
+        reason="legacy_terminal_stop",
+    )
+    precision.register_rule_and_phase(
+        rule_id=weak_ready.rule_id,
+        manifest=weak_ready.as_dict(),
+        phase_id="wide-weak-ready:prospective",
+        status="ready",
+        starts_at_utc=started.isoformat(),
+        policy={"prospective": True},
+    )
+    target = _store(tmp_path)
+
+    selected = select_ready_discovery_nominations_from_profiles(
+        (
+            ("precision_shadow", precision),
+            ("rare_precision_shadow", rare),
+        ),
+        target_store=target,
+        existing_specs=(),
+        max_active=1,
+    )
+
+    assert len(selected) == 1
+    nomination = selected[0]
+    assert nomination.members[0].manifest == mature
+    assert nomination.members[0].source_profile == "rare_precision_shadow"
+    imported = import_ready_discovery_evidence(
+        rare,
+        target,
+        nomination,
+        family_id=discovery_nomination_family(nomination),
+    )
+    assert imported["claimed"] == 200
+    assert imported["outcomes"] == 200
+    metrics = target.metrics_for_phase(nomination.phase_id)
+    assert metrics["win"] == 181
+    assert metrics["loss"] == 19
 
 
 def test_ready_discovery_rule_is_frozen_into_a_fresh_duel(tmp_path) -> None:
@@ -742,7 +839,7 @@ def test_invalid_atomic_replacement_rolls_back_everything(tmp_path) -> None:
     assert phases[challenger.rule_id]["status"] == "retired"
 
 
-def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
+def test_degraded_champion_stays_without_baseline_fallback(tmp_path) -> None:
     baseline = _spec("baseline", 0.0)
     challenger = _spec("challenger", 80.0)
     specs = (baseline, challenger)
@@ -750,13 +847,21 @@ def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
     store = _store(tmp_path)
     layer = AutomaticChampionLayer(store, specs, families=families)
     started = datetime.now(UTC) + timedelta(seconds=1)
+    policy = AutomaticChampionPolicy(
+        **{
+            **_permissive_policy().manifest(),
+            # Keep the production margin so a tied/weak baseline cannot reclaim
+            # the crown as an ordinary challenger during this isolation test.
+            "superiority_margin": 0.02,
+        }
+    )
     controller = AutomaticChampionController(
         store,
         specs,
         families=families,
         baseline_portfolio_id="baseline",
         production_enabled=True,
-        policy=_permissive_policy(),
+        policy=policy,
     )
     controller.reconcile(now_utc=started.isoformat())
 
@@ -784,7 +889,11 @@ def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
         now_utc=(started + timedelta(days=8)).isoformat()
     )
     assert promoted["active_portfolio_id"] == "challenger"
+    promoted_since = promoted["active_since_utc"]
 
+    # Bad streak for the live champion only. Do not feed the baseline extra
+    # wins: otherwise it can "fairly" reclaim the crown as a normal challenger
+    # and the test would no longer isolate the removed fallback path.
     for index, won in enumerate((False, False, False, True)):
         observed = started + timedelta(days=9 + index)
         snapshot = _snapshot(
@@ -795,34 +904,20 @@ def test_degraded_champion_returns_to_baseline_atomically(tmp_path) -> None:
         )
         layer.process_snapshot(snapshot)
         _resolve(layer, snapshot, observed, won=won)
-        baseline_only_observed = observed + timedelta(hours=1)
-        baseline_only = _snapshot(
-            550 + index,
-            50.0,
-            baseline_only_observed,
-            league_id=(index % 2) + 1,
-        )
-        layer.process_snapshot(baseline_only)
-        _resolve(
-            layer,
-            baseline_only,
-            baseline_only_observed,
-            won=True,
-        )
 
-    recovered = controller.reconcile(
+    held = controller.reconcile(
         now_utc=(started + timedelta(days=14)).isoformat()
     )
 
-    assert recovered["switched"] is True
-    assert recovered["switch_reason"] == "degraded_champion_fallback"
-    assert recovered["degradation_fallback"] is True
-    assert recovered["active_portfolio_id"] == "baseline"
-    assert recovered["publication_suspended"] is False
+    assert held["switched"] is False
+    assert held["degradation_fallback"] is False
+    assert held["active_degraded"] is True
+    assert held["active_portfolio_id"] == "challenger"
+    assert held["active_since_utc"] == promoted_since
+    assert held["publication_suspended"] is False
     pointer = store.get_active_pointer("automatic_publication_champion")
-    assert pointer["rule_id"] == baseline.rule_id
-    assert pointer["payload"]["publication_suspended"] is False
-    assert controller.active_selection().spec.portfolio_id == "baseline"
+    assert pointer["rule_id"] == challenger.rule_id
+    assert controller.active_selection().spec.portfolio_id == "challenger"
 
 
 def test_degraded_baseline_suspends_until_hysteresis_recovery(tmp_path) -> None:

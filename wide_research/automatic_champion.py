@@ -36,6 +36,9 @@ AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v4"
 AUTOMATIC_CHAMPION_POINTER = "automatic_publication_champion"
 AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION = 1
 DISCOVERY_NOMINATION_PREFIX = "discovery-ready-"
+DISCOVERY_NOMINATION_SOURCE_STATUSES = ("ready", "shadow", "paused")
+DISCOVERY_NOMINATION_MIN_RESOLVED = 200
+DISCOVERY_NOMINATION_MIN_HIT_RATE = 0.86
 
 
 class AutomaticChampionUnavailable(RuntimeError):
@@ -303,6 +306,44 @@ def load_discovery_nomination_specs(
     return tuple(specs)
 
 
+def _discovery_nomination_phase_metrics(
+    source_store: WideResearchStore,
+    phase: Mapping[str, Any],
+) -> tuple[int, int, float]:
+    wins = 0
+    losses = 0
+    resolved = 0
+    for trigger in source_store.list_triggers(
+        phase_id=str(phase.get("phase_id") or "")
+    ):
+        status = str(trigger.get("latest_outcome_status") or "pending")
+        if status not in {"win", "loss", "invalid"}:
+            continue
+        resolved += 1
+        wins += int(status == "win")
+        losses += int(status == "loss")
+    scored = wins + losses
+    hit_rate = wins / scored if scored else 0.0
+    return wins, resolved, hit_rate
+
+
+def _discovery_nomination_qualifies(
+    *,
+    status: str,
+    resolved: int,
+    hit_rate: float,
+    min_resolved: int,
+    min_hit_rate: float,
+) -> bool:
+    # READY already passed the certificate path; keep those eligible.
+    if status == "ready":
+        return True
+    return (
+        resolved >= int(min_resolved)
+        and hit_rate + 1e-12 >= float(min_hit_rate)
+    )
+
+
 def select_ready_discovery_nominations(
     source_store: WideResearchStore,
     *,
@@ -310,8 +351,40 @@ def select_ready_discovery_nominations(
     source_profile: str,
     existing_specs: Sequence[FrozenPortfolioSpec],
     max_active: int,
+    min_resolved: int = DISCOVERY_NOMINATION_MIN_RESOLVED,
+    min_hit_rate: float = DISCOVERY_NOMINATION_MIN_HIT_RATE,
+    source_statuses: Sequence[str] = DISCOVERY_NOMINATION_SOURCE_STATUSES,
 ) -> tuple[FrozenPortfolioSpec, ...]:
-    """Select the strongest READY rules for currently available duel slots."""
+    """Select the strongest mature discovery rules for open duel slots.
+
+    READY phases remain eligible. Shadow/paused phases also qualify once they
+    clear the staged pool bar (default: 200 resolved at ≥86% hit-rate) so a
+    strong finalist paused under an older gate is not stranded outside the
+    automatic champion catalog.
+    """
+
+    return select_ready_discovery_nominations_from_profiles(
+        ((str(source_profile), source_store),),
+        target_store=target_store,
+        existing_specs=existing_specs,
+        max_active=max_active,
+        min_resolved=min_resolved,
+        min_hit_rate=min_hit_rate,
+        source_statuses=source_statuses,
+    )
+
+
+def select_ready_discovery_nominations_from_profiles(
+    sources: Sequence[tuple[str, WideResearchStore]],
+    *,
+    target_store: WideResearchStore,
+    existing_specs: Sequence[FrozenPortfolioSpec],
+    max_active: int,
+    min_resolved: int = DISCOVERY_NOMINATION_MIN_RESOLVED,
+    min_hit_rate: float = DISCOVERY_NOMINATION_MIN_HIT_RATE,
+    source_statuses: Sequence[str] = DISCOVERY_NOMINATION_SOURCE_STATUSES,
+) -> tuple[FrozenPortfolioSpec, ...]:
+    """Rank mature rules across discovery stores into the remaining duel slots."""
 
     limit = max(0, int(max_active))
     admitted_keys = {
@@ -331,41 +404,54 @@ def select_ready_discovery_nominations(
         in {"candidate", "shadow", "ready", "active"}
     )
     available = max(0, limit - active_dynamic)
-    if available == 0:
+    if available == 0 or not sources:
         return ()
 
-    ranked: list[tuple[tuple[Any, ...], Mapping[str, Any]]] = []
-    for phase in source_store.list_phases(statuses=("ready",)):
-        key = (str(source_profile), str(phase.get("rule_id") or ""))
-        if key in admitted_keys:
-            continue
-        wins = 0
-        resolved = 0
-        for trigger in source_store.list_triggers(
-            phase_id=str(phase.get("phase_id") or "")
-        ):
-            status = str(trigger.get("latest_outcome_status") or "pending")
-            if status not in {"win", "loss", "invalid"}:
-                continue
-            resolved += 1
-            wins += int(status == "win")
-        lower, _upper = wilson_interval(wins, resolved)
-        ranked.append(
-            (
-                (
-                    -float(lower),
-                    -(wins / resolved if resolved else 0.0),
-                    -resolved,
-                    str(phase.get("rule_id") or ""),
-                ),
-                phase,
-            )
+    statuses = tuple(
+        dict.fromkeys(
+            str(status).lower()
+            for status in source_statuses
+            if str(status).strip()
         )
+    )
+    ranked: list[tuple[tuple[Any, ...], str, Mapping[str, Any]]] = []
+    for source_profile, source_store in sources:
+        profile = str(source_profile)
+        for phase in source_store.list_phases(statuses=statuses):
+            rule_id = str(phase.get("rule_id") or "")
+            key = (profile, rule_id)
+            if key in admitted_keys:
+                continue
+            status = str(phase.get("status") or "")
+            wins, resolved, hit_rate = _discovery_nomination_phase_metrics(
+                source_store, phase
+            )
+            if not _discovery_nomination_qualifies(
+                status=status,
+                resolved=resolved,
+                hit_rate=hit_rate,
+                min_resolved=min_resolved,
+                min_hit_rate=min_hit_rate,
+            ):
+                continue
+            lower, _upper = wilson_interval(wins, resolved)
+            ranked.append(
+                (
+                    (
+                        -float(lower),
+                        -float(hit_rate),
+                        -int(resolved),
+                        profile,
+                        rule_id,
+                    ),
+                    profile,
+                    phase,
+                )
+            )
     ranked.sort(key=lambda item: item[0])
 
     selected = []
-    profile_slug = str(source_profile).replace("_", "-")
-    for _score, phase in ranked[:available]:
+    for _score, source_profile, phase in ranked[:available]:
         manifest_payload = phase.get("manifest")
         if not isinstance(manifest_payload, Mapping):
             continue
@@ -375,6 +461,7 @@ def select_ready_discovery_nominations(
             source_store_hash=str(phase.get("manifest_hash") or ""),
             manifest=manifest,
         )
+        profile_slug = str(source_profile).replace("_", "-")
         selected.append(
             FrozenPortfolioSpec(
                 portfolio_id=(
@@ -395,19 +482,23 @@ def import_ready_discovery_evidence(
     *,
     family_id: str,
 ) -> dict[str, int]:
-    """Copy already prospective READY evidence into the direct duel book.
+    """Copy already prospective mature evidence into the direct duel book.
 
-    Discovery history before the source phase remains excluded. The copied
-    rows retain their original observation identities and outcome versions, so
-    retries are idempotent and corrections continue to reconcile normally.
+    READY and pool-mature shadow/paused sources are accepted. Discovery history
+    before the source phase remains excluded. The copied rows retain their
+    original observation identities and outcome versions, so retries are
+    idempotent and corrections continue to reconcile normally.
     """
 
     source_profile, source_rule_id = discovery_nomination_source_key(spec)
     source_rows = source_store.list_phases(
-        statuses=("ready",), rule_id=source_rule_id
+        statuses=DISCOVERY_NOMINATION_SOURCE_STATUSES,
+        rule_id=source_rule_id,
     )
     if len(source_rows) != 1:
-        raise ValueError("discovery nomination source is not uniquely READY")
+        raise ValueError(
+            "discovery nomination source is not uniquely mature/READY"
+        )
     source_phase = source_rows[0]
     target_store.register_rule_and_phase(
         rule_id=spec.rule_id,
@@ -423,6 +514,7 @@ def import_ready_discovery_evidence(
                 "ready_evidence_imported": True,
                 "source_profile": source_profile,
                 "source_phase_id": str(source_phase["phase_id"]),
+                "source_status": str(source_phase.get("status") or ""),
             },
             "production_applied": False,
         },
@@ -1154,30 +1246,10 @@ class AutomaticChampionController:
         degradation_detected = bool(
             active_metrics_before.get("degraded")
         )
-        degradation_fallback = bool(
-            degradation_detected
-            and active_rule_id != self.baseline.rule_id
-            and not contract_reasons
-        )
-        if degradation_fallback:
-            baseline_evaluation = next(
-                (
-                    row
-                    for row in evaluations
-                    if row.get("rule_id") == self.baseline.rule_id
-                ),
-                None,
-            )
-            if baseline_evaluation is None:
-                contract_reasons.append("baseline_evaluation_missing")
-                recommended = None
-                degradation_fallback = False
-            else:
-                recommended = {
-                    **baseline_evaluation,
-                    "eligible": True,
-                    "reasons": ["degraded_champion_fallback"],
-                }
+        # Degraded champions stay on the throne until a prospective challenger
+        # wins fairly. Auto-falling back to a "stable" baseline reset every
+        # challenger's comparison window and erased hard-earned duel progress.
+        degradation_fallback = False
 
         was_suspended = bool(payload.get("publication_suspended"))
         active_recovered = bool(
@@ -1192,11 +1264,7 @@ class AutomaticChampionController:
         if recommended is not None and self.production_enabled:
             previous_rule_id = active_rule_id
             now_text = _utc_iso(now)
-            switch_reason = (
-                "degraded_champion_fallback"
-                if degradation_fallback
-                else "prospective_challenger_superior"
-            )
+            switch_reason = "prospective_challenger_superior"
             decision = {
                 "reason": switch_reason,
                 "from_rule_id": active_rule_id,
@@ -1215,22 +1283,13 @@ class AutomaticChampionController:
                 ),
                 "required_superiority_probability": None,
             }
-            target_degraded = bool(
-                _mapping(recommended.get("metrics")).get("degraded")
-            )
             metadata = self._pointer_metadata(
                 selector_started_at_utc=_utc_iso(selector_started),
                 active_since_utc=now_text,
                 previous_rule_id=active_rule_id,
                 decision=decision,
-                publication_suspended=bool(
-                    degradation_fallback and target_degraded
-                ),
-                suspension_reason=(
-                    "baseline_degraded"
-                    if degradation_fallback and target_degraded
-                    else None
-                ),
+                publication_suspended=False,
+                suspension_reason=None,
             )
             transaction = self.store.swap_active_pointer(
                 self.pointer_name,

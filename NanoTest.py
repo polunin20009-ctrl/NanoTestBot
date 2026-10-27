@@ -115,7 +115,12 @@ from wide_research.automatic_champion import (
     is_discovery_nomination,
     load_discovery_nomination_specs,
     retire_exhausted_discovery_nominations,
-    select_ready_discovery_nominations,
+    select_ready_discovery_nominations_from_profiles,
+)
+from wide_research.discovery_lift import (
+    DiscoveryLiftPolicy,
+    default_discovery_lift_state_path,
+    run_discovery_division_lift,
 )
 from wide_research.controller import (
     POOL_SELECTION_MIN_HIT_RATE,
@@ -1371,10 +1376,10 @@ ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS = _parse_env_bool(
 AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS = max(
     1,
     min(
-        1,
+        20,
         int(
             os.environ.get(
-                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "1"
+                "AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS", "20"
             )
         ),
     ),
@@ -1386,6 +1391,26 @@ AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON = max(
             "AUTOMATIC_PUBLICATION_DISCOVERY_TERMINAL_HORIZON", "200"
         )
     ),
+)
+ENABLE_DISCOVERY_DIVISION_LIFT = _parse_env_bool(
+    "ENABLE_DISCOVERY_DIVISION_LIFT", True
+)
+DISCOVERY_DIVISION_LIFT_DRY_RUN = _parse_env_bool(
+    "DISCOVERY_DIVISION_LIFT_DRY_RUN", False
+)
+DISCOVERY_DIVISION_LIFT_STATE_FILE = os.environ.get(
+    "DISCOVERY_DIVISION_LIFT_STATE_FILE",
+    str(default_discovery_lift_state_path()),
+)
+DISCOVERY_DIVISION_LIFT_MAX_SWAPS = max(
+    0,
+    min(
+        3,
+        int(os.environ.get("DISCOVERY_DIVISION_LIFT_MAX_SWAPS", "2")),
+    ),
+)
+DISCOVERY_DIVISION_LIFT_POLICY = DiscoveryLiftPolicy(
+    max_swaps_per_run=DISCOVERY_DIVISION_LIFT_MAX_SWAPS,
 )
 AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES = {
     "balanced-two-rule": "balanced-core",
@@ -23346,6 +23371,86 @@ def _automatic_publication_champion_specs() -> Tuple[
     return specs
 
 
+def _automatic_publication_nomination_sources() -> list[
+    Tuple[str, WideResearchStore]
+]:
+    """Research stores that may feed discovery challengers into D1."""
+
+    sources: list[Tuple[str, WideResearchStore]] = []
+    if not ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS:
+        return sources
+    if ENABLE_WIDE_RESEARCH_PRECISION:
+        sources.append(
+            (
+                "precision_shadow",
+                _get_wide_research_precision_components()[0],
+            )
+        )
+    if ENABLE_WIDE_RESEARCH_FOUR_FACTOR:
+        sources.append(
+            (
+                "exact_four_shadow",
+                _get_wide_research_four_factor_components()[0],
+            )
+        )
+    if ENABLE_WIDE_RESEARCH_RARE_PRECISION:
+        sources.append(
+            (
+                "rare_precision_shadow",
+                _get_wide_research_rare_precision_components()[0],
+            )
+        )
+    return sources
+
+
+def _run_automatic_publication_discovery_lift(
+    *,
+    champion_store: WideResearchStore,
+    decision: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Promote mature D2 rules into D1 by filling slots or relegating tails."""
+
+    if not ENABLE_DISCOVERY_DIVISION_LIFT or not decision:
+        return {"skipped": True}
+    sources = _automatic_publication_nomination_sources()
+    if not sources:
+        return {"skipped": True, "reason": "no_sources"}
+    fixed_specs = _automatic_publication_champion_specs()
+    persisted_dynamic = load_discovery_nomination_specs(champion_store)
+    result = run_discovery_division_lift(
+        sources,
+        target_store=champion_store,
+        existing_specs=fixed_specs + persisted_dynamic,
+        decision=decision,
+        state_path=DISCOVERY_DIVISION_LIFT_STATE_FILE,
+        policy=DISCOVERY_DIVISION_LIFT_POLICY,
+        max_active=AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS,
+        dry_run=DISCOVERY_DIVISION_LIFT_DRY_RUN,
+    )
+    applied = list(result.get("applied") or [])
+    planned = list(result.get("planned") or [])
+    if applied or planned or result.get("throttled") or result.get("errors"):
+        logger.info(
+            "[DISCOVERY_DIVISION_LIFT] dry_run=%s throttled=%s "
+            "planned=%s applied=%s errors=%s",
+            bool(result.get("dry_run")),
+            bool(result.get("throttled")),
+            len(planned),
+            len(applied),
+            len(list(result.get("errors") or [])),
+        )
+    for row in applied:
+        logger.info(
+            "[DISCOVERY_DIVISION_LIFT_SWAP] mode=%s candidate=%s "
+            "incumbent=%s portfolio_id=%s",
+            row.get("mode"),
+            (row.get("candidate") or {}).get("source_key"),
+            ((row.get("incumbent") or {}) or {}).get("source_key"),
+            row.get("portfolio_id"),
+        )
+    return result
+
+
 def _get_automatic_publication_champion_components(
     *, refresh_nominations: bool = False
 ) -> Tuple[
@@ -23387,21 +23492,20 @@ def _get_automatic_publication_champion_components(
         fixed_specs = _automatic_publication_champion_specs()
         persisted_dynamic = load_discovery_nomination_specs(store)
         selected: Tuple[FrozenPortfolioSpec, ...] = ()
-        precision_store: Optional[WideResearchStore] = None
-        if (
-            ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS
-            and ENABLE_WIDE_RESEARCH_PRECISION
-        ):
-            precision_store = _get_wide_research_precision_components()[0]
-            selected = select_ready_discovery_nominations(
-                precision_store,
+        nomination_sources = _automatic_publication_nomination_sources()
+        if nomination_sources:
+            selected = select_ready_discovery_nominations_from_profiles(
+                nomination_sources,
                 target_store=store,
-                source_profile="precision_shadow",
                 existing_specs=fixed_specs + persisted_dynamic,
                 max_active=(
                     AUTOMATIC_PUBLICATION_DISCOVERY_MAX_CHALLENGERS
                 ),
             )
+        source_stores = {
+            profile: source_store
+            for profile, source_store in nomination_sources
+        }
         dynamic_specs = tuple(
             sorted(
                 (*persisted_dynamic, *selected),
@@ -23413,21 +23517,25 @@ def _get_automatic_publication_champion_components(
         for spec in specs:
             if is_discovery_nomination(spec):
                 families[spec.portfolio_id] = discovery_nomination_family(spec)
-        if precision_store is not None:
-            for spec in selected:
-                imported = import_ready_discovery_evidence(
-                    precision_store,
-                    store,
-                    spec,
-                    family_id=families[spec.portfolio_id],
-                )
-                logger.info(
-                    "[AUTOMATIC_CHAMPION_NOMINATION] portfolio_id=%s "
-                    "claimed=%s outcomes=%s source=precision_ready",
-                    spec.portfolio_id,
-                    imported.get("claimed"),
-                    imported.get("outcomes"),
-                )
+        for spec in selected:
+            source_profile = str(spec.members[0].source_profile)
+            source_store = source_stores.get(source_profile)
+            if source_store is None:
+                continue
+            imported = import_ready_discovery_evidence(
+                source_store,
+                store,
+                spec,
+                family_id=families[spec.portfolio_id],
+            )
+            logger.info(
+                "[AUTOMATIC_CHAMPION_NOMINATION] portfolio_id=%s "
+                "claimed=%s outcomes=%s source_profile=%s",
+                spec.portfolio_id,
+                imported.get("claimed"),
+                imported.get("outcomes"),
+                source_profile,
+            )
         phase_statuses = {
             str(row.get("rule_id") or ""): str(row.get("status") or "")
             for row in store.list_phases()
@@ -25549,6 +25657,10 @@ def _wide_research_discovery_next_delay(
 
 
 def wide_research_daemon() -> None:
+    global _automatic_publication_champion_layer
+    global _automatic_publication_champion_controller
+    global _automatic_publication_champion_signature
+
     logger.info(
         "[WIDE_RESEARCH_DAEMON] started primary_enabled=%s "
         "auto_discovery=%s auto_lifecycle=%s production_apply=%s "
@@ -25615,14 +25727,27 @@ def wide_research_daemon() -> None:
                         ),
                     )
                 )
+                lift_result = _run_automatic_publication_discovery_lift(
+                    champion_store=champion_store,
+                    decision=decision,
+                )
+                if lift_result.get("applied"):
+                    _automatic_publication_champion_layer = None
+                    _automatic_publication_champion_controller = None
+                    _automatic_publication_champion_signature = None
+                    _get_automatic_publication_champion_components(
+                        refresh_nominations=True
+                    )
                 logger.info(
                     "[AUTOMATIC_CHAMPION_RECOVERY] recovery=%s "
-                    "active=%s recommended=%s switched=%s retired=%s",
+                    "active=%s recommended=%s switched=%s retired=%s "
+                    "lift_applied=%s",
                     recovery,
                     decision.get("active_portfolio_id"),
                     decision.get("recommended_portfolio_id"),
                     decision.get("switched"),
                     len(retired_nominations),
+                    len(list(lift_result.get("applied") or [])),
                 )
         except Exception:
             logger.exception(
@@ -26155,11 +26280,27 @@ def wide_research_daemon() -> None:
                         if decision
                         else ()
                     )
+                    lift_result = (
+                        _run_automatic_publication_discovery_lift(
+                            champion_store=_champion_store,
+                            decision=decision,
+                        )
+                        if decision
+                        else {"skipped": True}
+                    )
+                    if lift_result.get("applied"):
+                        _automatic_publication_champion_layer = None
+                        _automatic_publication_champion_controller = None
+                        _automatic_publication_champion_signature = None
+                        _get_automatic_publication_champion_components(
+                            refresh_nominations=True
+                        )
                     if (
                         decision.get("switched")
                         or decision.get("recommended_rule_id")
                         or decision.get("status") == "blocked"
                         or retired_nominations
+                        or lift_result.get("applied")
                     ):
                         logger.info(
                             "[AUTOMATIC_CHAMPION_DECISION] active=%s "

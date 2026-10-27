@@ -1419,6 +1419,97 @@ class WideResearchController:
             self._discovery_rank_key(row),
         )
 
+    def _yield_pool_capacity_for_finalist(
+        self,
+        *,
+        phase_rows: Sequence[Mapping[str, Any]],
+        evidence: Mapping[str, tuple[dict[str, Any], Optional[int], float]],
+        finalist_phase_id: str,
+        finalist_hit_rate: float,
+        finalist_resolved: int,
+        now: datetime,
+    ) -> Optional[str]:
+        """Pause one weaker evaluated phase so a paused finalist can resume.
+
+        Pool capacity previously stranded high-hit-rate phases that were paused
+        under an older terminal gate (e.g. 90% at look 200) after the threshold
+        relaxed: every slot stayed occupied by active shadows.
+        """
+
+        victims: list[tuple[float, int, str, str]] = []
+        for row in phase_rows:
+            status = str(row.get("status") or "")
+            if status not in {"candidate", "shadow"}:
+                continue
+            phase_id = str(row.get("phase_id") or "")
+            if not phase_id or phase_id == finalist_phase_id:
+                continue
+            metrics = evidence.get(phase_id, ({}, None, 1.0))[0]
+            wins = int(metrics.get("wins") or 0)
+            losses = int(metrics.get("losses") or 0)
+            resolved = wins + losses
+            hit_rate = wins / resolved if resolved else -1.0
+            if hit_rate > float(finalist_hit_rate) + 1e-12:
+                continue
+            if (
+                abs(hit_rate - float(finalist_hit_rate)) <= 1e-12
+                and resolved >= int(finalist_resolved)
+            ):
+                continue
+            victims.append((hit_rate, resolved, phase_id, status))
+        if not victims:
+            return None
+        victims.sort(key=lambda item: (item[0], item[1], item[2]))
+        hit_rate, resolved, victim_id, victim_status = victims[0]
+        self.store.transition_phase(
+            victim_id,
+            "paused",
+            expected_status=victim_status,
+            reason="pool_capacity_yielded_to_finalist",
+            metadata={
+                "finalist_phase_id": finalist_phase_id,
+                "finalist_hit_rate": float(finalist_hit_rate),
+                "finalist_resolved": int(finalist_resolved),
+                "victim_hit_rate": (
+                    None if hit_rate < 0.0 else float(hit_rate)
+                ),
+                "victim_resolved": int(resolved),
+            },
+            changed_at_utc=_utc_iso(now),
+        )
+        # Keep the in-memory pool view coherent for later resumes in this pass.
+        for row in phase_rows:
+            if str(row.get("phase_id") or "") == victim_id:
+                if hasattr(row, "__setitem__"):
+                    row["status"] = "paused"
+                break
+        return victim_id
+
+    def _ensure_resume_slot(
+        self,
+        *,
+        available_resume_slots: int,
+        phase_rows: Sequence[Mapping[str, Any]],
+        evidence: Mapping[str, tuple[dict[str, Any], Optional[int], float]],
+        finalist_phase_id: str,
+        finalist_hit_rate: float,
+        finalist_resolved: int,
+        now: datetime,
+    ) -> tuple[int, Optional[str]]:
+        if available_resume_slots > 0:
+            return available_resume_slots, None
+        victim_id = self._yield_pool_capacity_for_finalist(
+            phase_rows=phase_rows,
+            evidence=evidence,
+            finalist_phase_id=finalist_phase_id,
+            finalist_hit_rate=finalist_hit_rate,
+            finalist_resolved=finalist_resolved,
+            now=now,
+        )
+        if victim_id is None:
+            return 0, None
+        return 1, victim_id
+
     @staticmethod
     def _prospective_metrics(
         triggers: Sequence[Mapping[str, Any]],
@@ -1996,6 +2087,18 @@ class WideResearchController:
             str(row.get("status")) in EVALUATED_STATUSES for row in phase_rows
         )
         available_resume_slots = max(0, self.max_shadow_rules - evaluated_count)
+
+        def _resume_priority(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            phase_id = str(row.get("phase_id") or "")
+            metrics = evidence.get(phase_id, ({}, None, 1.0))[0]
+            wins = int(metrics.get("wins") or 0)
+            losses = int(metrics.get("losses") or 0)
+            resolved = wins + losses
+            hit_rate = wins / resolved if resolved else -1.0
+            paused = 1 if str(row.get("status") or "") == "paused" else 0
+            return (-paused, -hit_rate, -resolved, phase_id)
+
+        review_phases.sort(key=_resume_priority)
         for phase in review_phases:
             phase_id = str(phase["phase_id"])
             metrics, milestone, _p_value = evidence[phase_id]
@@ -2157,6 +2260,21 @@ class WideResearchController:
                                 "pool_calendar_age_expired"
                             )
                             continue
+                        available_resume_slots, yielded_id = (
+                            self._ensure_resume_slot(
+                                available_resume_slots=available_resume_slots,
+                                phase_rows=phase_rows,
+                                evidence=evidence,
+                                finalist_phase_id=phase_id,
+                                finalist_hit_rate=float(hit_rate or 0.0),
+                                finalist_resolved=int(total),
+                                now=now,
+                            )
+                        )
+                        if yielded_id is not None:
+                            readiness[-1][
+                                "pool_capacity_yielded_phase_id"
+                            ] = yielded_id
                         if available_resume_slots <= 0:
                             readiness[-1]["resume_deferred"] = (
                                 "pool_capacity"
@@ -2171,6 +2289,15 @@ class WideResearchController:
                                 **terminal_disposition,
                                 "future_evidence_only": True,
                                 "pool_lifecycle": pool_lifecycle,
+                                **(
+                                    {
+                                        "pool_capacity_yielded_phase_id": (
+                                            yielded_id
+                                        )
+                                    }
+                                    if yielded_id is not None
+                                    else {}
+                                ),
                             },
                             changed_at_utc=_utc_iso(now),
                         )
@@ -2212,6 +2339,28 @@ class WideResearchController:
                             "pool_calendar_age_expired"
                         )
                         continue
+                    selection_hit_rate = pool_selection.get("hit_rate")
+                    available_resume_slots, yielded_id = (
+                        self._ensure_resume_slot(
+                            available_resume_slots=available_resume_slots,
+                            phase_rows=phase_rows,
+                            evidence=evidence,
+                            finalist_phase_id=phase_id,
+                            finalist_hit_rate=float(
+                                selection_hit_rate
+                                if selection_hit_rate is not None
+                                else 0.0
+                            ),
+                            finalist_resolved=int(
+                                pool_selection.get("resolved") or 0
+                            ),
+                            now=now,
+                        )
+                    )
+                    if yielded_id is not None:
+                        readiness[-1][
+                            "pool_capacity_yielded_phase_id"
+                        ] = yielded_id
                     if available_resume_slots <= 0:
                         readiness[-1]["resume_deferred"] = "pool_capacity"
                         continue
@@ -2224,6 +2373,15 @@ class WideResearchController:
                             "selection": pool_selection,
                             "pool_lifecycle": pool_lifecycle,
                             "future_evidence_only": True,
+                            **(
+                                {
+                                    "pool_capacity_yielded_phase_id": (
+                                        yielded_id
+                                    )
+                                }
+                                if yielded_id is not None
+                                else {}
+                            ),
                         },
                         changed_at_utc=_utc_iso(now),
                     )
