@@ -29319,6 +29319,7 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
             st.setdefault("normal_time_goal_events_after_signal", [])
             st.setdefault("extra_time_goal_events_after_signal", [])
             st.setdefault("shootout_events_excluded", 0)
+            st.setdefault("final_message_posted", False)
 
         try:
             init_home_i = int(init_score[0])
@@ -29474,6 +29475,47 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 "[NORMAL_TIME_SCORE_SOURCE] fixture_id=%s status=%s source=%s normal_time_score=%s-%s after_extra_time_score=None penalty_score=None",
                 match_id, status_short, normal_score_source, normal_score[0], normal_score[1],
             )
+            # Post the full final card immediately (before slow outcome writes).
+            # Never switch the Telegram message to the short
+            # "Основное время завершено" summary — users want the stats card
+            # with goals + final score in one step.
+            went_to_extra_time = bool(
+                is_extra_time_active(fixture) or is_shootout_active(fixture) or status_short in {"AET", "PEN"}
+            )
+            boundary_header = resolve_signal_header_title(
+                is_admin_approved=bool(st.get("approved_by_admin", False)),
+                signal_route=signal_route,
+                saved_header_text=saved_signal_header,
+            )
+            boundary_final_text = render_final_message(
+                {
+                    "data": data,
+                    "fixture_id": match_id,
+                    "signal_home": int(init_score[0]),
+                    "signal_away": int(init_score[1]),
+                    "final_home": int(normal_score[0]),
+                    "final_away": int(normal_score[1]),
+                    "goal_minutes": scored_goals_after_signal,
+                    "normal_time_result": normal_result,
+                    "normal_time_boundary_mode": NORMAL_TIME_BOUNDARY_MODE,
+                    "went_to_extra_time": went_to_extra_time and not is_finished,
+                },
+                header_text=boundary_header,
+            )
+            if edit_telegram_message_improved(boundary_final_text, match_id):
+                with state_lock:
+                    st["final_message_posted"] = True
+                    mark_state_dirty()
+                logger.info(
+                    "[MESSAGE_MODE] FINAL rendered match=%s header=\"%s\" final=%s-%s signal=%s-%s goals=%s source=normal_time_boundary",
+                    match_id,
+                    boundary_header,
+                    normal_score[0],
+                    normal_score[1],
+                    init_score[0],
+                    init_score[1],
+                    scored_goals_after_signal,
+                )
             try:
                 resolve_decision_snapshot_outcomes(
                     match_id, events, fixture_context, normal_score, resolved_at
@@ -29486,16 +29528,6 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 )
             except Exception:
                 logger.exception("[TRAINING_OUTCOME_V2] fixture_id=%s action=best_effort_failed", match_id)
-            boundary_header = resolve_signal_header_title(
-                is_admin_approved=bool(st.get("approved_by_admin", False)),
-                signal_route=signal_route,
-                saved_header_text=saved_signal_header,
-            )
-            boundary_text = render_normal_time_boundary_message(
-                boundary_header, normal_result, normal_score,
-                went_to_extra_time=is_extra_time_active(fixture) or is_shootout_active(fixture),
-            )
-            edit_telegram_message_improved(boundary_text, match_id)
         if isinstance(elapsed_label, str) and elapsed_label.strip().lower() in ("ft", "finished", "match finished"):
             is_finished = True
 
@@ -29632,18 +29664,31 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                 "normal_time_boundary_mode": NORMAL_TIME_BOUNDARY_MODE,
                 "went_to_extra_time": status_short in {"AET", "PEN"},
             }, header_text=header_text)
-            logger.info(
-                "[MESSAGE_MODE] FINAL rendered match=%s header=\"%s\" final=%s-%s signal=%s-%s goals=%s",
-                match_id,
-                header_text,
-                final_home,
-                final_away,
-                signal_home,
-                signal_away,
-                scored_goals_after_signal,
-            )
-
-            edited_final = edit_telegram_message_improved(msg, match_id)
+            already_posted = bool(st.get("final_message_posted"))
+            if already_posted:
+                logger.info(
+                    "[MESSAGE_MODE] FINAL skipped_tg match=%s header=\"%s\" final=%s-%s signal=%s-%s goals=%s reason=already_posted_at_boundary",
+                    match_id,
+                    header_text,
+                    final_home,
+                    final_away,
+                    signal_home,
+                    signal_away,
+                    scored_goals_after_signal,
+                )
+                edited_final = True
+            else:
+                logger.info(
+                    "[MESSAGE_MODE] FINAL rendered match=%s header=\"%s\" final=%s-%s signal=%s-%s goals=%s",
+                    match_id,
+                    header_text,
+                    final_home,
+                    final_away,
+                    signal_home,
+                    signal_away,
+                    scored_goals_after_signal,
+                )
+                edited_final = edit_telegram_message_improved(msg, match_id)
             if edited_final:
                 has_goal_after_signal = determine_normal_time_goal_result(
                     signal_home,
