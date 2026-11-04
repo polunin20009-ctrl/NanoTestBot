@@ -6,6 +6,10 @@ from typing import Any, Mapping, Optional
 
 from .schema import DEFAULT_UNIVERSE, FAIL, PASS, UNAVAILABLE, UniverseSpec
 from .extended_features import EXTENDED_FEATURES, EXTENDED_FEATURE_NAMES, extend_values
+from .team_context import (
+    TEAM_CONTEXT_FEATURE_NAMES,
+    extend_team_context_values,
+)
 
 
 FEATURE_SCHEMA_VERSION = 2
@@ -127,6 +131,7 @@ def _allowed_feature_names() -> tuple[str, ...]:
             f"ml.{model}.{output_name}" for output_name in _ML_TARGETS.values()
         )
     names.extend(_COMPOSITE_FEATURES)
+    names.extend(TEAM_CONTEXT_FEATURE_NAMES)
     return tuple(sorted(names))
 
 
@@ -565,6 +570,7 @@ def extract_features(
     _extract_raw_metrics(snapshot, values)
     rolling_contract = _extract_rolling(snapshot, values)
     _extract_composites(values, rolling_contract)
+    extend_team_context_values(snapshot, values)
     static_causal = _extract_prediction(
         static_prediction,
         snapshot,

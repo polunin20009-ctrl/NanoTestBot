@@ -156,6 +156,7 @@ from wide_research.rules import rule_manifest_from_dict
 from wide_research.store import WideResearchStore
 from wide_research.health_runtime import ResearchHealthMonitor
 from wide_research.health_snapshot import ProfileSnapshotSpec
+from wide_research.team_context import build_team_context_payload
 from match_period import (
     EventTime,
     GoalScope,
@@ -16775,6 +16776,21 @@ def _build_observation_raw_metrics(
     return raw, availability, quality
 
 
+def _observation_team_context_from_probability(
+    probability_result: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return build_team_context_payload(
+        home_attack_factor=probability_result.get("home_attack_factor"),
+        home_defense_factor=probability_result.get("home_defense_factor"),
+        away_attack_factor=probability_result.get("away_attack_factor"),
+        away_defense_factor=probability_result.get("away_defense_factor"),
+        team_mix_factor=probability_result.get("team_mix_factor"),
+        home_matches=probability_result.get("home_matches"),
+        away_matches=probability_result.get("away_matches"),
+        league_factor=probability_result.get("league_factor"),
+    )
+
+
 def build_observation_from_decision(
     decision_snapshot: Dict[str, Any],
     fixture_metrics: Dict[str, Any],
@@ -16808,6 +16824,7 @@ def build_observation_from_decision(
         "raw_metrics": raw_metrics,
         "availability": availability,
         "data_quality": data_quality,
+        "team_context": _observation_team_context_from_probability(probability_result),
         "features": {
             "pressure_index": probability_result.get("pressure_index"),
             "pressure_components": dict(probability_result.get("pressure_components") or {}),
@@ -16940,6 +16957,7 @@ def build_wide_monitor_observation(
         "raw_metrics": raw_metrics,
         "availability": availability,
         "data_quality": data_quality,
+        "team_context": _observation_team_context_from_probability(probability_result),
         "features": {
             "pressure_index": probability_result.get("pressure_index"),
             "pressure_components": dict(
