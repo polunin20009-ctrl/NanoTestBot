@@ -41,6 +41,7 @@ from .rules import Clause as ManifestClause
 from .rules import RuleManifest
 from .schema import PASS, UniverseSpec
 from .extended_features import EXTENDED_FEATURE_NAMES, EXTENDED_FEATURES, PRODUCTS, PRIMITIVES, has_market_dependency
+from .team_context import TEAM_CONTEXT_FEATURE_NAMES
 from market_benchmark.research import freeze_market_context, HISTORY_SECONDS
 from outcome_revision import outcome_rank
 
@@ -158,11 +159,19 @@ PRECISION_COMPOSITE_THRESHOLD_GRIDS: Mapping[
     "score.goal_difference_abs": ("<=", (0.0, 1.0, 2.0)),
     "composite.base_quality_v1": (">=", (1.0,)),
     "rolling.both_windows_available_v1": (">=", (1.0,)),
+    # Team/competition class atoms: fixed grids only (no train quantiles for
+    # binaries; continuous mix/gap use a small pre-registered ladder).
+    "team_context.v1.attack_mix": (">=", (0.95, 1.0, 1.05, 1.10, 1.15)),
+    "team_context.v1.trailing_favorite": (">=", (1.0,)),
+    "team_context.v1.away_urgency": (">=", (1.0,)),
+    "competition.v1.cup_or_europe": (">=", (1.0,)),
+    "matchup.v1.quality_gap": (">=", (0.02, 0.05, 0.08, 0.10, 0.15)),
 }
 PRECISION_FIXED_ONLY_FEATURES = frozenset(
     {
         "composite.base_quality_v1",
         "rolling.both_windows_available_v1",
+        *TEAM_CONTEXT_FEATURE_NAMES,
     }
 )
 
