@@ -1,10 +1,11 @@
 """Forward-looking ROI ledger for published Telegram signals.
 
-Model:
-  - 1 unit stake on Over (current goals + 0.5) / goal until end of normal time
-  - odds frozen from API-Football live quote at successful send time
-  - WIN  => +(odds - 1)
-  - LOSS => -1
+Asian model (current goals + 1.0):
+  - 1 unit stake on Over (score_total + 1.0) from API-Football live quote
+  - odds frozen at successful send time
+  - 0 more goals  => LOSS  => -1
+  - exactly 1 more => PUSH  => 0 (stake returned)
+  - 2+ more goals  => WIN   => +(odds - 1)
   - signals without a usable quote are tracked but excluded from ROI
   - only signals at/after ``epoch_utc`` participate
 """
@@ -24,9 +25,10 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_STATE_FILE = Path("stats") / "signal_roi_ledger.json"
 UNIT_STAKE = 1.0
+ASIAN_SELECTION = "over_current_goals_plus_1_0"
 
 _MSK = timezone(timedelta(hours=3))
 _LOCK = threading.RLock()
@@ -89,6 +91,7 @@ def empty_ledger(*, epoch_utc: Optional[str] = None) -> Dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "epoch_utc": epoch,
         "updated_at_utc": epoch,
+        "model": "asian_over_current_plus_1_0",
         "bets": {},
     }
 
@@ -118,6 +121,7 @@ def load_ledger(path: Optional[Any] = None) -> Dict[str, Any]:
         "schema_version": int(payload.get("schema_version") or SCHEMA_VERSION),
         "epoch_utc": str(epoch),
         "updated_at_utc": str(payload.get("updated_at_utc") or epoch),
+        "model": str(payload.get("model") or "asian_over_current_plus_1_0"),
         "bets": bets,
     }
 
@@ -127,6 +131,7 @@ def save_ledger(ledger: Mapping[str, Any], path: Optional[Any] = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = deepcopy(dict(ledger))
     payload["schema_version"] = SCHEMA_VERSION
+    payload["model"] = "asian_over_current_plus_1_0"
     payload["updated_at_utc"] = _fmt_utc(_utc_now())
     tmp = target.with_suffix(target.suffix + ".tmp")
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -166,7 +171,26 @@ def extract_over_decimal(quote: Optional[Mapping[str, Any]]) -> Optional[float]:
     return None
 
 
-def pnl_units(*, outcome: str, over_decimal: float, stake_units: float = UNIT_STAKE) -> float:
+def asian_outcome_from_goals(
+    *,
+    goals_at_signal: int,
+    goals_final: int,
+) -> str:
+    """Map final vs signal totals to Asian Over (current+1) settlement."""
+    delta = int(goals_final) - int(goals_at_signal)
+    if delta <= 0:
+        return "LOSS"
+    if delta == 1:
+        return "PUSH"
+    return "WIN"
+
+
+def pnl_units(
+    *,
+    outcome: str,
+    over_decimal: float,
+    stake_units: float = UNIT_STAKE,
+) -> float:
     result = str(outcome or "").upper()
     stake = float(stake_units)
     odds = float(over_decimal)
@@ -174,6 +198,8 @@ def pnl_units(*, outcome: str, over_decimal: float, stake_units: float = UNIT_ST
         return stake * (odds - 1.0)
     if result == "LOSS":
         return -stake
+    if result == "PUSH":
+        return 0.0
     raise ValueError(f"unsupported outcome: {outcome}")
 
 
@@ -191,6 +217,7 @@ def open_published_signal_bet(
     quote_record_key: Optional[str] = None,
     message_id: Optional[int] = None,
     stake_units: float = UNIT_STAKE,
+    line: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Register one published signal. Idempotent per fixture_id."""
     ensure_epoch(ledger)
@@ -202,6 +229,10 @@ def open_published_signal_bet(
     sent_at = _parse_utc(sent_at_utc) or _utc_now()
     epoch = _parse_utc(ledger.get("epoch_utc")) or sent_at
     odds = _safe_float(over_decimal)
+    goals_at_signal = int(score_home) + int(score_away)
+    target_line = _safe_float(line)
+    if target_line is None:
+        target_line = float(goals_at_signal + 1)
     usable_quote = (
         str(quote_status) == "available"
         and odds is not None
@@ -223,10 +254,12 @@ def open_published_signal_bet(
         "signal_minute": _safe_int(signal_minute),
         "score_home": int(score_home),
         "score_away": int(score_away),
+        "goals_at_signal": goals_at_signal,
         "message_id": _safe_int(message_id),
         "market": {
             "provider": "api_football",
-            "selection": "over_current_goals_plus_0_5",
+            "selection": ASIAN_SELECTION,
+            "line": target_line if usable_quote else None,
             "over_decimal": odds if usable_quote else None,
             "quote_status": "available" if usable_quote else str(quote_status or "unavailable"),
             "quote_record_key": quote_record_key,
@@ -235,6 +268,8 @@ def open_published_signal_bet(
         "status": status,
         "outcome": None,
         "pnl_units": None,
+        "goals_final": None,
+        "goals_after_signal": None,
         "settled_at_utc": None,
         "exclude_reason": exclude_reason,
     }
@@ -246,7 +281,8 @@ def settle_published_signal_bet(
     ledger: Dict[str, Any],
     *,
     fixture_id: int,
-    outcome: str,
+    outcome: Optional[str] = None,
+    goals_final: Optional[int] = None,
     settled_at_utc: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     fixture_key = str(int(fixture_id))
@@ -258,9 +294,18 @@ def settle_published_signal_bet(
     if bet.get("status") != "open":
         return bet
 
-    result = str(outcome or "").upper()
-    if result not in {"WIN", "LOSS"}:
-        return bet
+    result = str(outcome or "").upper() if outcome is not None else ""
+    if result not in {"WIN", "LOSS", "PUSH"}:
+        if goals_final is None:
+            return bet
+        goals_at = _safe_int(bet.get("goals_at_signal"))
+        if goals_at is None:
+            goals_at = int(bet.get("score_home") or 0) + int(bet.get("score_away") or 0)
+        result = asian_outcome_from_goals(
+            goals_at_signal=int(goals_at),
+            goals_final=int(goals_final),
+        )
+
     market = bet.get("market") if isinstance(bet.get("market"), dict) else {}
     odds = _safe_float(market.get("over_decimal"))
     stake = _safe_float(bet.get("stake_units")) or UNIT_STAKE
@@ -268,6 +313,13 @@ def settle_published_signal_bet(
         bet["status"] = "excluded"
         bet["exclude_reason"] = "quote_unavailable"
         return bet
+
+    if goals_final is not None:
+        goals_at = _safe_int(bet.get("goals_at_signal"))
+        if goals_at is None:
+            goals_at = int(bet.get("score_home") or 0) + int(bet.get("score_away") or 0)
+        bet["goals_final"] = int(goals_final)
+        bet["goals_after_signal"] = int(goals_final) - int(goals_at)
 
     bet["outcome"] = result
     bet["pnl_units"] = pnl_units(outcome=result, over_decimal=odds, stake_units=stake)
@@ -285,6 +337,7 @@ class RoiPeriodSummary:
     settled: int
     plus: int
     minus: int
+    push: int
     excluded: int
     open_count: int
     stake_units: float
@@ -302,6 +355,7 @@ class RoiPeriodSummary:
             "settled": self.settled,
             "plus": self.plus,
             "minus": self.minus,
+            "push": self.push,
             "excluded": self.excluded,
             "open": self.open_count,
             "stake_units": self.stake_units,
@@ -377,6 +431,7 @@ def summarize_period(
     settled = 0
     plus = 0
     minus = 0
+    push = 0
     excluded = 0
     open_count = 0
     stake_sum = 0.0
@@ -401,6 +456,8 @@ def summarize_period(
             plus += 1
         elif outcome == "LOSS":
             minus += 1
+        elif outcome == "PUSH":
+            push += 1
         stake = _safe_float(bet.get("stake_units")) or UNIT_STAKE
         pnl = _safe_float(bet.get("pnl_units")) or 0.0
         stake_sum += stake
@@ -421,6 +478,7 @@ def summarize_period(
         settled=settled,
         plus=plus,
         minus=minus,
+        push=push,
         excluded=excluded,
         open_count=open_count,
         stake_units=stake_sum,
@@ -438,7 +496,7 @@ def format_roi_message(summary: RoiPeriodSummary) -> str:
     if summary.open_count:
         lines.append(f"⏳ Ещё в игре: {summary.open_count}")
     if summary.excluded:
-        lines.append(f"➖ Без кэфа / вне ROI: {summary.excluded}")
+        lines.append(f"➖ Без азиатского кэфа / вне ROI: {summary.excluded}")
     lines.append("")
     if summary.settled <= 0:
         lines.append("Пока нет рассчитанных сигналов с коэффициентом.")
@@ -449,13 +507,14 @@ def format_roi_message(summary: RoiPeriodSummary) -> str:
         [
             f"✅ Плюсов: {summary.plus}",
             f"❌ Минусов: {summary.minus}",
+            f"↩ Возвратов (ровно +1 гол): {summary.push}",
         ]
     )
     if summary.pass_rate_pct is not None:
-        lines.append(f"📈 Проходимость: {summary.pass_rate_pct:.0f}%")
+        lines.append(f"📈 Проходимость (без возвратов): {summary.pass_rate_pct:.0f}%")
     lines.append("")
     if summary.avg_odds is not None:
-        lines.append(f"💸 Средний кэф (Over +0.5): {summary.avg_odds:.3f}")
+        lines.append(f"💸 Средний кэф (азиат Over счёт+1): {summary.avg_odds:.3f}")
     lines.append(f"📦 Ставок (юниты): {summary.stake_units:.0f}")
     sign = "+" if summary.pnl_units >= 0 else ""
     lines.append(f"💰 PnL: {sign}{summary.pnl_units:.2f} юнита")
@@ -463,7 +522,10 @@ def format_roi_message(summary: RoiPeriodSummary) -> str:
         roi_sign = "+" if summary.roi_pct >= 0 else ""
         lines.append(f"📊 ROI: {roi_sign}{summary.roi_pct:.1f}%")
     lines.append("")
-    lines.append("Модель: 1 юнит на гол до конца / Over (счёт+0.5) по кэфу API на момент сигнала.")
+    lines.append(
+        "Модель: 1 юнит, азиат Over (голы_сейчас+1). "
+        "0 голов после сигнала = −1; ровно 1 = 0; 2+ = +(кэф−1)."
+    )
     return "\n".join(lines)
 
 
@@ -479,6 +541,7 @@ def record_open_and_save(
     quote_status: str,
     quote_record_key: Optional[str] = None,
     message_id: Optional[int] = None,
+    line: Optional[float] = None,
     path: Optional[Any] = None,
 ) -> Dict[str, Any]:
     with _LOCK:
@@ -496,6 +559,7 @@ def record_open_and_save(
             quote_status=quote_status,
             quote_record_key=quote_record_key,
             message_id=message_id,
+            line=line,
         )
         save_ledger(ledger, path)
         return bet
@@ -504,7 +568,8 @@ def record_open_and_save(
 def record_settle_and_save(
     *,
     fixture_id: int,
-    outcome: str,
+    outcome: Optional[str] = None,
+    goals_final: Optional[int] = None,
     settled_at_utc: Optional[Any] = None,
     path: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -514,6 +579,7 @@ def record_settle_and_save(
             ledger,
             fixture_id=fixture_id,
             outcome=outcome,
+            goals_final=goals_final,
             settled_at_utc=settled_at_utc,
         )
         if bet is not None:
@@ -522,10 +588,36 @@ def record_settle_and_save(
 
 
 def initialize_ledger(path: Optional[Any] = None) -> str:
-    """Create/persist ledger and freeze epoch on first enablement."""
+    """Create/persist ledger and freeze epoch on first enablement.
+
+    Upgrades from schema v1 (European +0.5) start a fresh Asian epoch so
+    prior settlements are not mixed into the new ROI book.
+    """
     with _LOCK:
         target = _coerce_path(path)
-        ledger = load_ledger(target)
+        raw_schema = 0
+        raw_model = ""
+        if target.exists():
+            try:
+                raw = json.loads(target.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    raw_schema = int(raw.get("schema_version") or 1)
+                    raw_model = str(raw.get("model") or "")
+            except Exception:
+                logger.exception("[SIGNAL_ROI] failed_to_inspect path=%s", target)
+        if target.exists() and (
+            raw_schema < SCHEMA_VERSION
+            or (raw_model and raw_model != "asian_over_current_plus_1_0")
+        ):
+            logger.info(
+                "[SIGNAL_ROI] resetting ledger for asian model "
+                "prior_schema=%s prior_model=%s",
+                raw_schema,
+                raw_model or "unset",
+            )
+            ledger = empty_ledger()
+        else:
+            ledger = load_ledger(target)
         epoch = ensure_epoch(ledger)
         save_ledger(ledger, target)
         return epoch

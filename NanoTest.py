@@ -105,6 +105,7 @@ from shadow_candidates.storage import jsonl_paths as shadow_candidate_jsonl_path
 from market_benchmark import (
     AppendOnlyMarketJournal,
     SNAPSHOT_RECORD_TYPE as MARKET_SNAPSHOT_RECORD_TYPE,
+    normalize_live_asian_plus_one_markets,
     normalize_live_goal_markets,
 )
 from wide_research.automatic_champion import (
@@ -9153,8 +9154,8 @@ def _signal_roi_quote_for_send(
     score_home: int,
     score_away: int,
     sent_at_ts: float,
-) -> Tuple[Optional[float], str, Optional[str]]:
-    """Freeze the live Over+(goals+0.5) quote known at send time."""
+) -> Tuple[Optional[float], str, Optional[str], Optional[float]]:
+    """Freeze the live Asian Over+(goals+1.0) quote known at send time."""
     sent_at = datetime.fromtimestamp(float(sent_at_ts), tz=timezone.utc)
     observation = {
         "fixture_id": int(match_id),
@@ -9165,16 +9166,18 @@ def _signal_roi_quote_for_send(
             "score_away": int(score_away),
         },
     }
-    quote, status = _latest_market_quote_for_observation(observation)
+    quote, status = _latest_asian_roi_quote_for_observation(observation)
     odds = signal_roi.extract_over_decimal(quote)
     record_key = None
+    line = None
     if isinstance(quote, dict):
         record_key = quote.get("record_key")
+        line = _market_finite_float(quote.get("line"))
     if odds is None and status == "available":
         status = "quote_odds_missing"
     return odds, str(status or "unavailable"), (
         str(record_key) if record_key else None
-    )
+    ), line
 
 
 def _record_signal_roi_open(
@@ -9190,7 +9193,7 @@ def _record_signal_roi_open(
     if not ENABLE_SIGNAL_ROI:
         return
     try:
-        odds, quote_status, quote_key = _signal_roi_quote_for_send(
+        odds, quote_status, quote_key, line = _signal_roi_quote_for_send(
             match_id=int(match_id),
             signal_minute=int(signal_minute or 0),
             score_home=int(score_home),
@@ -9208,37 +9211,43 @@ def _record_signal_roi_open(
             quote_status=quote_status,
             quote_record_key=quote_key,
             message_id=int(message_id),
+            line=line,
             path=SIGNAL_ROI_LEDGER_FILE,
         )
         logger.info(
-            "[SIGNAL_ROI] open fixture_id=%s status=%s over=%s quote_status=%s",
+            "[SIGNAL_ROI] open fixture_id=%s status=%s asian_over=%s line=%s quote_status=%s",
             match_id,
             bet.get("status"),
             (bet.get("market") or {}).get("over_decimal"),
+            (bet.get("market") or {}).get("line"),
             quote_status,
         )
     except Exception:
         logger.exception("[SIGNAL_ROI] failed_to_open fixture_id=%s", match_id)
 
 
-def _record_signal_roi_settle(match_id: int, normal_time_result: Optional[str]) -> None:
+def _record_signal_roi_settle(
+    match_id: int,
+    *,
+    final_home: int,
+    final_away: int,
+) -> None:
     if not ENABLE_SIGNAL_ROI:
         return
-    result = str(normal_time_result or "").upper()
-    if result not in {"WIN", "LOSS"}:
-        return
     try:
+        goals_final = int(final_home) + int(final_away)
         bet = signal_roi.record_settle_and_save(
             fixture_id=int(match_id),
-            outcome=result,
+            goals_final=goals_final,
             path=SIGNAL_ROI_LEDGER_FILE,
         )
         if bet is None:
             return
         logger.info(
-            "[SIGNAL_ROI] settle fixture_id=%s outcome=%s status=%s pnl=%s",
+            "[SIGNAL_ROI] settle fixture_id=%s outcome=%s goals_after=%s status=%s pnl=%s",
             match_id,
-            result,
+            bet.get("outcome"),
+            bet.get("goals_after_signal"),
             bet.get("status"),
             bet.get("pnl_units"),
         )
@@ -21306,6 +21315,85 @@ def _latest_market_quote_for_observation(
     return None, reasons[0] if reasons else "no_recent_quote"
 
 
+def _asian_roi_quote_validation_reason(
+    quote: Mapping[str, Any],
+    observation: Mapping[str, Any],
+) -> Optional[str]:
+    """Validate Asian Over (current+1.0) quote for ROI freeze at send time."""
+    observation_time = _parse_iso_utc(observation.get("created_at_utc"))
+    captured_time = _parse_iso_utc(quote.get("captured_at_utc"))
+    provider_time = _parse_iso_utc(quote.get("provider_update_utc"))
+    if observation_time is None:
+        return "observation_timestamp_missing"
+    if captured_time is None:
+        return "quote_timestamp_missing"
+    if captured_time > observation_time:
+        return "quote_captured_after_observation"
+    if (
+        observation_time - captured_time
+    ).total_seconds() > MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS:
+        return "quote_too_old"
+    if provider_time is None:
+        return "provider_update_timestamp_missing"
+    if provider_time > observation_time:
+        return "provider_update_after_observation"
+    if (provider_time - captured_time).total_seconds() > 5.0:
+        return "provider_update_after_capture"
+    if (
+        observation_time - provider_time
+    ).total_seconds() > MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS:
+        return "provider_quote_too_old"
+    match = (
+        observation.get("match")
+        if isinstance(observation.get("match"), Mapping)
+        else {}
+    )
+    score_home = _safe_int(match.get("score_home"), -1)
+    score_away = _safe_int(match.get("score_away"), -1)
+    if score_home < 0 or score_away < 0:
+        return "observation_score_missing"
+    if (
+        _safe_int(quote.get("score_home"), -2) != score_home
+        or _safe_int(quote.get("score_away"), -2) != score_away
+    ):
+        return "quote_score_mismatch"
+    current_goals = score_home + score_away
+    if _safe_int(quote.get("current_goals"), -1) != current_goals:
+        return "quote_total_mismatch"
+    line = _market_finite_float(quote.get("line"))
+    if line is None or not math.isclose(
+        line, current_goals + 1.0, abs_tol=1e-9
+    ):
+        return "quote_asian_line_mismatch"
+    odds = signal_roi.extract_over_decimal(quote)
+    if odds is None or odds <= 1.0:
+        return "quote_odds_missing"
+    if quote.get("shadow_only") is not True:
+        return "quote_not_shadow_only"
+    if quote.get("production_applied") is not False:
+        return "quote_production_flag_invalid"
+    return None
+
+
+def _latest_asian_roi_quote_for_observation(
+    observation: Mapping[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    fixture_id = _safe_int(observation.get("fixture_id"), -1)
+    with _market_benchmark_lock:
+        history = copy.deepcopy(
+            _market_benchmark_quote_cache.get(fixture_id) or []
+        )
+    if not history:
+        return None, "no_recent_quote"
+    reasons: List[str] = []
+    for quote in reversed(history):
+        reason = _asian_roi_quote_validation_reason(quote, observation)
+        if reason is None:
+            return quote, "available"
+        reasons.append(reason)
+    return None, reasons[0] if reasons else "no_recent_quote"
+
+
 def _market_model_probability_payload(
     prediction: Optional[Mapping[str, Any]],
     *,
@@ -21569,34 +21657,58 @@ def _persist_market_benchmark_payload(
         payload,
         captured_at_utc=captured,
     )
+    asian_normalized = normalize_live_asian_plus_one_markets(
+        payload,
+        captured_at_utc=captured,
+    )
     rejection_counts = Counter(
         str(record.get("reason") or "unknown")
         for record in normalized.rejections
     )
+    for record in asian_normalized.rejections:
+        rejection_counts[f"asian_{record.get('reason') or 'unknown'}"] += 1
     accepted: List[Dict[str, Any]] = []
+    accepted_asian: List[Dict[str, Any]] = []
     captured_time = _parse_iso_utc(captured)
-    for raw_record in normalized.records:
+
+    def _accept_quote_window(
+        raw_record: Mapping[str, Any],
+        *,
+        counts: Counter,
+        prefix: str = "",
+    ) -> Optional[Dict[str, Any]]:
         record = dict(raw_record)
         minute = _safe_int(record.get("minute"), -1)
         if minute < MARKET_BENCHMARK_MIN_MINUTE:
-            rejection_counts["minute_before_collection_window"] += 1
-            continue
+            counts[f"{prefix}minute_before_collection_window"] += 1
+            return None
         if minute > MARKET_BENCHMARK_MAX_MINUTE:
-            rejection_counts["minute_after_collection_window"] += 1
-            continue
+            counts[f"{prefix}minute_after_collection_window"] += 1
+            return None
         provider_time = _parse_iso_utc(record.get("provider_update_utc"))
         if captured_time is None or provider_time is None:
-            rejection_counts["timestamp_missing_or_invalid"] += 1
-            continue
+            counts[f"{prefix}timestamp_missing_or_invalid"] += 1
+            return None
         if (provider_time - captured_time).total_seconds() > 5.0:
-            rejection_counts["provider_update_after_capture"] += 1
-            continue
+            counts[f"{prefix}provider_update_after_capture"] += 1
+            return None
         if (
             captured_time - provider_time
         ).total_seconds() > MARKET_BENCHMARK_MAX_QUOTE_AGE_SECONDS:
-            rejection_counts["provider_quote_too_old"] += 1
-            continue
-        accepted.append(record)
+            counts[f"{prefix}provider_quote_too_old"] += 1
+            return None
+        return record
+
+    for raw_record in normalized.records:
+        record = _accept_quote_window(raw_record, counts=rejection_counts)
+        if record is not None:
+            accepted.append(record)
+    for raw_record in asian_normalized.records:
+        record = _accept_quote_window(
+            raw_record, counts=rejection_counts, prefix="asian_"
+        )
+        if record is not None:
+            accepted_asian.append(record)
 
     response = payload.get("response") if isinstance(payload, Mapping) else None
     errors = payload.get("errors") if isinstance(payload, Mapping) else None
@@ -21612,14 +21724,16 @@ def _persist_market_benchmark_payload(
         "source_endpoint": "/odds/live",
         "raw_live_entries": len(response) if isinstance(response, list) else 0,
         "accepted_quotes": len(accepted),
+        "accepted_asian_quotes": len(accepted_asian),
         "rejection_counts": dict(sorted(rejection_counts.items())),
         "request_valid": response_valid,
         "api_errors_present": not response_valid,
         "shadow_only": True,
         "production_applied": False,
     }
+    # Journal keeps the primary +0.5 research stream; Asian quotes feed ROI cache.
     results = target_journal.append_many([*accepted, poll_record])
-    _market_cache_update(accepted, captured_at_utc=captured)
+    _market_cache_update([*accepted, *accepted_asian], captured_at_utc=captured)
     # balanced-two-rule is the production gate and its market-pressure member
     # needs the same causal quote cache regardless of rare-discovery settings.
     _market_research_quote_cache.update(accepted, captured)
@@ -29525,7 +29639,11 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                         state["match_signal_info"][str(match_id)]["is_finished"] = True
                         logger.info(f"[STATS] Match {match_id} marked as finished")
 
-                    _record_signal_roi_settle(match_id, st.get("normal_time_result"))
+                    _record_signal_roi_settle(
+                        match_id,
+                        final_home=int(final_home),
+                        final_away=int(final_away),
+                    )
 
                     # Label Google Sheets rows with goal_next_15 (only once)
                     labeled = state.get("labeled_matches", [])

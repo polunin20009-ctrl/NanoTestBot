@@ -38,6 +38,12 @@ DEFAULT_LIVE_GOAL_MARKETS: Tuple[LiveGoalMarketSpec, ...] = (
     LiveGoalMarketSpec(bet_id=36, name="Over/Under Line", priority=1),
 )
 
+# Integer Asian total (current goals + 1.0): push on exactly one more goal.
+# Prefer Over/Under Line — Match Goals almost never publishes whole lines.
+ASIAN_PLUS_ONE_LIVE_GOAL_MARKETS: Tuple[LiveGoalMarketSpec, ...] = (
+    LiveGoalMarketSpec(bet_id=36, name="Over/Under Line", priority=0),
+)
+
 
 @dataclass(frozen=True)
 class NormalizationResult:
@@ -322,6 +328,10 @@ def _normalize_entry(
     expected_fixture_id: Optional[int],
     expected_current_goals: Optional[int],
     market_specs: Sequence[LiveGoalMarketSpec],
+    line_offset: Decimal = Decimal("0.5"),
+    market_type: str = "one_more_goal_to90",
+    target_event: str = "at_least_one_more_goal_to90_normal_time",
+    source_market_type: str = "match_total_goals",
 ) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
     fixture = entry.get("fixture")
     fixture_map = fixture if isinstance(fixture, Mapping) else {}
@@ -372,7 +382,7 @@ def _normalize_entry(
             )
         ]
 
-    target_line = Decimal(current_goals) + Decimal("0.5")
+    target_line = Decimal(current_goals) + Decimal(line_offset)
     odds = entry.get("odds")
     if not isinstance(odds, Sequence) or isinstance(odds, (str, bytes)):
         odds = ()
@@ -479,9 +489,9 @@ def _normalize_entry(
             "provider_update_utc": provider_update_utc,
             "league_id": _coerce_int(league_map.get("id"), minimum=1),
             "league_season": _coerce_int(league_map.get("season"), minimum=1),
-            "market_type": "one_more_goal_to90",
-            "source_market_type": "match_total_goals",
-            "target_event": "at_least_one_more_goal_to90_normal_time",
+            "market_type": market_type,
+            "source_market_type": source_market_type,
+            "target_event": target_event,
             "settlement_scope": "normal_time",
             "bet_id": spec.bet_id,
             "bet_name": spec.name,
@@ -577,6 +587,10 @@ def normalize_live_goal_markets(
     fixture_id: Optional[object] = None,
     current_goals: Optional[object] = None,
     market_specs: Sequence[LiveGoalMarketSpec] = DEFAULT_LIVE_GOAL_MARKETS,
+    line_offset: object = Decimal("0.5"),
+    market_type: str = "one_more_goal_to90",
+    target_event: str = "at_least_one_more_goal_to90_normal_time",
+    source_market_type: str = "match_total_goals",
 ) -> NormalizationResult:
     """Normalize API-Football ``/odds/live`` into shadow quote snapshots.
 
@@ -587,6 +601,9 @@ def normalize_live_goal_markets(
     """
 
     captured = _utc_timestamp(captured_at_utc)
+    offset = _coerce_decimal(line_offset)
+    if offset is None or offset <= 0:
+        raise ValueError("line_offset must be a positive decimal")
     expected_fixture_id: Optional[int] = None
     if fixture_id is not None:
         expected_fixture_id = _coerce_int(fixture_id, minimum=1)
@@ -672,6 +689,10 @@ def normalize_live_goal_markets(
             expected_fixture_id=expected_fixture_id,
             expected_current_goals=expected_current_goals,
             market_specs=tuple(normalized_specs),
+            line_offset=offset,
+            market_type=str(market_type),
+            target_event=str(target_event),
+            source_market_type=str(source_market_type),
         )
         if record is not None:
             records.append(record)
@@ -692,4 +713,29 @@ def normalize_live_goal_markets(
     return NormalizationResult(
         records=tuple(unique_records.values()),
         rejections=tuple(rejections),
+    )
+
+
+def normalize_live_asian_plus_one_markets(
+    payload: object,
+    *,
+    captured_at_utc: Optional[TimestampLike] = None,
+    fixture_id: Optional[object] = None,
+    current_goals: Optional[object] = None,
+) -> NormalizationResult:
+    """Normalize Asian Over (current goals + 1.0) quotes for ROI settlement.
+
+    Settlement: 0 more goals = LOSS, exactly 1 more = PUSH, 2+ more = WIN.
+    """
+
+    return normalize_live_goal_markets(
+        payload,
+        captured_at_utc=captured_at_utc,
+        fixture_id=fixture_id,
+        current_goals=current_goals,
+        market_specs=ASIAN_PLUS_ONE_LIVE_GOAL_MARKETS,
+        line_offset=Decimal("1"),
+        market_type="asian_over_current_plus_1_0",
+        target_event="asian_two_more_goals_push_on_one_to90",
+        source_market_type="asian_match_total_goals",
     )
