@@ -76,6 +76,53 @@ def test_regular_final_renderer_keeps_goal_minutes_and_short_score_format() -> N
     assert "⚽️Голы: 68′ 82′" in message
     assert "Счёт после основного времени" not in message
     assert "Дополнительное время и серия пенальти не учитываются." not in message
+    assert "Основное время завершено" not in message
+    assert "После сигнала был гол" not in message
+
+
+def test_final_card_keeps_signal_score_and_stats_block() -> None:
+    message = nanotest.render_final_message(
+        {
+            "data": {
+                "fixture": {
+                    "team_home_name": {"value": "AEK Athens FC"},
+                    "team_away_name": {"value": "Real Madrid"},
+                    "league_name": {"value": "UEFA Champions League"},
+                    "league_country": {"value": "World"},
+                    "xg_home": {"value": 0.95},
+                    "xg_away": {"value": 3.40},
+                    "total_shots_home": {"value": 9},
+                    "total_shots_away": {"value": 24},
+                    "shots_on_target_home": {"value": 5},
+                    "shots_on_target_away": {"value": 8},
+                    "saves_home": {"value": 5},
+                    "saves_away": {"value": 3},
+                    "shots_insidebox_home": {"value": 6},
+                    "shots_insidebox_away": {"value": 17},
+                    "corners_home": {"value": 0},
+                    "corners_away": {"value": 7},
+                    "ball_possession_home": {"value": 30},
+                    "ball_possession_away": {"value": 70},
+                    "status_short": {"value": "FT"},
+                }
+            },
+            "signal_home": 1,
+            "signal_away": 1,
+            "final_home": 2,
+            "final_away": 3,
+            "goal_minutes": [75, 78, 92],
+            "normal_time_result": "WIN",
+        },
+        header_text="🚨 Сигнал",
+    )
+
+    assert "AEK Athens FC — Real Madrid" in message
+    assert "Счет: 1 - 1 (Завершен)" in message
+    assert "xG:" in message
+    assert "Удары по воротам:" in message
+    assert "⚽️Голы: 75′ 78′ 92′" in message
+    assert "✅ Финальный счёт: 2-3" in message
+    assert "Основное время завершено" not in message
 
 
 def test_extra_time_final_renderer_shows_normal_time_score_disclaimer() -> None:
