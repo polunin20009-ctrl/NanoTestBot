@@ -127,6 +127,7 @@ from wide_research.controller import (
     WideResearchController,
 )
 from market_benchmark.research import CausalQuoteCache
+import signal_roi
 from wide_research.discovery import (
     ATOMIC_GRID_VERSION as WIDE_RESEARCH_ATOMIC_GRID_VERSION,
     DISCOVERY_ENGINE_VERSION as WIDE_RESEARCH_DISCOVERY_ENGINE_VERSION,
@@ -1411,6 +1412,11 @@ DISCOVERY_DIVISION_LIFT_MAX_SWAPS = max(
 )
 DISCOVERY_DIVISION_LIFT_POLICY = DiscoveryLiftPolicy(
     max_swaps_per_run=DISCOVERY_DIVISION_LIFT_MAX_SWAPS,
+)
+ENABLE_SIGNAL_ROI = _parse_env_bool("ENABLE_SIGNAL_ROI", True)
+SIGNAL_ROI_LEDGER_FILE = os.environ.get(
+    "SIGNAL_ROI_LEDGER_FILE",
+    str(signal_roi.default_state_path()),
 )
 AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES = {
     "balanced-two-rule": "balanced-core",
@@ -9128,7 +9134,116 @@ def _record_ordinary_signal_delivery_state(
     logger.info(
         f"[STATS] Match {match_id}: signal sent at {msk_time} MSK, assigned to date {signal_date}"
     )
+    _record_signal_roi_open(
+        match_id=int(match_id),
+        message_id=int(message_id),
+        signal_minute=int(signal_minute or 0),
+        score_home=int(score_home),
+        score_away=int(score_away),
+        sent_at_ts=float(sent_ts),
+        signal_date=str(signal_date),
+    )
     return sent_ts
+
+
+def _signal_roi_quote_for_send(
+    *,
+    match_id: int,
+    signal_minute: int,
+    score_home: int,
+    score_away: int,
+    sent_at_ts: float,
+) -> Tuple[Optional[float], str, Optional[str]]:
+    """Freeze the live Over+(goals+0.5) quote known at send time."""
+    sent_at = datetime.fromtimestamp(float(sent_at_ts), tz=timezone.utc)
+    observation = {
+        "fixture_id": int(match_id),
+        "minute": int(signal_minute or 0),
+        "created_at_utc": sent_at.isoformat(),
+        "match": {
+            "score_home": int(score_home),
+            "score_away": int(score_away),
+        },
+    }
+    quote, status = _latest_market_quote_for_observation(observation)
+    odds = signal_roi.extract_over_decimal(quote)
+    record_key = None
+    if isinstance(quote, dict):
+        record_key = quote.get("record_key")
+    if odds is None and status == "available":
+        status = "quote_odds_missing"
+    return odds, str(status or "unavailable"), (
+        str(record_key) if record_key else None
+    )
+
+
+def _record_signal_roi_open(
+    *,
+    match_id: int,
+    message_id: int,
+    signal_minute: int,
+    score_home: int,
+    score_away: int,
+    sent_at_ts: float,
+    signal_date: str,
+) -> None:
+    if not ENABLE_SIGNAL_ROI:
+        return
+    try:
+        odds, quote_status, quote_key = _signal_roi_quote_for_send(
+            match_id=int(match_id),
+            signal_minute=int(signal_minute or 0),
+            score_home=int(score_home),
+            score_away=int(score_away),
+            sent_at_ts=float(sent_at_ts),
+        )
+        bet = signal_roi.record_open_and_save(
+            fixture_id=int(match_id),
+            sent_at_utc=datetime.fromtimestamp(float(sent_at_ts), tz=timezone.utc),
+            signal_date_msk=str(signal_date),
+            signal_minute=int(signal_minute or 0),
+            score_home=int(score_home),
+            score_away=int(score_away),
+            over_decimal=odds,
+            quote_status=quote_status,
+            quote_record_key=quote_key,
+            message_id=int(message_id),
+            path=SIGNAL_ROI_LEDGER_FILE,
+        )
+        logger.info(
+            "[SIGNAL_ROI] open fixture_id=%s status=%s over=%s quote_status=%s",
+            match_id,
+            bet.get("status"),
+            (bet.get("market") or {}).get("over_decimal"),
+            quote_status,
+        )
+    except Exception:
+        logger.exception("[SIGNAL_ROI] failed_to_open fixture_id=%s", match_id)
+
+
+def _record_signal_roi_settle(match_id: int, normal_time_result: Optional[str]) -> None:
+    if not ENABLE_SIGNAL_ROI:
+        return
+    result = str(normal_time_result or "").upper()
+    if result not in {"WIN", "LOSS"}:
+        return
+    try:
+        bet = signal_roi.record_settle_and_save(
+            fixture_id=int(match_id),
+            outcome=result,
+            path=SIGNAL_ROI_LEDGER_FILE,
+        )
+        if bet is None:
+            return
+        logger.info(
+            "[SIGNAL_ROI] settle fixture_id=%s outcome=%s status=%s pnl=%s",
+            match_id,
+            result,
+            bet.get("status"),
+            bet.get("pnl_units"),
+        )
+    except Exception:
+        logger.exception("[SIGNAL_ROI] failed_to_settle fixture_id=%s", match_id)
 
 
 def _merge_post_send_signal_info(
@@ -12950,12 +13065,30 @@ def compute_stats_from_sheet(window_start_msk: datetime, title: str) -> str:
 
     return "\n".join(lines)
 
+def _append_signal_roi_section(message: str, period: str) -> str:
+    if not ENABLE_SIGNAL_ROI:
+        return message
+    try:
+        roi_msg = signal_roi.build_period_message(
+            period, path=SIGNAL_ROI_LEDGER_FILE
+        )
+    except Exception:
+        logger.exception("[SIGNAL_ROI] failed_to_format period=%s", period)
+        return message
+    base = str(message or "").rstrip()
+    if not base:
+        return roi_msg
+    return base + "\n\n⸻\n\n" + roi_msg
+
+
 def format_weekly_stats_message() -> str:
     """Format weekly statistics message for Telegram (last 7 days from signal send time)."""
     now_msk = datetime.now(_MSK_TZ)
     window_start = now_msk - timedelta(days=7)
     title = "📅 Итоги недели (последние 7 дней)"
-    return compute_stats_from_sheet(window_start, title)
+    return _append_signal_roi_section(
+        compute_stats_from_sheet(window_start, title), "week"
+    )
 
 def format_monthly_stats_message() -> str:
     """Format monthly statistics message for Telegram (current calendar month)."""
@@ -12963,7 +13096,16 @@ def format_monthly_stats_message() -> str:
     window_start = now_msk.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_name = _MONTH_NAMES_RU.get(now_msk.month, now_msk.strftime("%B"))
     title = f"🗓 Итоги месяца ({month_name} {now_msk.year})"
-    return compute_stats_from_sheet(window_start, title)
+    return _append_signal_roi_section(
+        compute_stats_from_sheet(window_start, title), "month"
+    )
+
+
+def format_all_time_roi_message() -> str:
+    """ROI since the forward-looking ROI epoch (enablement moment)."""
+    if not ENABLE_SIGNAL_ROI:
+        return "ROI-учёт сейчас выключен."
+    return signal_roi.build_period_message("all", path=SIGNAL_ROI_LEDGER_FILE)
 
 def send_daily_stats():
     """Send daily statistics report to Telegram (deprecated, use check_and_send_daily_stats_if_ready)."""
@@ -13104,6 +13246,9 @@ def get_standard_keyboard() -> Dict[str, Any]:
                 {"text": "📅 Итоги месяца", "callback_data": "stats_month"}
             ],
             [
+                {"text": "📈 ROI за всё время", "callback_data": "stats_roi_all"}
+            ],
+            [
                 {"text": "👁️♦️ Как работать с сигналами", "callback_data": "instruction"}
             ]
         ]
@@ -13118,6 +13263,9 @@ def get_channel_keyboard() -> Dict[str, Any]:
             ],
             [
                 {"text": "📅 Итоги месяца", "callback_data": "stats_month"}
+            ],
+            [
+                {"text": "📈 ROI за всё время", "callback_data": "stats_roi_all"}
             ],
             [
                 {"text": "👁️♦️ Как работать с сигналами", "callback_data": "instruction"}
@@ -13300,10 +13448,14 @@ def handle_message(message: Dict[str, Any]):
                 # Check rate limit for stat requests via /start (separate limits for each action)
                 rate_action = None
                 now_ts = None
-                if start_param in ("stats_week", "stats_month"):
+                if start_param in ("stats_week", "stats_month", "stats_roi_all"):
                     now_ts = time.time()
                     # Map start_param to action name
-                    action_map = {"stats_week": "weekly", "stats_month": "monthly"}
+                    action_map = {
+                        "stats_week": "weekly",
+                        "stats_month": "monthly",
+                        "stats_roi_all": "roi_all",
+                    }
                     rate_action = action_map.get(start_param)
                     
                     can_request, wait_sec = can_user_request(user_id, rate_action, now_ts, window=60)
@@ -13322,6 +13474,9 @@ def handle_message(message: Dict[str, Any]):
                 elif start_param == "stats_month":
                     content_msg = format_monthly_stats_message()
                     content_type = "monthly stats"
+                elif start_param == "stats_roi_all":
+                    content_msg = format_all_time_roi_message()
+                    content_type = "all-time ROI"
                 elif start_param == "strategy":
                     content_msg = format_red_eye_strategy_message()
                     content_type = "strategy"
@@ -13423,10 +13578,15 @@ def handle_callback_query(callback_query: Dict[str, Any]):
         # Check rate limit for personal request actions (separate limit for each action)
         rate_action = None
         now_ts = None
-        if callback_data in ("stats_week", "stats_month", "instruction"):
+        if callback_data in ("stats_week", "stats_month", "stats_roi_all", "instruction"):
             now_ts = time.time()
             # Map callback_data to action name
-            action_map = {"stats_week": "weekly", "stats_month": "monthly", "instruction": "instruction"}
+            action_map = {
+                "stats_week": "weekly",
+                "stats_month": "monthly",
+                "stats_roi_all": "roi_all",
+                "instruction": "instruction",
+            }
             rate_action = action_map.get(callback_data)
             
             can_request, wait_sec = can_user_request(user_id, rate_action, now_ts, window=60)
@@ -13479,6 +13639,23 @@ def handle_callback_query(callback_query: Dict[str, Any]):
                             mark_user_request(user_id, rate_action, now_ts)
                     else:
                         logger.warning(f"[TG] Failed to send monthly stats to user {user_id}: {r.text}")
+
+            elif callback_data == "stats_roi_all":
+                msg = format_all_time_roi_message()
+                if msg and user_id:
+                    send_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                    send_payload = {
+                        "chat_id": user_id,
+                        "text": msg,
+                        "reply_markup": json.dumps(get_standard_keyboard())
+                    }
+                    r = requests.post(send_url, data=send_payload, timeout=10)
+                    if r.ok:
+                        logger.info(f"[TG] All-time ROI sent to user {user_id}")
+                        if rate_action and now_ts:
+                            mark_user_request(user_id, rate_action, now_ts)
+                    else:
+                        logger.warning(f"[TG] Failed to send all-time ROI to user {user_id}: {r.text}")
             
             elif callback_data == "instruction":
                 msg = format_red_eye_strategy_message()
@@ -29348,6 +29525,8 @@ def perform_monitor_update(match_id: int, client: APISportsMetricsClient):
                         state["match_signal_info"][str(match_id)]["is_finished"] = True
                         logger.info(f"[STATS] Match {match_id} marked as finished")
 
+                    _record_signal_roi_settle(match_id, st.get("normal_time_result"))
+
                     # Label Google Sheets rows with goal_next_15 (only once)
                     labeled = state.get("labeled_matches", [])
                     already_labeled = match_id in labeled
@@ -30477,6 +30656,12 @@ def main_loop():
     start_monitor_daemon(client)
     start_callback_handler_daemon()  # Start callback handler for inline buttons
     start_daily_stats_checker_daemon()  # Start daily stats checker for 23:59 rule
+    if ENABLE_SIGNAL_ROI:
+        try:
+            epoch = signal_roi.initialize_ledger(SIGNAL_ROI_LEDGER_FILE)
+            logger.info("[SIGNAL_ROI] enabled ledger=%s epoch_utc=%s", SIGNAL_ROI_LEDGER_FILE, epoch)
+        except Exception:
+            logger.exception("[SIGNAL_ROI] failed_to_initialize_ledger")
     start_gsheets_labeler_daemon(client)  # Start Google Sheets labeler daemon for goal_next_15 backfill
     start_daily_cleanup_daemon(client)  # Start maintenance daemon (04:00 MSK smart cleanup)
     refresh_all_cup_leagues_now()  # Queue cup/problem leagues for one-by-one non-blocking refresh
