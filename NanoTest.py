@@ -9147,15 +9147,15 @@ def _record_ordinary_signal_delivery_state(
     return sent_ts
 
 
-def _signal_roi_quote_for_send(
+def _signal_roi_quote_bundle_for_send(
     *,
     match_id: int,
     signal_minute: int,
     score_home: int,
     score_away: int,
     sent_at_ts: float,
-) -> Tuple[Optional[float], str, Optional[str], Optional[float]]:
-    """Freeze the live Asian Over+(goals+1.0) quote known at send time."""
+) -> Dict[str, Any]:
+    """Freeze both live Over+(goals+0.5) and Asian Over+(goals+1.0) quotes."""
     sent_at = datetime.fromtimestamp(float(sent_at_ts), tz=timezone.utc)
     observation = {
         "fixture_id": int(match_id),
@@ -9166,18 +9166,30 @@ def _signal_roi_quote_for_send(
             "score_away": int(score_away),
         },
     }
-    quote, status = _latest_asian_roi_quote_for_observation(observation)
-    odds = signal_roi.extract_over_decimal(quote)
-    record_key = None
-    line = None
-    if isinstance(quote, dict):
-        record_key = quote.get("record_key")
-        line = _market_finite_float(quote.get("line"))
-    if odds is None and status == "available":
-        status = "quote_odds_missing"
-    return odds, str(status or "unavailable"), (
-        str(record_key) if record_key else None
-    ), line
+
+    def _pack(quote: Optional[Mapping[str, Any]], status: str) -> Dict[str, Any]:
+        odds = signal_roi.extract_over_decimal(quote)
+        record_key = None
+        line = None
+        if isinstance(quote, dict):
+            record_key = quote.get("record_key")
+            line = _market_finite_float(quote.get("line"))
+        resolved = str(status or "unavailable")
+        if odds is None and resolved == "available":
+            resolved = "quote_odds_missing"
+        return {
+            "over_decimal": odds,
+            "quote_status": resolved,
+            "quote_record_key": str(record_key) if record_key else None,
+            "line": line,
+        }
+
+    eu_quote, eu_status = _latest_market_quote_for_observation(observation)
+    asian_quote, asian_status = _latest_asian_roi_quote_for_observation(observation)
+    return {
+        "eu": _pack(eu_quote, eu_status),
+        "asian": _pack(asian_quote, asian_status),
+    }
 
 
 def _record_signal_roi_open(
@@ -9193,13 +9205,15 @@ def _record_signal_roi_open(
     if not ENABLE_SIGNAL_ROI:
         return
     try:
-        odds, quote_status, quote_key, line = _signal_roi_quote_for_send(
+        quotes = _signal_roi_quote_bundle_for_send(
             match_id=int(match_id),
             signal_minute=int(signal_minute or 0),
             score_home=int(score_home),
             score_away=int(score_away),
             sent_at_ts=float(sent_at_ts),
         )
+        eu = quotes["eu"]
+        asian = quotes["asian"]
         bet = signal_roi.record_open_and_save(
             fixture_id=int(match_id),
             sent_at_utc=datetime.fromtimestamp(float(sent_at_ts), tz=timezone.utc),
@@ -9207,20 +9221,28 @@ def _record_signal_roi_open(
             signal_minute=int(signal_minute or 0),
             score_home=int(score_home),
             score_away=int(score_away),
-            over_decimal=odds,
-            quote_status=quote_status,
-            quote_record_key=quote_key,
+            eu_over_decimal=eu.get("over_decimal"),
+            eu_quote_status=str(eu.get("quote_status") or "unavailable"),
+            eu_quote_record_key=eu.get("quote_record_key"),
+            eu_line=eu.get("line"),
+            asian_over_decimal=asian.get("over_decimal"),
+            asian_quote_status=str(asian.get("quote_status") or "unavailable"),
+            asian_quote_record_key=asian.get("quote_record_key"),
+            asian_line=asian.get("line"),
             message_id=int(message_id),
-            line=line,
             path=SIGNAL_ROI_LEDGER_FILE,
         )
+        legs = bet.get("legs") if isinstance(bet.get("legs"), dict) else {}
+        eu_leg = legs.get(signal_roi.LEG_EU) or {}
+        asian_leg = legs.get(signal_roi.LEG_ASIAN) or {}
         logger.info(
-            "[SIGNAL_ROI] open fixture_id=%s status=%s asian_over=%s line=%s quote_status=%s",
+            "[SIGNAL_ROI] open fixture_id=%s eu_status=%s eu_over=%s "
+            "asian_status=%s asian_over=%s",
             match_id,
-            bet.get("status"),
-            (bet.get("market") or {}).get("over_decimal"),
-            (bet.get("market") or {}).get("line"),
-            quote_status,
+            eu_leg.get("status"),
+            eu_leg.get("over_decimal"),
+            asian_leg.get("status"),
+            asian_leg.get("over_decimal"),
         )
     except Exception:
         logger.exception("[SIGNAL_ROI] failed_to_open fixture_id=%s", match_id)
@@ -9243,13 +9265,18 @@ def _record_signal_roi_settle(
         )
         if bet is None:
             return
+        legs = bet.get("legs") if isinstance(bet.get("legs"), dict) else {}
+        eu_leg = legs.get(signal_roi.LEG_EU) or {}
+        asian_leg = legs.get(signal_roi.LEG_ASIAN) or {}
         logger.info(
-            "[SIGNAL_ROI] settle fixture_id=%s outcome=%s goals_after=%s status=%s pnl=%s",
+            "[SIGNAL_ROI] settle fixture_id=%s goals_after=%s "
+            "eu=%s/%s asian=%s/%s",
             match_id,
-            bet.get("outcome"),
             bet.get("goals_after_signal"),
-            bet.get("status"),
-            bet.get("pnl_units"),
+            eu_leg.get("outcome"),
+            eu_leg.get("pnl_units"),
+            asian_leg.get("outcome"),
+            asian_leg.get("pnl_units"),
         )
     except Exception:
         logger.exception("[SIGNAL_ROI] failed_to_settle fixture_id=%s", match_id)
