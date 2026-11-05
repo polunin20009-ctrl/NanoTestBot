@@ -579,14 +579,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         lifecycle_policy["allowed_looks"] = list(
             controller.policy.allowed_looks
         )
+        # Keep the worker summary contract identical to the parent-process
+        # validator and the controller that actually runs terminal review.
+        # A hardcoded 0.90 here previously caused profile_mismatch rejects
+        # after every successful rare-precision discovery cycle.
+        terminal_review = controller._terminal_review_manifest()
         summary["profile_contract"] = {
             "max_shadow_rules": int(args.max_shadow_rules),
             "lifecycle_policy": lifecycle_policy,
             "pool_lifecycle": dict(controller.pool_lifecycle_policy or {}),
             "terminal_review": {
-                "enabled": True,
-                "final_look": 200,
-                "min_point_hit_rate": 0.90,
+                "enabled": bool(terminal_review["enabled"]),
+                "final_look": int(terminal_review["final_look"]),
+                "min_point_hit_rate": float(
+                    terminal_review["min_point_hit_rate"]
+                ),
             },
         }
     if not args.lifecycle_only:
