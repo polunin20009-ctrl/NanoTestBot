@@ -862,6 +862,54 @@ def test_static_and_rolling_noop_cooldowns_are_independent(
     assert bot._shadow_rolling_noop_scan_not_before_monotonic > 0.0
 
 
+def test_rolling_outcome_wakeup_skipped_when_outcome_retrain_disabled(
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+    monkeypatch.setattr(bot, "ENABLE_SHADOW_ML_ROLLING_CHALLENGER", True)
+    monkeypatch.setattr(bot, "SHADOW_ML_ROLLING_AUTO_RETRAIN", True)
+    monkeypatch.setattr(bot, "SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME", False)
+    monkeypatch.setattr(
+        bot, "_shadow_rolling_pending_fixture_ids", set(range(1, 6))
+    )
+    monkeypatch.setattr(bot, "_shadow_rolling_known_new_fixtures", 40)
+    monkeypatch.setattr(bot, "_shadow_rolling_data_revision_pending", True)
+    monkeypatch.setattr(
+        bot, "_shadow_rolling_contract_mismatch_pending", False
+    )
+    monkeypatch.setattr(
+        bot, "_shadow_rolling_noop_scan_not_before_monotonic", 0.0
+    )
+    monkeypatch.setattr(
+        bot,
+        "train_shadow_rolling_ml_once",
+        lambda **kwargs: calls.append(kwargs) or {"status": "trained"},
+    )
+
+    skipped = bot.process_shadow_rolling_retrain_wakeup(
+        trigger="outcome_event"
+    )
+    assert skipped["status"] == "skipped"
+    assert skipped["reason"] == "outcome_retrain_disabled"
+    assert calls == []
+    assert bot._shadow_rolling_pending_fixture_ids == set(range(1, 6))
+
+    monkeypatch.setattr(
+        bot,
+        "load_shadow_rolling_model_cached",
+        lambda: {"model_id": "rolling"},
+    )
+    monkeypatch.setattr(
+        bot,
+        "_shadow_ml_model_age_seconds",
+        lambda artifact: float(bot.SHADOW_ML_RETRAIN_CHECK_SECONDS + 1),
+    )
+    scheduled = bot.process_shadow_rolling_retrain_wakeup(trigger="scheduled")
+    assert scheduled["status"] == "trained"
+    assert len(calls) == 1
+    assert calls[0]["trigger"] == "scheduled"
+
+
 def test_rolling_scan_error_restores_consumed_hints_without_cooldown(
     monkeypatch,
 ) -> None:

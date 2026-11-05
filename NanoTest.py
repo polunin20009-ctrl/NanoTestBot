@@ -727,6 +727,12 @@ SHADOW_ML_AUTO_RETRAIN = _parse_env_bool("SHADOW_ML_AUTO_RETRAIN", True)
 SHADOW_ML_ROLLING_AUTO_RETRAIN = _parse_env_bool(
     "SHADOW_ML_ROLLING_AUTO_RETRAIN", True
 )
+# Rolling training is memory-heavy on this host. Keep periodic scheduled
+# retrains, but do not launch a fresh rolling worker on every match outcome
+# unless explicitly re-enabled.
+SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME = _parse_env_bool(
+    "SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME", False
+)
 SHADOW_ML_MODEL_FILE = os.environ.get(
     "SHADOW_ML_MODEL_FILE", os.path.join("stats", "shadow_ml_model.json")
 )
@@ -2129,10 +2135,12 @@ def log_feature_flags() -> None:
     )
     logger.info(
         "[SHADOW_ML_ROLLING_CONFIG] enabled=%s challenger_shadow_only=true "
+        "retrain_on_outcome=%s "
         "primary_probability_apply=%s auto_retrain=%s feature_profile=%s "
         "rolling_schema=%s windows=5,10 model_file=%s predictions_file=%s "
         "rotate_max_bytes=%s",
         ENABLE_SHADOW_ML_ROLLING_CHALLENGER,
+        SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME,
         ENABLE_ROLLING_ML_PRIMARY_PROBABILITY,
         SHADOW_ML_ROLLING_AUTO_RETRAIN,
         ROLLING_FEATURE_PROFILE,
@@ -19680,6 +19688,18 @@ def process_shadow_rolling_retrain_wakeup(
             "status": "skipped",
             "trigger": str(trigger),
             "reason": "disabled",
+        }
+    # Outcome wakeups are intentionally ignored by default: rolling training
+    # repeatedly hit the worker memory ceiling when launched after every
+    # settled match. Scheduled scans still accumulate pending fixtures.
+    if (
+        str(trigger or "").strip().lower() == "outcome_event"
+        and not SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME
+    ):
+        return {
+            "status": "skipped",
+            "trigger": str(trigger),
+            "reason": "outcome_retrain_disabled",
         }
     with _shadow_ml_schedule_lock:
         pending_count = (
