@@ -291,7 +291,29 @@ def test_shadow_ml_disk_join_matches_legacy_candidate_semantics(
         "outcome_records": 3,
         "candidate_payloads_seen": 3,
         "joined_training_rows": 1,
+        "observations_excluded_by_lookback": 0,
+        "lookback_cutoff_utc": None,
     }
+
+
+def test_shadow_ml_disk_join_honours_min_created_at_lookback() -> None:
+    old = _rolling_observation(808, 46, 1)
+    old["created_at_utc"] = "2026-08-01T12:00:00+00:00"
+    old["outcome"] = {"status": "resolved"}
+    recent = _rolling_observation(809, 47, 2)
+    recent["created_at_utc"] = "2026-11-01T12:00:00+00:00"
+    recent["outcome"] = {"status": "resolved"}
+
+    joined, stats = bot.materialize_training_history(
+        [old, recent],
+        include_pending=False,
+        min_created_at_utc="2026-09-07T12:00:00+00:00",
+    )
+
+    assert [row["fixture_id"] for row in joined] == [809]
+    assert stats["observations_excluded_by_lookback"] == 1
+    assert stats["joined_training_rows"] == 1
+    assert stats["lookback_cutoff_utc"] == "2026-09-07T12:00:00+00:00"
 
 
 def test_shadow_ml_disk_join_removes_temporary_spool(tmp_path: Path) -> None:
