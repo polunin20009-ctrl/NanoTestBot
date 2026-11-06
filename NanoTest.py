@@ -77,6 +77,7 @@ from signal_reputation import (
 from shadow_ml import (
     ROLLING_ARTIFACT_ROLE,
     ROLLING_ARTIFACT_TYPE,
+    DEFAULT_ROLLING_TRAIN_LOOKBACK_DAYS,
     ROLLING_FEATURE_PROFILE,
     ShadowMLConfig,
     append_prediction_record as append_shadow_ml_prediction_record,
@@ -732,6 +733,17 @@ SHADOW_ML_ROLLING_AUTO_RETRAIN = _parse_env_bool(
 # unless explicitly re-enabled.
 SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME = _parse_env_bool(
     "SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME", False
+)
+# Bound rolling challenger training to recent history so feature matrices fit
+# inside SHADOW_ML_WORKER_MEMORY_LIMIT_MB. 0 disables the lookback filter.
+SHADOW_ML_ROLLING_TRAIN_LOOKBACK_DAYS = max(
+    0.0,
+    float(
+        os.environ.get(
+            "SHADOW_ML_ROLLING_TRAIN_LOOKBACK_DAYS",
+            str(DEFAULT_ROLLING_TRAIN_LOOKBACK_DAYS),
+        )
+    ),
 )
 SHADOW_ML_MODEL_FILE = os.environ.get(
     "SHADOW_ML_MODEL_FILE", os.path.join("stats", "shadow_ml_model.json")
@@ -1548,6 +1560,13 @@ SHADOW_ML_WORKER_MEMORY_LIMIT_MB = max(
     512,
     int(os.environ.get("SHADOW_ML_WORKER_MEMORY_LIMIT_MB", "5120")),
 )
+# Rolling feature matrices are heavier than the static incumbent; give the
+# isolated rolling worker a higher address-space ceiling after the 60-day
+# lookback trim. Keep it below host RAM so the live bot stays protected.
+SHADOW_ML_ROLLING_WORKER_MEMORY_LIMIT_MB = max(
+    int(SHADOW_ML_WORKER_MEMORY_LIMIT_MB),
+    int(os.environ.get("SHADOW_ML_ROLLING_WORKER_MEMORY_LIMIT_MB", "6400")),
+)
 SHADOW_ML_CANDIDATE_MIN_FIXTURES = max(
     20, int(os.environ.get("SHADOW_ML_CANDIDATE_MIN_FIXTURES", "150"))
 )
@@ -2135,12 +2154,14 @@ def log_feature_flags() -> None:
     )
     logger.info(
         "[SHADOW_ML_ROLLING_CONFIG] enabled=%s challenger_shadow_only=true "
-        "retrain_on_outcome=%s "
+        "retrain_on_outcome=%s train_lookback_days=%s worker_memory_limit_mb=%s "
         "primary_probability_apply=%s auto_retrain=%s feature_profile=%s "
         "rolling_schema=%s windows=5,10 model_file=%s predictions_file=%s "
         "rotate_max_bytes=%s",
         ENABLE_SHADOW_ML_ROLLING_CHALLENGER,
         SHADOW_ML_ROLLING_RETRAIN_ON_OUTCOME,
+        SHADOW_ML_ROLLING_TRAIN_LOOKBACK_DAYS,
+        SHADOW_ML_ROLLING_WORKER_MEMORY_LIMIT_MB,
         ENABLE_ROLLING_ML_PRIMARY_PROBABILITY,
         SHADOW_ML_ROLLING_AUTO_RETRAIN,
         ROLLING_FEATURE_PROFILE,
@@ -18596,12 +18617,28 @@ def load_joined_observation_history(
 
 def load_shadow_ml_training_history(
     path: Optional[str] = None,
+    *,
+    lookback_days: Optional[float] = None,
+    now: Optional[datetime] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Prepare only possible ML rows using a disk-backed canonical join."""
 
+    min_created_at: Optional[datetime] = None
+    try:
+        days = float(lookback_days) if lookback_days is not None else 0.0
+    except (TypeError, ValueError):
+        days = 0.0
+    if days > 0.0:
+        reference = now or datetime.now(timezone.utc)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        min_created_at = reference.astimezone(timezone.utc) - timedelta(
+            days=days
+        )
     return materialize_training_history(
         iter_observation_history_records(path),
         include_pending=False,
+        min_created_at_utc=min_created_at,
     )
 
 
@@ -20050,27 +20087,55 @@ def _train_shadow_ml_once_local(
         return result
     try:
         history_spool_stats: Optional[Dict[str, int]] = None
+        train_now = datetime.now(timezone.utc)
+        rolling_lookback_days = (
+            float(SHADOW_ML_ROLLING_TRAIN_LOOKBACK_DAYS) if is_rolling else None
+        )
         if history_path is not None:
             records, history_spool_stats = load_shadow_ml_training_history(
-                history_path
+                history_path,
+                lookback_days=rolling_lookback_days,
+                now=train_now,
             )
             logger.info(
                 "[SHADOW_ML_HISTORY_SPOOL] variant=%s scanned=%s observations=%s "
-                "outcomes=%s candidate_payloads=%s materialized_rows=%s",
+                "outcomes=%s candidate_payloads=%s materialized_rows=%s "
+                "lookback_excluded=%s lookback_cutoff=%s",
                 variant,
                 history_spool_stats.get("records_scanned"),
                 history_spool_stats.get("observation_records"),
                 history_spool_stats.get("outcome_records"),
                 history_spool_stats.get("candidate_payloads_seen"),
                 history_spool_stats.get("joined_training_rows"),
+                history_spool_stats.get("observations_excluded_by_lookback"),
+                history_spool_stats.get("lookback_cutoff_utc"),
             )
             result["history_spool"] = dict(history_spool_stats)
         else:
             records = load_joined_observation_history(include_pending=False)
-        summary = summarize_training(records)
+        if is_rolling:
+            summary = summarize_training(
+                records,
+                lookback_days=rolling_lookback_days,
+                now=train_now,
+            )
+        else:
+            summary = summarize_training(records)
         current_fixtures = _safe_int(summary.get("unique_fixtures"), 0)
         result["records"] = _safe_int(summary.get("eligible_records"), 0)
         result["fixtures"] = current_fixtures
+        if is_rolling and isinstance(summary.get("train_lookback"), dict):
+            result["train_lookback"] = dict(summary["train_lookback"])
+            logger.info(
+                "[SHADOW_ML_ROLLING_TRAIN_LOOKBACK] enabled=%s days=%s "
+                "before=%s after=%s excluded=%s cutoff=%s",
+                result["train_lookback"].get("enabled"),
+                result["train_lookback"].get("lookback_days"),
+                result["train_lookback"].get("records_before"),
+                result["train_lookback"].get("records_after"),
+                result["train_lookback"].get("records_excluded"),
+                result["train_lookback"].get("cutoff_utc"),
+            )
 
         current_artifact = load_current_model(force=True)
         previous_summary = (
@@ -20141,11 +20206,19 @@ def _train_shadow_ml_once_local(
                 result["reason"] = "no_retrain_threshold"
                 return result
 
-        artifact = train_model(
-            records,
-            config=_shadow_ml_config(),
-            now=datetime.now(timezone.utc),
-        )
+        if is_rolling:
+            artifact = train_model(
+                records,
+                config=_shadow_ml_config(),
+                now=train_now,
+                lookback_days=rolling_lookback_days,
+            )
+        else:
+            artifact = train_model(
+                records,
+                config=_shadow_ml_config(),
+                now=train_now,
+            )
         if not validate_artifact(artifact):
             raise ValueError("trainer returned an invalid shadow artifact")
         destination = output_path or canonical_model_file
@@ -20169,7 +20242,7 @@ def _train_shadow_ml_once_local(
             }
         )
         logger.info(
-            "[%s] trigger=%s model_id=%s status=%s records=%s fixtures=%s new_fixtures=%s feature_contract_changed=%s data_revision_changed=%s span_days=%s production_apply=false",
+            "[%s] trigger=%s model_id=%s status=%s records=%s fixtures=%s new_fixtures=%s feature_contract_changed=%s data_revision_changed=%s span_days=%s lookback_days=%s production_apply=false",
             "SHADOW_ML_ROLLING_TRAIN" if is_rolling else "SHADOW_ML_TRAIN",
             trigger,
             artifact.get("model_id"),
@@ -20180,6 +20253,7 @@ def _train_shadow_ml_once_local(
             contract_changed,
             data_revision_changed,
             summary.get("span_days"),
+            rolling_lookback_days if is_rolling else None,
         )
         return result
     except MemoryError:
@@ -20341,7 +20415,11 @@ def _train_shadow_ml_once_isolated(
                 worker_environment["GOALBOT_LIBRARY_MODE"] = "1"
                 worker_environment[
                     "GOALBOT_SHADOW_ML_WORKER_MEMORY_LIMIT_MB"
-                ] = str(SHADOW_ML_WORKER_MEMORY_LIMIT_MB)
+                ] = str(
+                    SHADOW_ML_ROLLING_WORKER_MEMORY_LIMIT_MB
+                    if is_rolling
+                    else SHADOW_ML_WORKER_MEMORY_LIMIT_MB
+                )
                 with _shadow_ml_active_process_lock:
                     if _shadow_ml_stop.is_set():
                         result.update(

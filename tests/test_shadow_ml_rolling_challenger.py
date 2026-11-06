@@ -344,3 +344,65 @@ def test_contract_rejects_missing_rolling_schema_and_ignores_deploy_hashes() -> 
     contract = rolling.rolling_feature_contract(invalid)
     assert contract["key"] == ""
     assert contract["error"] == "rolling_schema"
+
+
+def test_rolling_train_lookback_keeps_only_recent_rows() -> None:
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    recent = _observation(10)
+    recent["created_at_utc"] = (now - timedelta(days=10)).isoformat()
+    old = _observation(11)
+    old["created_at_utc"] = (now - timedelta(days=90)).isoformat()
+    undated = _observation(12)
+    undated["created_at_utc"] = "not-a-timestamp"
+
+    kept, meta = rolling.filter_rolling_training_records_by_lookback(
+        [recent, old, undated],
+        lookback_days=60,
+        now=now,
+    )
+    assert [row["fixture_id"] for row in kept] == [10]
+    assert meta["enabled"] is True
+    assert meta["lookback_days"] == 60.0
+    assert meta["records_before"] == 3
+    assert meta["records_after"] == 1
+    assert meta["records_excluded"] == 2
+    assert meta["excluded_missing_timestamp"] == 1
+
+    summary = rolling.summarize_rolling_training_data(
+        [recent, old, undated],
+        lookback_days=60,
+        now=now,
+    )
+    assert summary["train_lookback"]["records_after"] == 1
+    assert summary["records_seen"] == 1
+
+    disabled, disabled_meta = rolling.filter_rolling_training_records_by_lookback(
+        [recent, old],
+        lookback_days=0,
+        now=now,
+    )
+    assert len(disabled) == 2
+    assert disabled_meta["enabled"] is False
+
+
+def test_train_shadow_rolling_model_honours_lookback_days() -> None:
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    rows = []
+    for fixture_id in range(1, 21):
+        row = _observation(fixture_id)
+        # Half the cohort is older than 60 days and must be ignored.
+        age_days = 10 if fixture_id <= 10 else 90
+        row["created_at_utc"] = (now - timedelta(days=age_days)).isoformat()
+        rows.append(row)
+
+    artifact = rolling.train_shadow_rolling_model(
+        rows,
+        config=_config(),
+        now=now,
+        lookback_days=60,
+    )
+    lookback = artifact["training_summary"]["train_lookback"]
+    assert lookback["enabled"] is True
+    assert lookback["records_before"] == 20
+    assert lookback["records_after"] == 10
+    assert artifact["training_summary"]["unique_fixtures"] == 10

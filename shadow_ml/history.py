@@ -13,9 +13,25 @@ import json
 import os
 import sqlite3
 import tempfile
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from outcome_revision import outcome_revision as get_outcome_revision
+
+
+def _parse_created_at_utc(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 _OBSERVATION_UPSERT = """
@@ -142,6 +158,7 @@ def materialize_training_history(
     include_pending: bool = False,
     spool_parent: Optional[os.PathLike[str] | str] = None,
     commit_every: int = 2000,
+    min_created_at_utc: Optional[datetime | str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Join an append-only journal without retaining the raw journal in RAM.
 
@@ -149,15 +166,30 @@ def materialize_training_history(
     keep their JSON payload.  Rank rows for every observation and outcome are
     stored on disk so that a newer incompatible revision correctly supersedes
     an older compatible one, exactly like the legacy in-memory joiner.
+
+    ``min_created_at_utc`` drops older observations before their payloads are
+    spilled/joined, which keeps rolling lookback training inside the worker
+    memory ceiling on long journals.
     """
 
     batch_size = max(1, int(commit_every))
+    min_created_at = (
+        min_created_at_utc
+        if isinstance(min_created_at_utc, datetime)
+        else _parse_created_at_utc(min_created_at_utc)
+    )
     stats = {
         "records_scanned": 0,
         "observation_records": 0,
         "outcome_records": 0,
         "candidate_payloads_seen": 0,
         "joined_training_rows": 0,
+        "observations_excluded_by_lookback": 0,
+        "lookback_cutoff_utc": (
+            min_created_at.astimezone(timezone.utc).isoformat()
+            if min_created_at is not None
+            else None
+        ),
     }
     parent = os.fspath(spool_parent) if spool_parent is not None else None
     with tempfile.TemporaryDirectory(
@@ -180,6 +212,14 @@ def materialize_training_history(
                 created_at = str(raw.get("created_at_utc") or "")
                 if record_type == "observation":
                     stats["observation_records"] += 1
+                    if min_created_at is not None:
+                        parsed_created = _parse_created_at_utc(created_at)
+                        if (
+                            parsed_created is None
+                            or parsed_created < min_created_at
+                        ):
+                            stats["observations_excluded_by_lookback"] += 1
+                            continue
                     training_shape = _has_training_shape(raw)
                     if training_shape:
                         stats["candidate_payloads_seen"] += 1

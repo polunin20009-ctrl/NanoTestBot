@@ -180,6 +180,35 @@ def test_isolated_ml_parent_never_materializes_history(
         bot.SHADOW_ML_WORKER_MEMORY_LIMIT_MB
     )
 
+    process_calls.clear()
+    rolling_artifact = {
+        "artifact_type": bot.ROLLING_ARTIFACT_TYPE,
+        "model_id": "isolated-model",
+        "production_applied": False,
+    }
+    monkeypatch.setattr(bot, "ENABLE_SHADOW_ML_ROLLING_CHALLENGER", True)
+    monkeypatch.setattr(
+        bot,
+        "SHADOW_ML_ROLLING_MODEL_FILE",
+        str(tmp_path / "shadow-rolling-model.json"),
+    )
+    monkeypatch.setattr(
+        bot, "load_shadow_ml_model_file", lambda path: rolling_artifact
+    )
+    monkeypatch.setattr(
+        bot, "_shadow_rolling_artifact_is_safe", lambda value: True
+    )
+    rolling_result = bot._train_shadow_ml_once_isolated(
+        force=True,
+        trigger="test-rolling",
+        variant="rolling",
+    )
+    assert rolling_result["status"] == "trained"
+    _rolling_command, rolling_kwargs = process_calls[0]
+    assert rolling_kwargs["env"]["GOALBOT_SHADOW_ML_WORKER_MEMORY_LIMIT_MB"] == str(
+        bot.SHADOW_ML_ROLLING_WORKER_MEMORY_LIMIT_MB
+    )
+
 
 def test_worker_memory_guard_sets_hard_address_space_limit(monkeypatch) -> None:
     import resource
@@ -220,7 +249,7 @@ def test_local_isolated_worker_uses_spooled_history_loader(
     monkeypatch.setattr(
         bot,
         "load_shadow_ml_training_history",
-        lambda path: (
+        lambda path, **kwargs: (
             records,
             {
                 "records_scanned": 10,
@@ -228,6 +257,8 @@ def test_local_isolated_worker_uses_spooled_history_loader(
                 "outcome_records": 4,
                 "candidate_payloads_seen": 1,
                 "joined_training_rows": 1,
+                "observations_excluded_by_lookback": 0,
+                "lookback_cutoff_utc": None,
             },
         ),
     )
@@ -278,7 +309,7 @@ def test_local_worker_reports_memory_limit_without_replacing_model(
     monkeypatch.setattr(
         bot,
         "load_shadow_ml_training_history",
-        lambda path: (_ for _ in ()).throw(MemoryError()),
+        lambda path, **kwargs: (_ for _ in ()).throw(MemoryError()),
     )
 
     result = bot._train_shadow_ml_once_local(

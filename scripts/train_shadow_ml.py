@@ -173,17 +173,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return 0
 
-    records, history_spool = bot.load_shadow_ml_training_history(args.input)
-    trainer = (
-        bot.train_shadow_rolling_model
+    train_now = datetime.now(timezone.utc)
+    rolling_lookback = (
+        float(bot.SHADOW_ML_ROLLING_TRAIN_LOOKBACK_DAYS)
         if args.variant == "rolling"
-        else train_shadow_model
+        else None
     )
-    artifact = trainer(
-        records,
-        config=bot._shadow_ml_config(),
-        now=datetime.now(timezone.utc),
+    records, history_spool = bot.load_shadow_ml_training_history(
+        args.input,
+        lookback_days=rolling_lookback,
+        now=train_now,
     )
+    if args.variant == "rolling":
+        artifact = bot.train_shadow_rolling_model(
+            records,
+            config=bot._shadow_ml_config(),
+            now=train_now,
+            lookback_days=rolling_lookback,
+        )
+    else:
+        artifact = train_shadow_model(
+            records,
+            config=bot._shadow_ml_config(),
+            now=train_now,
+        )
     written = False
     if not args.dry_run:
         save_model(output, artifact)

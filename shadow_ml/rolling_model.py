@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict
+from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import model as core
@@ -25,6 +26,65 @@ ROLLING_FEATURE_PROFILE = "rolling_5m10m_v1"
 ROLLING_FEATURE_CONTRACT_SCHEMA_VERSION = 1
 ROLLING_WINDOWS = (5, 10)
 ROLLING_OFFLINE_READY_MIN_WINDOW_ROW_FRACTION = 0.60
+# Keep rolling training bounded so the challenger fits in the worker RLIMIT
+# without loading the full multi-month observation journal into feature matrices.
+DEFAULT_ROLLING_TRAIN_LOOKBACK_DAYS = 60.0
+
+
+def filter_rolling_training_records_by_lookback(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    lookback_days: Optional[float],
+    now: Any = None,
+) -> Tuple[List[Mapping[str, Any]], Dict[str, Any]]:
+    """Keep only recent joined observations for rolling challenger training.
+
+    ``lookback_days <= 0`` or ``None`` disables the filter. Records without a
+    parseable ``created_at_utc`` are dropped while the filter is enabled so the
+    memory bound cannot be bypassed by undated rows.
+    """
+
+    materialized = [
+        record for record in records if isinstance(record, Mapping)
+    ]
+    try:
+        days = float(lookback_days) if lookback_days is not None else 0.0
+    except (TypeError, ValueError):
+        days = 0.0
+    meta: Dict[str, Any] = {
+        "enabled": False,
+        "lookback_days": None,
+        "cutoff_utc": None,
+        "records_before": len(materialized),
+        "records_after": len(materialized),
+        "records_excluded": 0,
+        "excluded_missing_timestamp": 0,
+    }
+    if days <= 0.0:
+        return materialized, meta
+
+    reference = core._normalise_now(now)
+    cutoff = reference - timedelta(days=days)
+    kept: List[Mapping[str, Any]] = []
+    missing_timestamp = 0
+    for record in materialized:
+        timestamp = core._parse_timestamp(record.get("created_at_utc"))
+        if timestamp is None:
+            missing_timestamp += 1
+            continue
+        if timestamp >= cutoff:
+            kept.append(record)
+    meta.update(
+        {
+            "enabled": True,
+            "lookback_days": round(days, 6),
+            "cutoff_utc": core._iso_utc(cutoff),
+            "records_after": len(kept),
+            "records_excluded": len(materialized) - len(kept),
+            "excluded_missing_timestamp": missing_timestamp,
+        }
+    )
+    return kept, meta
 
 _ROLLING_METRICS = (
     "xg_total",
@@ -341,10 +401,17 @@ def _rolling_training_data_hash(eligible: Sequence[Mapping[str, Any]]) -> str:
 
 def summarize_rolling_training_data(
     records: Iterable[Mapping[str, Any]],
+    *,
+    lookback_days: Optional[float] = None,
+    now: Any = None,
 ) -> Dict[str, Any]:
     """Summarize only prospectively frozen rolling-compatible rows."""
 
-    materialized = list(records)
+    materialized, lookback_meta = filter_rolling_training_records_by_lookback(
+        records,
+        lookback_days=lookback_days,
+        now=now,
+    )
     all_eligible, excluded, duplicates = _all_rolling_eligible_items(materialized)
     training_contract = _select_contract(all_eligible)
     selected_key = str((training_contract or {}).get("key") or "")
@@ -404,6 +471,7 @@ def summarize_rolling_training_data(
             "excluded": excluded,
             "training_data_hash": _rolling_training_data_hash(eligible),
             "feature_profile": ROLLING_FEATURE_PROFILE,
+            "train_lookback": lookback_meta,
         }
     )
     data_quality = dict(core._as_mapping(summary.get("data_quality")))
@@ -468,14 +536,23 @@ def train_shadow_rolling_model(
     records: Iterable[Mapping[str, Any]],
     config: Optional[core.ShadowMLConfig] = None,
     now: Any = None,
+    *,
+    lookback_days: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Train the deterministic rolling challenger as a separate artifact."""
 
     selected_config = config or core.ShadowMLConfig()
     if not isinstance(selected_config, core.ShadowMLConfig):
         raise TypeError("config must be ShadowMLConfig or None")
-    materialized = list(records)
+    # Filter once here, then summarize the trimmed journal without re-applying
+    # lookback so ``train_lookback.records_before`` stays honest.
+    materialized, lookback_meta = filter_rolling_training_records_by_lookback(
+        records,
+        lookback_days=lookback_days,
+        now=now,
+    )
     summary = summarize_rolling_training_data(materialized)
+    summary["train_lookback"] = lookback_meta
     training_contract = core._as_mapping(summary.get("training_contract"))
     eligible = _materialize_rolling_eligible(
         materialized,
