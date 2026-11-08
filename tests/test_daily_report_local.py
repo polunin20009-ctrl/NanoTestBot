@@ -94,6 +94,36 @@ def test_local_daily_report_waits_for_missing_outcome(monkeypatch, tmp_path) -> 
     assert bot.format_daily_stats_message("2026-07-24") is None
 
 
+def test_local_daily_report_excludes_quarantine_without_blocking(monkeypatch, tmp_path) -> None:
+    snapshots = [
+        _snapshot(501, "2026-07-24T12:00:00+00:00"),
+        _snapshot(502, "2026-07-24T13:00:00+00:00"),
+        _snapshot(503, "2026-07-24T14:00:00+00:00"),
+    ]
+    outcomes = [
+        _outcome(501, "2026-07-24T12:00:00+00:00", "WIN", 58),
+        {
+            **_outcome(502, "2026-07-24T13:00:00+00:00", "UNKNOWN", None),
+            "outcome_integrity_status": "quarantine",
+            "goal_result_source": "unknown",
+        },
+        _outcome(503, "2026-07-24T14:00:00+00:00", "LOSS", None),
+    ]
+    _use_local_files(monkeypatch, tmp_path, snapshots, outcomes)
+
+    collected = bot.collect_local_report_matches("2026-07-24")
+    payload = bot.build_daily_report("2026-07-24", collected["matches"])
+
+    assert collected["all_finished"] is True
+    assert collected["unresolved_ids"] == []
+    assert collected["excluded_ids"] == [502]
+    assert collected["candidate_match_ids"] == [501, 502, 503]
+    assert [match["fixture_id"] for match in collected["matches"]] == [501, 503]
+    assert payload["final_matches_count"] == 2
+    assert payload["plus"] == 1
+    assert payload["minus"] == 1
+
+
 def test_daily_formatter_does_not_access_google_sheets(monkeypatch, tmp_path) -> None:
     snapshots = [_snapshot(301, "2026-07-24T12:00:00+00:00")]
     outcomes = [_outcome(301, "2026-07-24T12:00:00+00:00", "WIN", 76)]
