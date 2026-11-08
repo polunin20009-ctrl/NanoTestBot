@@ -12410,6 +12410,25 @@ def _local_record_signal_date_msk(record: Dict[str, Any]) -> Optional[str]:
     return timestamp.astimezone(_MSK_TZ).strftime("%Y-%m-%d")
 
 
+def _local_outcome_is_terminal_excluded(outcome: Dict[str, Any]) -> bool:
+    """True when a stored outcome is finished but must not count in daily WIN/LOSS.
+
+    Quarantine / void / UNKNOWN integrity outcomes are terminal: the match is
+    done, but the label is intentionally excluded from plus/minus. Without this,
+    one unreliable scoreboard can block the daily Telegram report forever.
+    """
+    if not isinstance(outcome, dict):
+        return False
+    integrity_status = str(outcome.get("outcome_integrity_status") or "").strip().lower()
+    if integrity_status in {"quarantine", "void"}:
+        return True
+    normal_time_result = str(outcome.get("normal_time_result") or "").strip().upper()
+    if normal_time_result in {"UNKNOWN", "VOID"}:
+        return True
+    status = str(outcome.get("status") or "").strip().lower()
+    return status in {"quarantine", "void"}
+
+
 def collect_local_report_matches(report_date_msk) -> Dict[str, Any]:
     """Collect one locally resolved outcome per signalled fixture for an MSK day."""
     if isinstance(report_date_msk, str):
@@ -12442,14 +12461,18 @@ def collect_local_report_matches(report_date_msk) -> Dict[str, Any]:
         if fixture_id > 0:
             candidate_ids.add(fixture_id)
 
-    outcome_by_fixture: Dict[int, Dict[str, Any]] = {}
-    outcome_order: Dict[int, str] = {}
+    latest_by_fixture: Dict[int, Dict[str, Any]] = {}
+    latest_order: Dict[int, str] = {}
     for outcome in outcomes:
         if _local_record_signal_date_msk(outcome) != report_date_str:
             continue
         fixture_id = _safe_int(outcome.get("fixture_id"), 0)
+        if fixture_id <= 0:
+            continue
         normal_time_result = str(outcome.get("normal_time_result") or "").upper()
-        if fixture_id <= 0 or normal_time_result not in {"WIN", "LOSS"}:
+        is_scored = normal_time_result in {"WIN", "LOSS"}
+        is_excluded = _local_outcome_is_terminal_excluded(outcome)
+        if not is_scored and not is_excluded:
             continue
         candidate_ids.add(fixture_id)
         order_key = str(
@@ -12458,16 +12481,20 @@ def collect_local_report_matches(report_date_msk) -> Dict[str, Any]:
             or outcome.get("timestamp_utc")
             or ""
         )
-        if fixture_id not in outcome_by_fixture or order_key >= outcome_order.get(fixture_id, ""):
-            outcome_by_fixture[fixture_id] = dict(outcome)
-            outcome_order[fixture_id] = order_key
+        if fixture_id not in latest_by_fixture or order_key >= latest_order.get(fixture_id, ""):
+            latest_by_fixture[fixture_id] = dict(outcome)
+            latest_order[fixture_id] = order_key
 
     matches: List[Dict[str, Any]] = []
     unresolved_ids: List[int] = []
+    excluded_ids: List[int] = []
     for fixture_id in sorted(candidate_ids):
-        outcome = outcome_by_fixture.get(fixture_id)
+        outcome = latest_by_fixture.get(fixture_id)
         if outcome is None:
             unresolved_ids.append(fixture_id)
+            continue
+        if _local_outcome_is_terminal_excluded(outcome):
+            excluded_ids.append(fixture_id)
             continue
         matches.append(
             {
@@ -12487,6 +12514,7 @@ def collect_local_report_matches(report_date_msk) -> Dict[str, Any]:
         "candidate_match_ids": sorted(candidate_ids),
         "matches": matches,
         "resolved_matches": len(matches),
+        "excluded_ids": excluded_ids,
         "unresolved_ids": unresolved_ids,
         "all_finished": bool(candidate_ids) and not unresolved_ids,
     }
@@ -13905,16 +13933,20 @@ def maybe_send_daily_report(max_rows: int = 2500) -> None:
             unresolved_ids = list(collected.get("unresolved_ids") or [])
 
     matches = list(collected.get("matches") or [])
+    excluded_ids = list(collected.get("excluded_ids") or [])
     logger.info(
         "[DAILY_STATS_LOCAL] report_date=%s candidates=%s resolved=%s unresolved=%s "
-        "snapshots_loaded=%s outcomes_loaded=%s source=local_jsonl",
+        "excluded=%s snapshots_loaded=%s outcomes_loaded=%s source=local_jsonl",
         report_date_str,
         len(candidate_ids),
         len(matches),
         len(unresolved_ids),
+        len(excluded_ids),
         int(collected.get("snapshots_loaded", 0) or 0),
         int(collected.get("outcomes_loaded", 0) or 0),
     )
+    if excluded_ids:
+        logger.info("[DAILY_STATS_LOCAL] excluded_ids=%s", excluded_ids)
     if unresolved_ids:
         logger.info("[DAILY_STATS_LOCAL] unresolved_ids=%s", unresolved_ids)
         logger.info("[DAILY_STATS] waiting_for_all_matches_to_finish report_date=%s", report_date_str)
