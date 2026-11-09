@@ -12,7 +12,9 @@ Same signal, two parallel 1u stakes:
    - 2+ more     => WIN  => +(odds - 1)
 
 Odds frozen from API-Football live quotes at successful send time.
-Missing quotes exclude that leg only. Only signals at/after epoch count.
+When a leg has no usable quote, it is settled with the mean of already-known
+real odds for that same leg (never overwriting a real quote). Only signals
+at/after epoch count.
 """
 
 from __future__ import annotations
@@ -41,6 +43,9 @@ LEG_KEYS = (LEG_EU, LEG_ASIAN)
 
 SELECTION_EU = "over_current_goals_plus_0_5"
 SELECTION_ASIAN = "over_current_goals_plus_1_0"
+
+ODDS_SOURCE_REAL = "real_quote"
+ODDS_SOURCE_IMPUTED_AVG = "imputed_avg_known"
 
 _MSK = timezone(timedelta(hours=3))
 _LOCK = threading.RLock()
@@ -214,6 +219,178 @@ def pnl_units(
     raise ValueError(f"unsupported outcome: {outcome}")
 
 
+def _leg_odds_source(leg: Mapping[str, Any]) -> str:
+    explicit = str(leg.get("odds_source") or "").strip().lower()
+    if explicit:
+        return explicit
+    if str(leg.get("quote_status") or "") == ODDS_SOURCE_IMPUTED_AVG:
+        return ODDS_SOURCE_IMPUTED_AVG
+    return ODDS_SOURCE_REAL
+
+
+def leg_has_real_odds(leg: Optional[Mapping[str, Any]]) -> bool:
+    """True when the leg carries a real market quote (not an imputed average)."""
+    if not isinstance(leg, Mapping):
+        return False
+    if _leg_odds_source(leg) == ODDS_SOURCE_IMPUTED_AVG:
+        return False
+    if str(leg.get("quote_status") or "") != "available":
+        return False
+    odds = _safe_float(leg.get("over_decimal"))
+    return odds is not None and odds > 1.0
+
+
+def average_known_leg_odds(
+    ledger: Mapping[str, Any],
+    leg_key: str,
+) -> Tuple[Optional[float], int]:
+    """Mean over_decimal of real quotes for ``leg_key`` across the ledger."""
+    if leg_key not in LEG_KEYS:
+        raise ValueError(f"unknown leg: {leg_key}")
+    values: list[float] = []
+    for bet in (ledger.get("bets") or {}).values():
+        if not isinstance(bet, Mapping):
+            continue
+        legs = bet.get("legs")
+        if not isinstance(legs, Mapping):
+            continue
+        leg = legs.get(leg_key)
+        if not leg_has_real_odds(leg if isinstance(leg, Mapping) else None):
+            continue
+        odds = _safe_float((leg or {}).get("over_decimal"))
+        if odds is not None and odds > 1.0:
+            values.append(float(odds))
+    if not values:
+        return None, 0
+    return sum(values) / len(values), len(values)
+
+
+def _apply_imputed_odds_to_leg(
+    leg: Dict[str, Any],
+    *,
+    avg_odds: float,
+    known_n: int,
+    goals_at_signal: Optional[int],
+    line_offset: float,
+) -> bool:
+    """Fill a missing-quote leg from the known-odds average. Never touches real quotes."""
+    if leg.get("status") == "settled":
+        return False
+    if leg_has_real_odds(leg):
+        return False
+    existing = _safe_float(leg.get("over_decimal"))
+    if (
+        existing is not None
+        and existing > 1.0
+        and leg.get("status") == "open"
+        and _leg_odds_source(leg) != ODDS_SOURCE_IMPUTED_AVG
+    ):
+        return False
+    if avg_odds <= 1.0 or known_n <= 0:
+        return False
+
+    basis = (
+        leg.get("impute_basis_reason")
+        or leg.get("exclude_reason")
+        or leg.get("quote_status")
+        or "quote_unavailable"
+    )
+    leg["over_decimal"] = float(avg_odds)
+    leg["stake_units"] = float(UNIT_STAKE)
+    leg["status"] = "open"
+    leg["outcome"] = None
+    leg["pnl_units"] = None
+    leg["settled_at_utc"] = None
+    leg["exclude_reason"] = None
+    leg["odds_source"] = ODDS_SOURCE_IMPUTED_AVG
+    leg["quote_status"] = ODDS_SOURCE_IMPUTED_AVG
+    leg["imputed_from_known_n"] = int(known_n)
+    leg["imputed_over_decimal"] = float(avg_odds)
+    leg["impute_basis_reason"] = str(basis)
+    if leg.get("line") is None and goals_at_signal is not None:
+        leg["line"] = float(goals_at_signal) + float(line_offset)
+    if not leg.get("selection"):
+        leg["selection"] = (
+            SELECTION_ASIAN if abs(line_offset - 1.0) < 1e-9 else SELECTION_EU
+        )
+    return True
+
+
+def impute_missing_leg_odds(ledger: Dict[str, Any], *, leg_key: str) -> int:
+    """Impute excluded/missing odds for one leg from the real-odds average.
+
+    Returns the number of legs changed. Real ``available`` quotes are never
+    overwritten. Already-settled real legs are left alone; settled imputed legs
+    keep their frozen imputed odds.
+    """
+    avg, known_n = average_known_leg_odds(ledger, leg_key)
+    if avg is None or known_n <= 0:
+        return 0
+    line_offset = 0.5 if leg_key == LEG_EU else 1.0
+    changed = 0
+    for bet in (ledger.get("bets") or {}).values():
+        if not isinstance(bet, dict):
+            continue
+        legs = bet.get("legs")
+        if not isinstance(legs, dict):
+            continue
+        leg = legs.get(leg_key)
+        if not isinstance(leg, dict):
+            continue
+        if leg.get("status") == "settled":
+            continue
+        goals_at = _safe_int(bet.get("goals_at_signal"))
+        if goals_at is None:
+            goals_at = int(bet.get("score_home") or 0) + int(bet.get("score_away") or 0)
+        if _apply_imputed_odds_to_leg(
+            leg,
+            avg_odds=float(avg),
+            known_n=int(known_n),
+            goals_at_signal=goals_at,
+            line_offset=line_offset,
+        ):
+            changed += 1
+    return changed
+
+
+def backfill_imputed_odds_and_settle(ledger: Dict[str, Any]) -> int:
+    """Impute missing odds, then settle any open legs that already have finals."""
+    ensure_epoch(ledger)
+    changed = 0
+    for leg_key in LEG_KEYS:
+        changed += impute_missing_leg_odds(ledger, leg_key=leg_key)
+
+    for fixture_key, bet in list((ledger.get("bets") or {}).items()):
+        if not isinstance(bet, dict):
+            continue
+        goals_final = _safe_int(bet.get("goals_final"))
+        if goals_final is None:
+            continue
+        legs = bet.get("legs") if isinstance(bet.get("legs"), dict) else {}
+        needs_settle = any(
+            isinstance(legs.get(leg_key), dict)
+            and legs[leg_key].get("status") == "open"
+            for leg_key in LEG_KEYS
+        )
+        if not needs_settle:
+            continue
+        prior_settled = None
+        for leg_key in LEG_KEYS:
+            leg = legs.get(leg_key)
+            if isinstance(leg, dict) and leg.get("settled_at_utc"):
+                prior_settled = leg.get("settled_at_utc")
+                break
+        settle_published_signal_bet(
+            ledger,
+            fixture_id=int(bet.get("fixture_id") or fixture_key),
+            goals_final=int(goals_final),
+            settled_at_utc=prior_settled,
+            impute_missing_odds=False,
+        )
+        changed += 1
+    return changed
+
+
 def _empty_leg(
     *,
     selection: str,
@@ -307,6 +484,30 @@ def open_published_signal_bet(
     if asian_target is None:
         asian_target = float(goals_at_signal) + 1.0
 
+    eu_leg = _empty_leg(
+        selection=SELECTION_EU,
+        line=eu_target,
+        over_decimal=eu_odds,
+        quote_status=eu_quote_status,
+        quote_record_key=eu_quote_record_key,
+        usable=eu_ok,
+        exclude_reason=eu_reason,
+        stake_units=stake_units,
+    )
+    asian_leg = _empty_leg(
+        selection=SELECTION_ASIAN,
+        line=asian_target,
+        over_decimal=asian_odds,
+        quote_status=asian_quote_status,
+        quote_record_key=asian_quote_record_key,
+        usable=asian_ok,
+        exclude_reason=asian_reason,
+        stake_units=stake_units,
+    )
+    if eu_ok:
+        eu_leg["odds_source"] = ODDS_SOURCE_REAL
+    if asian_ok:
+        asian_leg["odds_source"] = ODDS_SOURCE_REAL
     bet = {
         "fixture_id": int(fixture_id),
         "sent_at_utc": _fmt_utc(sent_at),
@@ -319,26 +520,8 @@ def open_published_signal_bet(
         "goals_final": None,
         "goals_after_signal": None,
         "legs": {
-            LEG_EU: _empty_leg(
-                selection=SELECTION_EU,
-                line=eu_target,
-                over_decimal=eu_odds,
-                quote_status=eu_quote_status,
-                quote_record_key=eu_quote_record_key,
-                usable=eu_ok,
-                exclude_reason=eu_reason,
-                stake_units=stake_units,
-            ),
-            LEG_ASIAN: _empty_leg(
-                selection=SELECTION_ASIAN,
-                line=asian_target,
-                over_decimal=asian_odds,
-                quote_status=asian_quote_status,
-                quote_record_key=asian_quote_record_key,
-                usable=asian_ok,
-                exclude_reason=asian_reason,
-                stake_units=stake_units,
-            ),
+            LEG_EU: eu_leg,
+            LEG_ASIAN: asian_leg,
         },
     }
     ledger.setdefault("bets", {})[fixture_key] = bet
@@ -376,6 +559,7 @@ def settle_published_signal_bet(
     goals_final: Optional[int] = None,
     outcome: Optional[str] = None,
     settled_at_utc: Optional[Any] = None,
+    impute_missing_odds: bool = True,
 ) -> Optional[Dict[str, Any]]:
     fixture_key = str(int(fixture_id))
     bet = ledger.setdefault("bets", {}).get(fixture_key)
@@ -410,6 +594,22 @@ def settle_published_signal_bet(
             return bet
     else:
         return bet
+
+    if impute_missing_odds:
+        for leg_key, offset in ((LEG_EU, 0.5), (LEG_ASIAN, 1.0)):
+            leg = legs.get(leg_key)
+            if not isinstance(leg, dict) or leg.get("status") == "settled":
+                continue
+            avg, known_n = average_known_leg_odds(ledger, leg_key)
+            if avg is None:
+                continue
+            _apply_imputed_odds_to_leg(
+                leg,
+                avg_odds=float(avg),
+                known_n=int(known_n),
+                goals_at_signal=goals_at,
+                line_offset=offset,
+            )
 
     eu_leg = legs.get(LEG_EU)
     asian_leg = legs.get(LEG_ASIAN)
@@ -473,6 +673,8 @@ class RoiPeriodSummary:
     avg_odds: Optional[float]
     pass_rate_pct: Optional[float]
     epoch_utc: str
+    imputed: int = 0
+    avg_real_odds: Optional[float] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -486,10 +688,12 @@ class RoiPeriodSummary:
             "push": self.push,
             "excluded": self.excluded,
             "open": self.open_count,
+            "imputed": self.imputed,
             "stake_units": self.stake_units,
             "pnl_units": self.pnl_units,
             "roi_pct": self.roi_pct,
             "avg_odds": self.avg_odds,
+            "avg_real_odds": self.avg_real_odds,
             "pass_rate_pct": self.pass_rate_pct,
             "epoch_utc": self.epoch_utc,
         }
@@ -573,13 +777,16 @@ def summarize_period(
     push = 0
     excluded = 0
     open_count = 0
+    imputed = 0
     stake_sum = 0.0
     pnl_sum = 0.0
     odds_values = []
+    real_odds_values = []
 
     for bet in bets:
         signals += 1
         legs = bet.get("legs") if isinstance(bet.get("legs"), Mapping) else None
+        leg_data: Optional[Mapping[str, Any]] = None
         if legs is None:
             # legacy flat bet: attribute to asian or eu by selection
             market = bet.get("market") if isinstance(bet.get("market"), Mapping) else {}
@@ -593,6 +800,7 @@ def summarize_period(
             odds = _safe_float(market.get("over_decimal"))
             stake = _safe_float(bet.get("stake_units")) or UNIT_STAKE
             pnl = _safe_float(bet.get("pnl_units")) or 0.0
+            odds_source = ODDS_SOURCE_REAL
         else:
             leg_data = legs.get(leg)
             if not isinstance(leg_data, Mapping):
@@ -603,6 +811,7 @@ def summarize_period(
             odds = _safe_float(leg_data.get("over_decimal"))
             stake = _safe_float(leg_data.get("stake_units")) or UNIT_STAKE
             pnl = _safe_float(leg_data.get("pnl_units")) or 0.0
+            odds_source = _leg_odds_source(leg_data)
 
         if status == "open":
             open_count += 1
@@ -614,6 +823,8 @@ def summarize_period(
             excluded += 1
             continue
         settled += 1
+        if odds_source == ODDS_SOURCE_IMPUTED_AVG:
+            imputed += 1
         if outcome == "WIN":
             plus += 1
         elif outcome == "LOSS":
@@ -624,9 +835,14 @@ def summarize_period(
         pnl_sum += pnl
         if odds is not None:
             odds_values.append(odds)
+            if odds_source != ODDS_SOURCE_IMPUTED_AVG:
+                real_odds_values.append(odds)
 
     roi_pct = (pnl_sum / stake_sum * 100.0) if stake_sum > 0 else None
     avg_odds = (sum(odds_values) / len(odds_values)) if odds_values else None
+    avg_real_odds = (
+        sum(real_odds_values) / len(real_odds_values) if real_odds_values else None
+    )
     decided = plus + minus
     pass_rate = (plus / decided * 100.0) if decided > 0 else None
     return RoiPeriodSummary(
@@ -646,6 +862,8 @@ def summarize_period(
         avg_odds=avg_odds,
         pass_rate_pct=pass_rate,
         epoch_utc=_fmt_utc(epoch),
+        imputed=imputed,
+        avg_real_odds=avg_real_odds,
     )
 
 
@@ -656,6 +874,10 @@ def format_roi_message(summary: RoiPeriodSummary) -> str:
         lines.append(f"⏳ Ещё в игре: {summary.open_count}")
     if summary.excluded:
         lines.append(f"➖ Без кэфа / вне ROI: {summary.excluded}")
+    if summary.imputed:
+        lines.append(
+            f"🧮 С средним кэфом известных: {summary.imputed}"
+        )
     lines.append("")
     if summary.settled <= 0:
         lines.append("Пока нет рассчитанных сигналов с коэффициентом.")
@@ -674,7 +896,10 @@ def format_roi_message(summary: RoiPeriodSummary) -> str:
         label = "Проходимость (без возвратов)" if summary.leg == LEG_ASIAN else "Проходимость"
         lines.append(f"📈 {label}: {summary.pass_rate_pct:.0f}%")
     lines.append("")
-    if summary.avg_odds is not None:
+    if summary.avg_real_odds is not None:
+        odds_label = "Over +0.5" if summary.leg == LEG_EU else "азиат Over +1"
+        lines.append(f"💸 Средний кэф известных ({odds_label}): {summary.avg_real_odds:.3f}")
+    elif summary.avg_odds is not None:
         odds_label = "Over +0.5" if summary.leg == LEG_EU else "азиат Over +1"
         lines.append(f"💸 Средний кэф ({odds_label}): {summary.avg_odds:.3f}")
     lines.append(f"📦 Ставок (юниты): {summary.stake_units:.0f}")
@@ -710,7 +935,8 @@ def format_dual_roi_message(
     parts.extend(
         [
             "",
-            "Один сигнал = две параллельные ставки по 1 юниту, когда есть оба кэфа.",
+            "Один сигнал = две параллельные ставки по 1 юниту.",
+            "Нет живого кэфа → берётся средний кэф уже известных сигналов этой же ветки.",
         ]
     )
     return "\n".join(parts)
@@ -784,6 +1010,7 @@ def record_settle_and_save(
             goals_final=goals_final,
             outcome=outcome,
             settled_at_utc=settled_at_utc,
+            impute_missing_odds=True,
         )
         if bet is not None:
             save_ledger(ledger, path)
@@ -826,7 +1053,8 @@ def build_period_message(period: str, *, path: Optional[Any] = None) -> str:
         target = _coerce_path(path)
         ledger = load_ledger(target)
         ensure_epoch(ledger)
-        if not target.exists():
+        repaired = backfill_imputed_odds_and_settle(ledger)
+        if repaired or not target.exists():
             save_ledger(ledger, target)
         eu = summarize_period(ledger, period, leg=LEG_EU)
         asian = summarize_period(ledger, period, leg=LEG_ASIAN)
