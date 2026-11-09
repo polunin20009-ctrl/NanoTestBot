@@ -1148,6 +1148,35 @@ def test_reschedule_detector_ignores_small_kickoff_shift(monkeypatch) -> None:
     assert reason is None
 
 
+def test_reschedule_detector_voids_ns_reset_after_live_without_future_shift(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        nanotest, "DECISION_OUTCOME_RESCHEDULE_MIN_SHIFT_SECONDS", 21_600
+    )
+    reason = nanotest._rescheduled_pending_fixture_void_reason(
+        {
+            "fixture": {
+                # Same original kickoff; provider reset status to NS after live play.
+                "date": "2026-11-08T11:00:00+00:00",
+                "status": {"short": "NS"},
+            }
+        },
+        [
+            {
+                "created_at_utc": "2026-11-08T12:05:26+00:00",
+                "minute": 46,
+            },
+            {
+                "created_at_utc": "2026-11-08T18:06:32+00:00",
+                "minute": 71,
+            },
+        ],
+    )
+
+    assert reason == "fixture_reset_to_ns_after_live"
+
+
 def test_default_schema_versions_are_migrated() -> None:
     assert nanotest.DECISION_SNAPSHOT_SCHEMA_VERSION >= 3
     assert nanotest.DECISION_OUTCOME_SCHEMA_VERSION >= 4

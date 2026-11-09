@@ -943,6 +943,12 @@ WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS = max(
     300,
     int(os.environ.get("WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS", "5400")),
 )
+# Precision discovery last completed near the shared 90-minute ceiling; with more
+# history it now times out. Give that profile a higher dedicated timeout.
+WIDE_RESEARCH_PRECISION_WORKER_TIMEOUT_SECONDS = max(
+    int(WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS),
+    int(os.environ.get("WIDE_RESEARCH_PRECISION_WORKER_TIMEOUT_SECONDS", "9000")),
+)
 WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB = max(
     512,
     int(os.environ.get("WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB", "3072")),
@@ -25443,6 +25449,11 @@ def _run_wide_research_discovery_profile(
                     text=True,
                 )
                 _wide_research_active_process = process
+            worker_timeout_seconds = (
+                float(WIDE_RESEARCH_PRECISION_WORKER_TIMEOUT_SECONDS)
+                if precision
+                else float(WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS)
+            )
             logger.info(
                 "[%s_WORKER_START] trigger=%s pid=%s memory_limit_mb=%s "
                 "timeout_seconds=%s",
@@ -25450,11 +25461,11 @@ def _run_wide_research_discovery_profile(
                 trigger,
                 process.pid,
                 WIDE_RESEARCH_WORKER_MEMORY_LIMIT_MB,
-                WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS,
+                int(worker_timeout_seconds),
             )
             try:
                 stdout, stderr = process.communicate(
-                    timeout=float(WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS)
+                    timeout=worker_timeout_seconds
                 )
             except subprocess.TimeoutExpired:
                 _terminate_subprocess(process)
@@ -25464,7 +25475,7 @@ def _run_wide_research_discovery_profile(
                     "timeout_seconds=%s production_unchanged=true",
                     log_tag,
                     trigger,
-                    WIDE_RESEARCH_WORKER_TIMEOUT_SECONDS,
+                    int(worker_timeout_seconds),
                 )
                 return result
         if process.returncode != 0:
@@ -28690,9 +28701,13 @@ def _rescheduled_pending_fixture_void_reason(
 
     latest_evidence_at = max(evidence_times)
     shift_seconds = (scheduled_at - latest_evidence_at).total_seconds()
-    if shift_seconds < float(DECISION_OUTCOME_RESCHEDULE_MIN_SHIFT_SECONDS):
-        return None
-    return f"fixture_rescheduled_{status_short.lower()}"
+    if shift_seconds >= float(DECISION_OUTCOME_RESCHEDULE_MIN_SHIFT_SECONDS):
+        return f"fixture_rescheduled_{status_short.lower()}"
+    # Provider reset the same fixture id back to NS/TBD after live play without
+    # publishing a future kickoff. Keep the old evidence from poisoning a replay.
+    if scheduled_at <= latest_evidence_at:
+        return f"fixture_reset_to_{status_short.lower()}_after_live"
+    return None
 
 
 def reconcile_pending_decision_outcomes(
