@@ -70,7 +70,14 @@ def test_dual_open_settle_and_compare(tmp_path):
     assert legs101[roi.LEG_ASIAN]["outcome"] == "WIN"
     assert abs(legs101[roi.LEG_EU]["pnl_units"] - 0.20) < 1e-9
     assert abs(legs101[roi.LEG_ASIAN]["pnl_units"] - 1.35) < 1e-9
-    assert loaded["bets"]["102"]["legs"][roi.LEG_ASIAN]["status"] == "excluded"
+    # Asian leg for 102 had no quote, so it is imputed from the known 2.35 average
+    # and settles as PUSH on exactly +1 goal after signal.
+    asian102 = loaded["bets"]["102"]["legs"][roi.LEG_ASIAN]
+    assert asian102["status"] == "settled"
+    assert asian102["odds_source"] == roi.ODDS_SOURCE_IMPUTED_AVG
+    assert abs(float(asian102["over_decimal"]) - 2.35) < 1e-9
+    assert asian102["outcome"] == "PUSH"
+    assert asian102["pnl_units"] == 0.0
     assert loaded["bets"]["102"]["legs"][roi.LEG_EU]["outcome"] == "WIN"
 
     eu = roi.summarize_period(loaded, "all", leg=roi.LEG_EU, now_utc=epoch + timedelta(days=1))
@@ -79,13 +86,15 @@ def test_dual_open_settle_and_compare(tmp_path):
     )
     assert eu.settled == 2 and eu.plus == 2
     assert abs(eu.pnl_units - 0.60) < 1e-9
-    assert asian.settled == 1 and asian.plus == 1 and asian.excluded == 1
+    assert asian.settled == 2 and asian.plus == 1 and asian.push == 1 and asian.excluded == 0
+    assert asian.imputed == 1
     assert abs(asian.pnl_units - 1.35) < 1e-9
 
     message = roi.format_dual_roi_message(eu, asian)
     assert "Over +0.5" in message
     assert "азиат" in message.lower() or "Азиат" in message
     assert "Сравнение ROI" in message
+    assert "средним кэфом" in message.lower()
 
 
 def test_push_only_on_asian(tmp_path):
@@ -145,3 +154,74 @@ def test_open_is_idempotent():
     assert first["legs"][roi.LEG_EU]["over_decimal"] == 1.25
     assert second["legs"][roi.LEG_EU]["over_decimal"] == 1.25
     assert len(ledger["bets"]) == 1
+
+
+def test_backfill_imputes_average_without_touching_real_odds():
+    ledger = roi.empty_ledger(epoch_utc="2026-11-03T21:00:00+00:00")
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=1,
+        sent_at_utc="2026-11-03T22:00:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=50,
+        score_home=1,
+        score_away=0,
+        eu_over_decimal=1.20,
+        eu_quote_status="available",
+        asian_over_decimal=1.40,
+        asian_quote_status="available",
+        asian_line=2.0,
+    )
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=2,
+        sent_at_utc="2026-11-03T22:10:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=55,
+        score_home=0,
+        score_away=0,
+        eu_over_decimal=1.15,
+        eu_quote_status="available",
+        asian_over_decimal=1.20,
+        asian_quote_status="available",
+        asian_line=1.0,
+    )
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=3,
+        sent_at_utc="2026-11-03T22:20:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=60,
+        score_home=2,
+        score_away=1,
+        eu_over_decimal=1.10,
+        eu_quote_status="available",
+        asian_over_decimal=None,
+        asian_quote_status="quote_asian_line_mismatch",
+        asian_line=4.0,
+    )
+    roi.settle_published_signal_bet(ledger, fixture_id=1, goals_final=3)  # +2 WIN
+    roi.settle_published_signal_bet(ledger, fixture_id=2, goals_final=0)  # +0 LOSS
+    # Fixture 3 already has final goals but was left excluded historically.
+    ledger["bets"]["3"]["goals_final"] = 5
+    ledger["bets"]["3"]["goals_after_signal"] = 2
+    ledger["bets"]["3"]["legs"][roi.LEG_EU]["status"] = "settled"
+    ledger["bets"]["3"]["legs"][roi.LEG_EU]["outcome"] = "WIN"
+    ledger["bets"]["3"]["legs"][roi.LEG_EU]["pnl_units"] = 0.10
+    ledger["bets"]["3"]["legs"][roi.LEG_EU]["settled_at_utc"] = "2026-11-03T23:00:00+00:00"
+
+    avg, known_n = roi.average_known_leg_odds(ledger, roi.LEG_ASIAN)
+    assert known_n == 2
+    assert abs(float(avg) - 1.30) < 1e-9
+
+    changed = roi.backfill_imputed_odds_and_settle(ledger)
+    assert changed >= 1
+    asian3 = ledger["bets"]["3"]["legs"][roi.LEG_ASIAN]
+    assert asian3["status"] == "settled"
+    assert asian3["odds_source"] == roi.ODDS_SOURCE_IMPUTED_AVG
+    assert abs(float(asian3["over_decimal"]) - 1.30) < 1e-9
+    assert asian3["outcome"] == "WIN"
+    assert abs(float(asian3["pnl_units"]) - 0.30) < 1e-9
+    # Real odds stay untouched.
+    assert ledger["bets"]["1"]["legs"][roi.LEG_ASIAN]["over_decimal"] == 1.40
+    assert ledger["bets"]["1"]["legs"][roi.LEG_ASIAN]["odds_source"] == roi.ODDS_SOURCE_REAL
