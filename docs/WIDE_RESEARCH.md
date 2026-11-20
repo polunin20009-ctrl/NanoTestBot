@@ -226,8 +226,11 @@ Automatic replacement uses three plain gates: at least 200 resolved outcomes,
 at least 10 elapsed days since the comparable candidate period began, and at
 least a 2 percentage-point hit-rate advantage over the current champion on the
 same comparison period. There is no absolute hit-rate floor. The champion must
-also have 200 resolved outcomes in that period so the direct comparison is defined. Beta
-posterior values and superiority probability remain in the report for
+also have 200 resolved outcomes in that period so the direct comparison is defined.
+When the live champion is degraded (last 40 resolved below 80%), the duel
+instead uses the newest trailing 120 resolved outcomes for both sides, with a
+120-sample floor, while keeping the ordinary 10-day span gate and the same
+2 percentage-point margin. Beta posterior values and superiority probability remain in the report for
 diagnostics and deterministic ranking; they do not authorize or block a swap.
 There is no 99.55% probability gate and no separate minimum champion tenure.
 Near-duplicate rules share one family and cannot cause threshold churn.
@@ -236,11 +239,11 @@ Near-duplicate rules share one family and cannot cause threshold churn.
 recommendation report. `AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY`
 permits an eligible recommendation to swap the active pointer. Demotion,
 promotion, lifecycle audit events, and the checksummed pointer update happen
-in one SQLite transaction. After a switch, a champion below 80% over its last
-40 resolved triggers is atomically returned to `balanced-two-rule`. If the
-baseline itself has the same sustained degradation, publication is suspended;
-it resumes only after its rolling rate reaches 80% or a fully eligible
-challenger replaces it.
+in one SQLite transaction. A degraded champion stays active until a prospective
+challenger wins the duel fairly; the selector does not auto-fall back to
+`balanced-two-rule` solely because of degradation. If the baseline itself is
+active and degraded, publication is suspended; it resumes only after its
+rolling rate reaches 80% or a fully eligible challenger replaces it.
 
 A READY precision rule may be admitted automatically as a frozen singleton
 challenger when `ENABLE_AUTOMATIC_PUBLICATION_DISCOVERY_NOMINATIONS=true`.
