@@ -32,13 +32,20 @@ from .schema import canonical_hash
 from .store import WideResearchStore
 
 
-AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v4"
+AUTOMATIC_CHAMPION_POLICY_VERSION = "automatic_champion_v5"
 AUTOMATIC_CHAMPION_POINTER = "automatic_publication_champion"
 AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION = 1
 DISCOVERY_NOMINATION_PREFIX = "discovery-ready-"
 DISCOVERY_NOMINATION_SOURCE_STATUSES = ("ready", "shadow", "paused")
 DISCOVERY_NOMINATION_MIN_RESOLVED = 200
 DISCOVERY_NOMINATION_MIN_HIT_RATE = 0.86
+_AUTOMATIC_CHAMPION_POLICY_MIGRATIONS = frozenset(
+    {
+        "automatic_champion_v2",
+        "automatic_champion_v3",
+        "automatic_champion_v4",
+    }
+)
 
 
 class AutomaticChampionUnavailable(RuntimeError):
@@ -91,6 +98,14 @@ class AutomaticChampionPolicy:
     degradation_window: int = 40
     degradation_rate: float = 0.80
     degradation_recovery_rate: float = 0.80
+    # When the live champion is degraded, compare both sides on the newest
+    # trailing resolved look instead of waiting for another full 200-sample
+    # accumulation on the shared comparison clock.
+    degraded_duel_look: int = 120
+    degraded_duel_min_resolved: int = 120
+    # Keep the ordinary calendar floor; acceleration comes from the trailing
+    # 120-look sample gate, not from shortening tenure.
+    degraded_duel_min_span_days: float = 10.0
 
     def __post_init__(self) -> None:
         probabilities = (
@@ -116,14 +131,30 @@ class AutomaticChampionPolicy:
             or self.prior_strength <= 0.0
             or not math.isfinite(self.min_span_days)
             or self.min_span_days < 0.0
+            or not math.isfinite(self.degraded_duel_min_span_days)
+            or self.degraded_duel_min_span_days < 0.0
         ):
             raise ValueError("automatic champion scales must be finite")
         counts = (
             self.min_resolved,
             self.degradation_window,
+            self.degraded_duel_look,
+            self.degraded_duel_min_resolved,
         )
         if any(type(value) is not int or value <= 0 for value in counts):
             raise ValueError("automatic champion counts must be positive integers")
+        if self.degraded_duel_min_resolved > self.degraded_duel_look:
+            raise ValueError(
+                "degraded duel min_resolved cannot exceed degraded duel look"
+            )
+        if self.degraded_duel_look < self.degradation_window:
+            raise ValueError(
+                "degraded duel look must cover the degradation window"
+            )
+        if self.degraded_duel_min_resolved > self.min_resolved:
+            raise ValueError(
+                "degraded duel min_resolved must not exceed the ordinary gate"
+            )
 
     def manifest(self) -> dict[str, Any]:
         return asdict(self)
@@ -845,10 +876,7 @@ class AutomaticChampionController:
         """Apply an explicitly supported selector-policy migration."""
 
         previous_policy = _mapping(payload.get("policy"))
-        if previous_policy.get("version") not in {
-            "automatic_champion_v2",
-            "automatic_champion_v3",
-        }:
+        if previous_policy.get("version") not in _AUTOMATIC_CHAMPION_POLICY_MIGRATIONS:
             raise AutomaticChampionUnavailable(
                 "automatic champion policy migration is not authorized"
             )
@@ -865,7 +893,7 @@ class AutomaticChampionController:
                 else None
             ),
             decision={
-                "reason": "selector_policy_v4_activated",
+                "reason": "selector_policy_v5_activated",
                 "previous_policy_hash": payload.get("policy_hash"),
                 "policy_hash": self.policy_hash,
             },
@@ -983,6 +1011,8 @@ class AutomaticChampionController:
         phase_id: str,
         *,
         starts_at: datetime,
+        trailing_resolved: Optional[int] = None,
+        duel_mode: str = "standard",
     ) -> dict[str, Any]:
         rows = []
         pending = 0
@@ -1004,6 +1034,13 @@ class AutomaticChampionController:
                 str(item[1].get("fixture_id") or ""),
             )
         )
+        available_resolved = len(rows)
+        if (
+            trailing_resolved is not None
+            and trailing_resolved > 0
+            and len(rows) > int(trailing_resolved)
+        ):
+            rows = rows[-int(trailing_resolved) :]
         wins = sum(status == "win" for _triggered, _row, status in rows)
         losses = len(rows) - wins
         times = [triggered for triggered, _row, _status in rows]
@@ -1023,6 +1060,7 @@ class AutomaticChampionController:
             status == "win" for _triggered, _row, status in recent
         )
         recent_rate = recent_wins / len(recent) if recent else 1.0
+        window_start = times[0] if times else starts_at
         return {
             "wins": wins,
             "losses": losses,
@@ -1050,13 +1088,33 @@ class AutomaticChampionController:
                 and recent_rate < self.policy.degradation_rate
             ),
             "starts_at_utc": _utc_iso(starts_at),
+            "effective_window_start_utc": _utc_iso(window_start),
+            "available_resolved": available_resolved,
+            "duel_mode": str(duel_mode),
+            "trailing_look": (
+                int(trailing_resolved) if trailing_resolved is not None else None
+            ),
         }
 
-    def _eligibility_reasons(self, metrics: Mapping[str, Any]) -> list[str]:
+    def _eligibility_reasons(
+        self,
+        metrics: Mapping[str, Any],
+        *,
+        min_resolved: Optional[int] = None,
+        min_span_days: Optional[float] = None,
+    ) -> list[str]:
         reasons: list[str] = []
-        if int(metrics["resolved"]) < self.policy.min_resolved:
+        resolved_gate = (
+            self.policy.min_resolved if min_resolved is None else int(min_resolved)
+        )
+        span_gate = (
+            self.policy.min_span_days
+            if min_span_days is None
+            else float(min_span_days)
+        )
+        if int(metrics["resolved"]) < resolved_gate:
             reasons.append("insufficient_resolved")
-        if float(metrics["elapsed_days"]) < self.policy.min_span_days:
+        if float(metrics["elapsed_days"]) < span_gate:
             reasons.append("insufficient_span_days")
         return reasons
 
@@ -1074,10 +1132,9 @@ class AutomaticChampionController:
         if set(contract_reasons) == {
             "policy_hash_mismatch",
             "policy_manifest_mismatch",
-        } and _mapping(payload.get("policy")).get("version") in {
-            "automatic_champion_v2",
-            "automatic_champion_v3",
-        }:
+        } and _mapping(payload.get("policy")).get("version") in (
+            _AUTOMATIC_CHAMPION_POLICY_MIGRATIONS
+        ):
             pointer = self._refresh_policy(pointer, payload, now=now)
             payload, contract_reasons = self._validate_pointer(pointer)
         if (
@@ -1105,6 +1162,46 @@ class AutomaticChampionController:
         }
         family_count = max(1, len(distinct_challenger_families))
 
+        active_phase = phases.get(active_rule_id)
+        active_status_start = max(
+            selector_started,
+            active_since,
+            _parse_utc(active_phase.get("starts_at_utc"))
+            if active_phase is not None
+            else selector_started,
+        )
+        active_status_metrics: Optional[dict[str, Any]] = None
+        if active_phase is not None and active_phase_id:
+            active_status_metrics = self._metrics(
+                active_phase_id,
+                starts_at=active_status_start,
+                duel_mode="standard",
+            )
+            active_status_metrics["elapsed_days"] = max(
+                0.0,
+                (now - active_status_start).total_seconds() / 86400.0,
+            )
+        champion_degraded = bool(
+            active_status_metrics is not None
+            and active_status_metrics.get("degraded")
+        )
+        duel_mode = (
+            "degraded_trailing" if champion_degraded else "standard"
+        )
+        duel_min_resolved = (
+            self.policy.degraded_duel_min_resolved
+            if champion_degraded
+            else self.policy.min_resolved
+        )
+        duel_min_span_days = (
+            self.policy.degraded_duel_min_span_days
+            if champion_degraded
+            else self.policy.min_span_days
+        )
+        duel_trailing = (
+            self.policy.degraded_duel_look if champion_degraded else None
+        )
+
         evaluations: list[dict[str, Any]] = []
         for spec in self.specs:
             phase = phases.get(spec.rule_id)
@@ -1115,6 +1212,7 @@ class AutomaticChampionController:
                         "portfolio_id": spec.portfolio_id,
                         "eligible": False,
                         "reasons": ["phase_missing"],
+                        "duel_mode": duel_mode,
                     }
                 )
                 continue
@@ -1126,13 +1224,18 @@ class AutomaticChampionController:
                 if active_rule_id in phases
                 else selector_started,
             )
-            metrics = self._metrics(
-                str(phase["phase_id"]),
-                starts_at=comparison_start,
-            )
-            metrics["elapsed_days"] = max(
-                0.0, (now - comparison_start).total_seconds() / 86400.0
-            )
+            if spec.rule_id == active_rule_id and active_status_metrics is not None:
+                metrics = dict(active_status_metrics)
+            else:
+                metrics = self._metrics(
+                    str(phase["phase_id"]),
+                    starts_at=comparison_start,
+                    trailing_resolved=duel_trailing,
+                    duel_mode=duel_mode,
+                )
+                metrics["elapsed_days"] = max(
+                    0.0, (now - comparison_start).total_seconds() / 86400.0
+                )
             row = {
                 "rule_id": spec.rule_id,
                 "portfolio_id": spec.portfolio_id,
@@ -1140,12 +1243,17 @@ class AutomaticChampionController:
                 "metrics": metrics,
                 "eligible": False,
                 "reasons": [],
+                "duel_mode": duel_mode,
             }
             if spec.rule_id == active_rule_id:
                 row["reasons"] = ["active_champion"]
                 evaluations.append(row)
                 continue
-            reasons = self._eligibility_reasons(metrics)
+            reasons = self._eligibility_reasons(
+                metrics,
+                min_resolved=duel_min_resolved,
+                min_span_days=duel_min_span_days,
+            )
             if str(phase.get("status") or "") not in {
                 "candidate",
                 "shadow",
@@ -1157,6 +1265,11 @@ class AutomaticChampionController:
             active_metrics = self._metrics(
                 active_phase_id,
                 starts_at=comparison_start,
+                trailing_resolved=duel_trailing,
+                duel_mode=duel_mode,
+            )
+            active_metrics["elapsed_days"] = max(
+                0.0, (now - comparison_start).total_seconds() / 86400.0
             )
             probability = superiority_probability(
                 _mapping(metrics["posterior"]),
@@ -1167,7 +1280,7 @@ class AutomaticChampionController:
                 float(metrics.get("hit_rate") or 0.0)
                 - float(active_metrics.get("hit_rate") or 0.0)
             )
-            if int(active_metrics["resolved"]) < self.policy.min_resolved:
+            if int(active_metrics["resolved"]) < duel_min_resolved:
                 reasons.append("champion_comparison_insufficient_resolved")
             if point_advantage < self.policy.superiority_margin:
                 reasons.append("hit_rate_margin_below_gate")
@@ -1411,6 +1524,7 @@ class AutomaticChampionController:
             ),
             "active_tenure_days": reported_tenure_days,
             "active_degraded": bool(current_metrics.get("degraded")),
+            "duel_mode": duel_mode,
             "degradation_detected_rule_id": (
                 str(active_evaluation.get("rule_id"))
                 if degradation_detected

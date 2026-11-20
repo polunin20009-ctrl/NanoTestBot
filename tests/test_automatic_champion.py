@@ -130,6 +130,9 @@ def _permissive_policy() -> AutomaticChampionPolicy:
         superiority_margin=0.0,
         degradation_window=4,
         degradation_rate=0.5,
+        degraded_duel_look=4,
+        degraded_duel_min_resolved=4,
+        degraded_duel_min_span_days=1.0,
     )
 
 
@@ -585,12 +588,20 @@ def test_default_policy_uses_relative_margin_without_absolute_hit_rate(
     store = _store(tmp_path)
     layer = AutomaticChampionLayer(store, specs, families=families)
     started = datetime.now(UTC) + timedelta(seconds=1)
+    # Keep this case on the ordinary 200-look path: a huge degradation window
+    # prevents the trailing degraded duel from rewriting the margin math.
+    policy = AutomaticChampionPolicy(
+        degradation_window=500,
+        degraded_duel_look=500,
+        degraded_duel_min_resolved=200,
+    )
     controller = AutomaticChampionController(
         store,
         specs,
         families=families,
         baseline_portfolio_id="baseline",
         production_enabled=True,
+        policy=policy,
     )
     controller.reconcile(now_utc=started.isoformat())
 
@@ -640,11 +651,12 @@ def test_default_policy_uses_relative_margin_without_absolute_hit_rate(
         if row["portfolio_id"] == "challenger"
     )
 
+    assert result["duel_mode"] == "standard"
     assert challenger_row["metrics"]["resolved"] == 200
     assert challenger_row["metrics"]["hit_rate"] == (
         challenger_wins / 200
     )
-    assert challenger_row["metrics"]["trigger_days"] == 1
+    assert challenger_row["metrics"]["trigger_days"] >= 1
     assert challenger_row["metrics"]["leagues"] == 1
     assert challenger_row["metrics"]["span_days"] < 1.0
     assert challenger_row["metrics"]["elapsed_days"] == 12.0
@@ -1055,7 +1067,11 @@ def test_staged_production_mode_change_reauthorizes_pointer(tmp_path) -> None:
 
 @pytest.mark.parametrize(
     "previous_version",
-    ("automatic_champion_v2", "automatic_champion_v3"),
+    (
+        "automatic_champion_v2",
+        "automatic_champion_v3",
+        "automatic_champion_v4",
+    ),
 )
 def test_supported_policy_migrates_without_resetting_active_champion(
     tmp_path,
@@ -1093,3 +1109,72 @@ def test_supported_policy_migrates_without_resetting_active_champion(
     assert migrated["active_portfolio_id"] == "baseline"
     assert migrated["active_since_utc"] == first["active_since_utc"]
     assert current.active_selection().generation == 2
+
+
+def test_degraded_champion_uses_trailing_duel_window_to_switch(tmp_path) -> None:
+    """A degraded champion can be replaced on the newest 120-look, not 200."""
+
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 80.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    layer = AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    controller = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+    )
+    controller.reconcile(now_utc=started.isoformat())
+
+    # 180 shared comparable outcomes: strong early stretch, then a collapsing
+    # champion tail. Challenger keeps winning the same fixtures by threshold.
+    for index in range(180):
+        observed = started + timedelta(hours=index)
+        # First 140: both mostly win via high probability.
+        # Last 40: low probability so only the high-threshold challenger wins,
+        # which also drives the champion recent-40 below 80%.
+        probability = 90.0 if index < 140 else 50.0
+        snapshot = _snapshot(
+            5000 + index,
+            probability,
+            observed,
+            league_id=(index % 8) + 1,
+        )
+        layer.process_snapshot(snapshot)
+        _resolve(
+            layer,
+            snapshot,
+            observed,
+            won=probability >= 80.0,
+        )
+
+    blocked = controller.reconcile(
+        now_utc=(started + timedelta(days=12)).isoformat()
+    )
+    blocked_challenger = next(
+        row
+        for row in blocked["evaluations"]
+        if row["portfolio_id"] == "challenger"
+    )
+    blocked_champion = next(
+        row
+        for row in blocked["evaluations"]
+        if row["portfolio_id"] == "baseline"
+    )
+    assert blocked_champion["metrics"]["degraded"] is True
+    assert blocked_champion["metrics"]["resolved"] == 180
+    assert blocked["duel_mode"] == "degraded_trailing"
+    assert blocked_challenger["duel_mode"] == "degraded_trailing"
+    assert blocked_challenger["metrics"]["duel_mode"] == "degraded_trailing"
+    assert blocked_challenger["metrics"]["resolved"] == 120
+    assert blocked_challenger["metrics"]["trailing_look"] == 120
+    assert blocked_challenger["champion_metrics"]["resolved"] == 120
+    # On the trailing 120 look the challenger is ahead enough to clear +2pp.
+    assert blocked_challenger["hit_rate_advantage"] >= 0.02
+    assert blocked_challenger["eligible"] is True
+    assert blocked["switched"] is True
+    assert blocked["active_portfolio_id"] == "challenger"
