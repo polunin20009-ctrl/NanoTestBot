@@ -20,6 +20,15 @@ from typing import Any, Mapping, Optional, Sequence
 
 from .live import WideShadowLayer
 from .portfolio import FrozenPortfolioLayer, FrozenPortfolioSpec
+from .prob_threshold_calibration import (
+    ProbThresholdCalibrationPolicy,
+    apply_dual_prob_threshold_gates,
+    apply_publication_prob_gate,
+    calibrate_dual_publication_floors,
+    extract_bot_prob_to90,
+    extract_rolling_ml_prob_to90,
+    publication_track_calibration,
+)
 from .schema import canonical_hash
 from .store import WideResearchStore
 
@@ -302,6 +311,12 @@ class AutomaticChampionController:
             for spec in sorted(normalized, key=lambda value: value.rule_id)
         }
         self.catalog_hash = canonical_hash(self.catalog)
+        # Kept off the champion policy hash on purpose: recalibrating the
+        # publication probability floor must not invalidate the pointer CAS.
+        self.prob_threshold_policy = ProbThresholdCalibrationPolicy()
+        self._prob_threshold_calibration: Optional[dict[str, Any]] = (
+            self._load_prob_threshold_calibration_from_report()
+        )
 
     def _phases(self) -> dict[str, Mapping[str, Any]]:
         return {
@@ -463,6 +478,121 @@ class AutomaticChampionController:
         """Return the validated active candidate or fail publication closed."""
 
         return self.active_selection().spec
+
+    def _load_prob_threshold_calibration_from_report(
+        self,
+    ) -> Optional[dict[str, Any]]:
+        if not self.report_path:
+            return None
+        path = Path(self.report_path)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        calibration = _mapping(payload.get("prob_threshold_calibration"))
+        return dict(calibration) if calibration else None
+
+    def active_prob_threshold_calibration(
+        self,
+        *,
+        rule_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return the latest calibrated publication floor for one rule."""
+
+        calibration = self._prob_threshold_calibration
+        if not calibration:
+            calibration = self._load_prob_threshold_calibration_from_report()
+            self._prob_threshold_calibration = (
+                dict(calibration) if calibration else None
+            )
+        if not calibration:
+            return None
+        if rule_id is not None and str(calibration.get("rule_id") or "") != str(
+            rule_id
+        ):
+            return None
+        return dict(calibration)
+
+    def publication_min_prob_to90(
+        self,
+        *,
+        rule_id: Optional[str] = None,
+    ) -> Optional[float]:
+        """Return the active calibrated floor, or ``None`` when inactive."""
+
+        calibration = self.active_prob_threshold_calibration(rule_id=rule_id)
+        track = publication_track_calibration(calibration) or _mapping(calibration)
+        if not track or not track.get("active"):
+            return None
+        try:
+            value = float(track.get("selected_threshold"))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def apply_prob_threshold_gate(
+        self,
+        *,
+        combination_allow: bool,
+        bot_prob_to90: Any,
+        rule_id: Optional[str] = None,
+        rolling_ml_prob_to90: Any = None,
+    ) -> dict[str, Any]:
+        """Apply the live bot floor and record the rolling-ML shadow decision."""
+
+        calibration = self.active_prob_threshold_calibration(rule_id=rule_id)
+        if rolling_ml_prob_to90 is None and not _mapping(calibration).get("tracks"):
+            return apply_publication_prob_gate(
+                combination_allow=combination_allow,
+                bot_prob_to90=bot_prob_to90,
+                calibration=calibration,
+            )
+        return apply_dual_prob_threshold_gates(
+            combination_allow=combination_allow,
+            bot_prob_to90=bot_prob_to90,
+            rolling_ml_prob_to90=rolling_ml_prob_to90,
+            calibration=calibration,
+        )
+
+    def _calibration_samples_for_phase(
+        self, phase_id: str
+    ) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        for trigger in self.store.list_triggers(phase_id=phase_id):
+            status = str(trigger.get("latest_outcome_status") or "")
+            if status not in {"win", "loss"}:
+                continue
+            payload = dict(_mapping(trigger.get("input")))
+            payload["outcome_status"] = status
+            if (
+                extract_bot_prob_to90(payload) is None
+                and extract_rolling_ml_prob_to90(payload) is None
+            ):
+                continue
+            samples.append(payload)
+        return samples
+
+    def _calibrate_active_prob_threshold(
+        self,
+        *,
+        rule_id: str,
+        phase_id: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        previous = self.active_prob_threshold_calibration(rule_id=rule_id)
+        samples = self._calibration_samples_for_phase(phase_id)
+        calibration = calibrate_dual_publication_floors(
+            samples,
+            policy=self.prob_threshold_policy,
+            previous=previous,
+            calibrated_at_utc=_utc_iso(now),
+            rule_id=rule_id,
+            phase_id=phase_id,
+        )
+        self._prob_threshold_calibration = dict(calibration)
+        return calibration
 
     def _refresh_production_mode(
         self,
@@ -938,6 +1068,25 @@ class AutomaticChampionController:
             0.0, (now - reported_active_since).total_seconds() / 86400.0
         )
 
+        current_phase_id = str(pointer.get("phase_id") or "")
+        if current_active_rule_id and current_phase_id and not contract_reasons:
+            prob_threshold_calibration = self._calibrate_active_prob_threshold(
+                rule_id=current_active_rule_id,
+                phase_id=current_phase_id,
+                now=now,
+            )
+        else:
+            prob_threshold_calibration = {
+                "schema_version": 1,
+                "version": self.prob_threshold_policy.version,
+                "active": False,
+                "selected_threshold": None,
+                "selection_reason": "champion_unavailable_for_calibration",
+                "rule_id": current_active_rule_id or None,
+                "phase_id": current_phase_id or None,
+            }
+            self._prob_threshold_calibration = dict(prob_threshold_calibration)
+
         result = {
             "schema_version": AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION,
             "generated_at_utc": _utc_iso(now),
@@ -988,6 +1137,7 @@ class AutomaticChampionController:
             "switch_reason": switch_reason,
             "previous_rule_id": previous_rule_id,
             "evaluations": evaluations,
+            "prob_threshold_calibration": prob_threshold_calibration,
         }
         result["checksum"] = canonical_hash(result)
         if self.report_path:

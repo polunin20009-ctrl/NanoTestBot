@@ -641,6 +641,77 @@ def test_automatic_champion_routes_through_validated_active_spec(
     selector.confirm_selection.assert_called_once_with(selection)
 
 
+def test_automatic_champion_calibrated_prob_gate_can_block(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        bot,
+        "build_wide_router_observation",
+        lambda **kwargs: {
+            "observation_id": "1:50:WIDE_ROUTER:v3",
+            "created_at_utc": "2026-01-01T00:00:00+00:00",
+            "market_research": {},
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_build_shadow_candidate_prediction_record",
+        lambda observation, rolling: None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "evaluate_frozen_portfolio",
+        lambda *args, **kwargs: {
+            "reason": "pass",
+            "portfolio_hash": "challenger-hash",
+            "passed_members": ["challenger-member"],
+            "members": [],
+        },
+    )
+    active = MagicMock(
+        portfolio_id="mature-challenger",
+        rule_id="frozen-portfolio-mature-challenger-v1",
+        phase_id="frozen-portfolio-mature-challenger-v1:prospective",
+    )
+    selection = MagicMock()
+    selection.spec = active
+    selection.generation = 7
+    selection.rule_id = active.rule_id
+    selection.pointer_updated_at_utc = "2026-01-01T00:00:00+00:00"
+    selector = MagicMock()
+    selector.active_selection.return_value = selection
+    selector.apply_prob_threshold_gate.return_value = {
+        "combination_allow": True,
+        "calibration_active": True,
+        "selected_threshold": 86.0,
+        "bot_prob_to90": 84.0,
+        "allow": False,
+        "reason": "prob_below_calibrated_threshold",
+    }
+    monkeypatch.setattr(bot, "ENABLE_AUTOMATIC_PUBLICATION_CHAMPION", True)
+    monkeypatch.setattr(
+        bot, "AUTOMATIC_PUBLICATION_CHAMPION_PRODUCTION_APPLY", True
+    )
+    monkeypatch.setattr(
+        bot,
+        "_get_automatic_publication_champion_components",
+        lambda: (MagicMock(), MagicMock(), selector),
+    )
+
+    decision = bot.route_publication_with_balanced_two_rule(
+        fixture_id=1,
+        minute=50,
+        fixture_metrics={},
+        probability_result={"prob_to90": 84.0},
+        current_filter_allow=True,
+    )
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "prob_below_calibrated_threshold"
+    assert decision["publication_min_prob_to90"] == 86.0
+    selector.apply_prob_threshold_gate.assert_called_once()
+
+
 def test_automatic_champion_pointer_change_blocks_publication(
     monkeypatch,
 ) -> None:
