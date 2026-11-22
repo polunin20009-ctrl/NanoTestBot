@@ -111,6 +111,9 @@ from wide_research.automatic_champion import (
     AutomaticChampionController,
     AutomaticChampionLayer,
 )
+from wide_research.prob_threshold_calibration import (
+    rolling_ml_prob_from_prediction,
+)
 from wide_research.controller import WideResearchController
 from market_benchmark.research import CausalQuoteCache
 from wide_research.discovery import (
@@ -23830,13 +23833,20 @@ def route_publication_with_balanced_two_rule(
             if math.isfinite(parsed_prob):
                 bot_prob_to90 = parsed_prob
                 break
+        rolling_ml_prob_to90 = rolling_ml_prob_from_prediction(
+            rolling_prediction
+        )
         prob_threshold_gate = {
             "combination_allow": combination_allow,
             "calibration_active": False,
             "selected_threshold": None,
             "bot_prob_to90": bot_prob_to90,
+            "rolling_ml_prob_to90": rolling_ml_prob_to90,
             "allow": combination_allow,
             "reason": "calibration_not_applicable",
+            "publication_track": "bot",
+            "shadow": {},
+            "disagreement": None,
         }
         if (
             automatic_champion_applied
@@ -23846,6 +23856,7 @@ def route_publication_with_balanced_two_rule(
             gate = automatic_champion_controller.apply_prob_threshold_gate(
                 combination_allow=combination_allow,
                 bot_prob_to90=bot_prob_to90,
+                rolling_ml_prob_to90=rolling_ml_prob_to90,
                 rule_id=automatic_champion_selection.rule_id,
             )
             if isinstance(gate, dict):

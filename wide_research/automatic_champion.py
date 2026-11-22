@@ -22,9 +22,12 @@ from .live import WideShadowLayer
 from .portfolio import FrozenPortfolioLayer, FrozenPortfolioSpec
 from .prob_threshold_calibration import (
     ProbThresholdCalibrationPolicy,
+    apply_dual_prob_threshold_gates,
     apply_publication_prob_gate,
-    calibrate_publication_min_prob,
+    calibrate_dual_publication_floors,
     extract_bot_prob_to90,
+    extract_rolling_ml_prob_to90,
+    publication_track_calibration,
 )
 from .schema import canonical_hash
 from .store import WideResearchStore
@@ -520,10 +523,11 @@ class AutomaticChampionController:
         """Return the active calibrated floor, or ``None`` when inactive."""
 
         calibration = self.active_prob_threshold_calibration(rule_id=rule_id)
-        if not calibration or not calibration.get("active"):
+        track = publication_track_calibration(calibration) or _mapping(calibration)
+        if not track or not track.get("active"):
             return None
         try:
-            value = float(calibration.get("selected_threshold"))
+            value = float(track.get("selected_threshold"))
         except (TypeError, ValueError):
             return None
         return value if math.isfinite(value) else None
@@ -534,13 +538,22 @@ class AutomaticChampionController:
         combination_allow: bool,
         bot_prob_to90: Any,
         rule_id: Optional[str] = None,
+        rolling_ml_prob_to90: Any = None,
     ) -> dict[str, Any]:
-        """Apply the durable calibrated floor to one publication decision."""
+        """Apply the live bot floor and record the rolling-ML shadow decision."""
 
-        return apply_publication_prob_gate(
+        calibration = self.active_prob_threshold_calibration(rule_id=rule_id)
+        if rolling_ml_prob_to90 is None and not _mapping(calibration).get("tracks"):
+            return apply_publication_prob_gate(
+                combination_allow=combination_allow,
+                bot_prob_to90=bot_prob_to90,
+                calibration=calibration,
+            )
+        return apply_dual_prob_threshold_gates(
             combination_allow=combination_allow,
             bot_prob_to90=bot_prob_to90,
-            calibration=self.active_prob_threshold_calibration(rule_id=rule_id),
+            rolling_ml_prob_to90=rolling_ml_prob_to90,
+            calibration=calibration,
         )
 
     def _calibration_samples_for_phase(
@@ -553,7 +566,10 @@ class AutomaticChampionController:
                 continue
             payload = dict(_mapping(trigger.get("input")))
             payload["outcome_status"] = status
-            if extract_bot_prob_to90(payload) is None:
+            if (
+                extract_bot_prob_to90(payload) is None
+                and extract_rolling_ml_prob_to90(payload) is None
+            ):
                 continue
             samples.append(payload)
         return samples
@@ -566,17 +582,11 @@ class AutomaticChampionController:
         now: datetime,
     ) -> dict[str, Any]:
         previous = self.active_prob_threshold_calibration(rule_id=rule_id)
-        previous_threshold = None
-        if previous and previous.get("active"):
-            try:
-                previous_threshold = float(previous.get("selected_threshold"))
-            except (TypeError, ValueError):
-                previous_threshold = None
         samples = self._calibration_samples_for_phase(phase_id)
-        calibration = calibrate_publication_min_prob(
+        calibration = calibrate_dual_publication_floors(
             samples,
             policy=self.prob_threshold_policy,
-            previous_threshold=previous_threshold,
+            previous=previous,
             calibrated_at_utc=_utc_iso(now),
             rule_id=rule_id,
             phase_id=phase_id,
