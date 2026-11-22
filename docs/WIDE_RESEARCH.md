@@ -243,6 +243,29 @@ silently substitutes a different rule. Switching the staged production flag
 is the one contract change that is re-authorized automatically without
 discarding already prospective evidence.
 
+### Publication probability-floor calibration
+
+The combination remains the match-pattern gate. On top of the active automatic
+champion, reconcile calibrates an optional `bot.prob_to90` publication floor
+that maximises trustworthy hit rate rather than bankroll or raw volume.
+
+Each new champion/portfolio trigger stores `calibration_inputs.bot.prob_to90`
+from the frozen feature vector. On reconcile, resolved triggers with a known
+bot probability are scored on a fixed grid (default 75.0–90.0 step 0.5). For
+every floor `t` the selector computes the Wilson lower confidence bound of the
+hit rate among triggers with `prob_to90 >= t`. A floor is eligible only with
+at least 40 such resolved samples. The selected floor must strictly beat the
+no-floor baseline LCB; otherwise the calibrated gate stays inactive and
+publication continues to follow the combination alone.
+
+The chosen floor is written into the checksummed automatic-champion report as
+`prob_threshold_calibration` and does not bump the publication pointer
+generation. Live routing ANDs the combination pass with
+`prob_to90 >= selected_threshold`. If the calibrated gate is active but the
+bot probability is missing, publication fails closed. Small hysteresis keeps
+the previous floor unless another eligible threshold improves LCB by at least
+0.5 percentage points.
+
 The manifest cache never accepts a lower generation or a corrupt update. While
 the process is alive it also rejects different content under the same
 generation. Generations are strict integers starting at 1. After a clean start

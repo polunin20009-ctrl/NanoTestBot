@@ -23815,11 +23815,54 @@ def route_publication_with_balanced_two_rule(
                 automatic_champion_selection
             )
         passed_members = list(evaluation.get("passed_members") or [])
+        combination_allow = bool(passed_members)
+        allow = combination_allow
+        reason = str(evaluation.get("reason") or "no_member_passed")
+        bot_prob_to90 = None
+        for key in ("prob_to90", "final_prob_to90"):
+            raw_prob = (probability_result or {}).get(key)
+            if raw_prob is None or raw_prob == "":
+                continue
+            try:
+                parsed_prob = float(raw_prob)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed_prob):
+                bot_prob_to90 = parsed_prob
+                break
+        prob_threshold_gate = {
+            "combination_allow": combination_allow,
+            "calibration_active": False,
+            "selected_threshold": None,
+            "bot_prob_to90": bot_prob_to90,
+            "allow": combination_allow,
+            "reason": "calibration_not_applicable",
+        }
+        if (
+            automatic_champion_applied
+            and automatic_champion_controller is not None
+            and automatic_champion_selection is not None
+        ):
+            gate = automatic_champion_controller.apply_prob_threshold_gate(
+                combination_allow=combination_allow,
+                bot_prob_to90=bot_prob_to90,
+                rule_id=automatic_champion_selection.rule_id,
+            )
+            if isinstance(gate, dict):
+                prob_threshold_gate = gate
+                allow = bool(gate.get("allow"))
+                if combination_allow and not allow:
+                    reason = str(
+                        gate.get("reason")
+                        or "prob_below_calibrated_threshold"
+                    )
+                elif allow:
+                    reason = str(gate.get("reason") or reason)
         return {
             "applied": True,
-            "allow": bool(passed_members),
+            "allow": allow,
             "source": spec.portfolio_id,
-            "reason": str(evaluation.get("reason") or "no_member_passed"),
+            "reason": reason,
             "rule_id": spec.rule_id,
             "automatic_champion_applied": automatic_champion_applied,
             "generation": (
@@ -23837,6 +23880,12 @@ def route_publication_with_balanced_two_rule(
             "current_filter_allow": bool(current_filter_allow),
             "passed_members": passed_members,
             "members": list(evaluation.get("members") or []),
+            "prob_threshold_gate": prob_threshold_gate,
+            "publication_min_prob_to90": (
+                prob_threshold_gate.get("selected_threshold")
+                if prob_threshold_gate.get("calibration_active")
+                else None
+            ),
         }
     except Exception:
         logger.exception(

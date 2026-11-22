@@ -14,6 +14,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from .features import FEATURE_SCHEMA_VERSION, evaluate_universe, extract_features
 from .live import WideShadowLayer
+from .prob_threshold_calibration import calibration_inputs_from_feature_values
 from .rules import Clause, RuleManifest, evaluate_rule, evaluate_snapshot
 from .schema import DEFAULT_UNIVERSE, FAIL, PASS, canonical_hash
 from .store import WideResearchStore
@@ -419,6 +420,7 @@ class FrozenPortfolioLayer(WideShadowLayer):
             )
             if not passed_members:
                 continue
+            calibration_inputs = calibration_inputs_from_feature_values(values)
             inserted = self.store.claim_first_trigger(
                 phase_id=spec.phase_id,
                 rule_id=spec.rule_id,
@@ -432,6 +434,7 @@ class FrozenPortfolioLayer(WideShadowLayer):
                     "passed_members": passed_members,
                     "member_evaluations": member_results,
                     "matched_values": matched_values,
+                    "calibration_inputs": calibration_inputs,
                     "feature_contracts": dict(
                         _mapping(vector.get("contracts"))
                     ),
