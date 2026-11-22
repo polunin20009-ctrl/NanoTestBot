@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from wide_research.prob_threshold_calibration import (
     ProbThresholdCalibrationPolicy,
+    apply_dual_prob_threshold_gates,
     apply_publication_prob_gate,
+    calibrate_dual_publication_floors,
     calibrate_publication_min_prob,
     calibration_inputs_from_feature_values,
     extract_bot_prob_to90,
+    extract_rolling_ml_prob_to90,
     hit_rate_lcb,
     iter_threshold_grid,
+    rolling_ml_prob_from_prediction,
 )
 
 
@@ -98,12 +102,98 @@ def test_grid_includes_bounds() -> None:
 
 
 def test_extract_and_persist_calibration_inputs() -> None:
-    values = {"bot.prob_to90": 84.25, "bot.baseline_prob_to90": 70.0}
+    values = {
+        "bot.prob_to90": 84.25,
+        "bot.baseline_prob_to90": 70.0,
+        "ml.rolling.prob_to90": 86.5,
+    }
     payload = {"calibration_inputs": calibration_inputs_from_feature_values(values)}
     assert extract_bot_prob_to90(payload) == 84.25
+    assert extract_rolling_ml_prob_to90(payload) == 86.5
     assert extract_bot_prob_to90(
         {"source_input": {"matched_values": {"bot.prob_to90": 79.5}}}
     ) == 79.5
+
+
+def test_rolling_ml_prob_from_prediction_record() -> None:
+    assert (
+        rolling_ml_prob_from_prediction(
+            {
+                "predictions": {
+                    "to90": {
+                        "status": "ok",
+                        "calibrated_probability_pct": 83.25,
+                        "production_applied": False,
+                    }
+                }
+            }
+        )
+        == 83.25
+    )
+    assert (
+        rolling_ml_prob_from_prediction(
+            {
+                "predictions": {
+                    "to90": {
+                        "status": "ok",
+                        "calibrated_probability_pct": 83.25,
+                        "production_applied": True,
+                    }
+                }
+            }
+        )
+        is None
+    )
+
+
+def test_dual_tracks_publish_bot_and_shadow_rolling_ml() -> None:
+    samples = []
+    for idx in range(60):
+        samples.append(
+            {
+                "calibration_inputs": {
+                    "bot.prob_to90": 80.0 + (idx % 5),
+                    "ml.rolling.prob_to90": 82.0 + (idx % 5),
+                },
+                "outcome_status": "win" if idx % 10 else "loss",
+            }
+        )
+    # Dense high-quality rolling-ML pocket above 85.
+    for _ in range(50):
+        samples.append(
+            {
+                "calibration_inputs": {
+                    "bot.prob_to90": 81.0,
+                    "ml.rolling.prob_to90": 86.0,
+                },
+                "outcome_status": "win",
+            }
+        )
+    policy = ProbThresholdCalibrationPolicy(
+        min_resolved=40,
+        min_threshold=80.0,
+        max_threshold=88.0,
+        grid_step=1.0,
+        hysteresis_lcb_eps=0.0,
+        require_improvement_vs_baseline=False,
+    )
+    dual = calibrate_dual_publication_floors(samples, policy=policy)
+    assert dual["publication_track"] == "bot"
+    assert "bot" in dual["tracks"]
+    assert "rolling_ml" in dual["tracks"]
+    assert dual["selected_threshold"] == dual["tracks"]["bot"]["selected_threshold"]
+    assert dual["shadow_comparison"]["comparable_resolved"] > 0
+
+    gate = apply_dual_prob_threshold_gates(
+        combination_allow=True,
+        bot_prob_to90=81.0,
+        rolling_ml_prob_to90=86.0,
+        calibration=dual,
+    )
+    assert gate["publication_track"] == "bot"
+    assert "publication" in gate
+    assert "rolling_ml" in gate["shadow"]
+    assert gate["allow"] == gate["publication"]["allow"]
 
 
 def test_publication_gate_and_fail_closed_without_prob() -> None:

@@ -265,24 +265,33 @@ re-authorized atomically without discarding already prospective evidence.
 ### Publication probability-floor calibration
 
 The combination remains the match-pattern gate. On top of the active automatic
-champion, reconcile calibrates an optional `bot.prob_to90` publication floor
-that maximises trustworthy hit rate rather than bankroll or raw volume.
+champion, reconcile calibrates probability floors that maximise trustworthy hit
+rate rather than bankroll or raw volume.
 
-Each new champion/portfolio trigger stores `calibration_inputs.bot.prob_to90`
-from the frozen feature vector. On reconcile, resolved triggers with a known
-bot probability are scored on a fixed grid (default 75.0–90.0 step 0.5). For
-every floor `t` the selector computes the Wilson lower confidence bound of the
-hit rate among triggers with `prob_to90 >= t`. A floor is eligible only with
-at least 40 such resolved samples. The selected floor must strictly beat the
-no-floor baseline LCB; otherwise the calibrated gate stays inactive and
-publication continues to follow the combination alone.
+Two tracks are calibrated in parallel on the same combination outcomes:
 
-The chosen floor is written into the checksummed automatic-champion report as
+- `bot` (`bot.prob_to90`) — the live publication track
+- `rolling_ml` (`ml.rolling.prob_to90`) — shadow-only comparison track
+
+Each new champion/portfolio trigger stores both values in
+`calibration_inputs` when available. On reconcile, each track scores a fixed
+grid (default 75.0–90.0 step 0.5). For every floor `t` the selector computes
+the Wilson lower confidence bound of the hit rate among triggers with
+probability `>= t`. A floor is eligible only with at least 40 resolved samples
+for that track. The selected floor must strictly beat the no-floor baseline
+LCB; otherwise that track stays inactive.
+
+Only the bot track can block Telegram publication:
+`combination_pass AND bot.prob_to90 >= bot_threshold`. The rolling-ML track is
+evaluated the same way but only logged (`shadow.rolling_ml`, disagreement
+counters, and report `shadow_comparison`). This lets both systems run together
+until enough comparable outcomes show which floor is stronger.
+
+The dual payload is written into the checksummed automatic-champion report as
 `prob_threshold_calibration` and does not bump the publication pointer
-generation. Live routing ANDs the combination pass with
-`prob_to90 >= selected_threshold`. If the calibrated gate is active but the
-bot probability is missing, publication fails closed. Small hysteresis keeps
-the previous floor unless another eligible threshold improves LCB by at least
+generation. If the live bot gate is active but bot probability is missing,
+publication fails closed. Small hysteresis keeps each track's previous floor
+unless another eligible threshold improves that track's LCB by at least
 0.5 percentage points.
 
 The manifest cache never accepts a lower generation or a corrupt update. While
