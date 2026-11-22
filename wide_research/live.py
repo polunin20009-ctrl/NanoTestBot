@@ -18,6 +18,7 @@ from typing import Any, Iterator, Mapping, Optional, Sequence
 
 from .features import FEATURE_SCHEMA_VERSION, extract_features, evaluate_universe
 from .lifecycle import ActiveManifestCache
+from .prob_threshold_calibration import calibration_inputs_from_feature_values
 from .rules import evaluate_rule, evaluate_snapshot, rule_manifest_from_dict
 from .schema import PASS
 from .store import WideResearchStore
@@ -216,6 +217,7 @@ class WideShadowLayer:
                 clause.feature: values.get(clause.feature)
                 for clause in manifest.clauses
             }
+            calibration_inputs = calibration_inputs_from_feature_values(values)
             inserted = self.store.claim_first_trigger(
                 phase_id=str(phase.get("phase_id") or ""),
                 rule_id=manifest.rule_id,
@@ -227,6 +229,7 @@ class WideShadowLayer:
                 input_data={
                     "manifest_hash": manifest.manifest_hash,
                     "matched_values": matched_values,
+                    "calibration_inputs": calibration_inputs,
                     "feature_contracts": dict(
                         _mapping(vector.get("contracts"))
                     ),
