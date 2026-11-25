@@ -200,9 +200,13 @@ def test_backfill_imputes_average_without_touching_real_odds():
         asian_quote_status="quote_asian_line_mismatch",
         asian_line=4.0,
     )
+    assert (
+        ledger["bets"]["3"]["legs"][roi.LEG_ASIAN]["status"]
+        == roi.STATUS_PENDING_QUOTE
+    )
     roi.settle_published_signal_bet(ledger, fixture_id=1, goals_final=3)  # +2 WIN
     roi.settle_published_signal_bet(ledger, fixture_id=2, goals_final=0)  # +0 LOSS
-    # Fixture 3 already has final goals but was left excluded historically.
+    # Fixture 3 already has final goals but was left pending historically.
     ledger["bets"]["3"]["goals_final"] = 5
     ledger["bets"]["3"]["goals_after_signal"] = 2
     ledger["bets"]["3"]["legs"][roi.LEG_EU]["status"] = "settled"
@@ -225,3 +229,129 @@ def test_backfill_imputes_average_without_touching_real_odds():
     # Real odds stay untouched.
     assert ledger["bets"]["1"]["legs"][roi.LEG_ASIAN]["over_decimal"] == 1.40
     assert ledger["bets"]["1"]["legs"][roi.LEG_ASIAN]["odds_source"] == roi.ODDS_SOURCE_REAL
+
+
+def test_missing_quote_opens_as_pending_then_late_fills():
+    ledger = roi.empty_ledger(epoch_utc="2026-11-03T21:00:00+00:00")
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=50,
+        sent_at_utc="2026-11-03T22:00:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=49,
+        score_home=0,
+        score_away=0,
+        eu_over_decimal=1.25,
+        eu_quote_status="available",
+        eu_line=0.5,
+        asian_over_decimal=None,
+        asian_quote_status="no_recent_quote",
+        asian_line=1.0,
+    )
+    asian = ledger["bets"]["50"]["legs"][roi.LEG_ASIAN]
+    assert asian["status"] == roi.STATUS_PENDING_QUOTE
+    assert asian["line"] == 1.0
+    assert roi.apply_late_fill_quote_to_leg(
+        asian,
+        over_decimal=1.95,
+        quote_record_key="asian:50:52",
+        line=1.0,
+        filled_at_utc="2026-11-03T22:03:00+00:00",
+    )
+    assert asian["status"] == roi.STATUS_OPEN
+    assert asian["odds_source"] == roi.ODDS_SOURCE_REAL
+    assert asian["late_filled"] is True
+    assert abs(float(asian["over_decimal"]) - 1.95) < 1e-9
+
+
+def test_goal_before_quote_imputes_average_only():
+    ledger = roi.empty_ledger(epoch_utc="2026-11-03T21:00:00+00:00")
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=1,
+        sent_at_utc="2026-11-03T22:00:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=40,
+        score_home=0,
+        score_away=0,
+        eu_over_decimal=1.30,
+        eu_quote_status="available",
+        asian_over_decimal=2.10,
+        asian_quote_status="available",
+        asian_line=1.0,
+    )
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=2,
+        sent_at_utc="2026-11-03T22:10:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=49,
+        score_home=1,
+        score_away=0,
+        eu_over_decimal=1.20,
+        eu_quote_status="available",
+        asian_over_decimal=None,
+        asian_quote_status="no_recent_quote",
+        asian_line=2.0,
+    )
+    assert roi.impute_leg_with_average(
+        ledger,
+        fixture_id=2,
+        leg_key=roi.LEG_ASIAN,
+        basis_reason=roi.IMPUTE_REASON_GOAL_BEFORE_QUOTE,
+    )
+    asian = ledger["bets"]["2"]["legs"][roi.LEG_ASIAN]
+    assert asian["status"] == roi.STATUS_OPEN
+    assert asian["odds_source"] == roi.ODDS_SOURCE_IMPUTED_AVG
+    assert asian["impute_basis_reason"] == roi.IMPUTE_REASON_GOAL_BEFORE_QUOTE
+    assert abs(float(asian["over_decimal"]) - 2.10) < 1e-9
+    # Late-fill must refuse once the leg is no longer pending.
+    assert (
+        roi.apply_late_fill_quote_to_leg(
+            asian,
+            over_decimal=1.55,
+            quote_record_key="too-late",
+            line=2.0,
+            filled_at_utc="2026-11-03T22:15:00+00:00",
+        )
+        is False
+    )
+
+
+def test_window_expiry_imputes_pending_leg():
+    ledger = roi.empty_ledger(epoch_utc="2026-11-03T21:00:00+00:00")
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=7,
+        sent_at_utc="2026-11-03T22:00:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=50,
+        score_home=0,
+        score_away=0,
+        eu_over_decimal=1.40,
+        eu_quote_status="available",
+        asian_over_decimal=1.80,
+        asian_quote_status="available",
+    )
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=8,
+        sent_at_utc="2026-11-03T22:05:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=55,
+        score_home=0,
+        score_away=0,
+        eu_over_decimal=None,
+        eu_quote_status="no_recent_quote",
+        asian_over_decimal=None,
+        asian_quote_status="no_recent_quote",
+    )
+    assert roi.impute_leg_with_average(
+        ledger,
+        fixture_id=8,
+        leg_key=roi.LEG_EU,
+        basis_reason=roi.IMPUTE_REASON_WINDOW_EXPIRED,
+    )
+    eu = ledger["bets"]["8"]["legs"][roi.LEG_EU]
+    assert eu["impute_basis_reason"] == roi.IMPUTE_REASON_WINDOW_EXPIRED
+    assert abs(float(eu["over_decimal"]) - 1.40) < 1e-9
