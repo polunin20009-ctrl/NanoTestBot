@@ -1178,3 +1178,61 @@ def test_degraded_champion_uses_trailing_duel_window_to_switch(tmp_path) -> None
     assert blocked_challenger["eligible"] is True
     assert blocked["switched"] is True
     assert blocked["active_portfolio_id"] == "challenger"
+
+
+def test_reconcile_calibrates_lcb_for_every_candidate(tmp_path) -> None:
+    baseline = _spec("baseline", 0.0)
+    challenger = _spec("challenger", 0.0)
+    specs = (baseline, challenger)
+    families = {"baseline": "baseline", "challenger": "challenger"}
+    store = _store(tmp_path)
+    AutomaticChampionLayer(store, specs, families=families)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+    report_path = tmp_path / "automatic_publication_champion.json"
+    controller = AutomaticChampionController(
+        store,
+        specs,
+        families=families,
+        baseline_portfolio_id="baseline",
+        production_enabled=True,
+        report_path=str(report_path),
+    )
+    result = controller.reconcile(now_utc=started.isoformat())
+
+    assert result["status"] == "ok"
+    by_rule = result["prob_threshold_calibrations_by_rule"]
+    assert set(by_rule) == {baseline.rule_id, challenger.rule_id}
+    assert result["prob_threshold_calibration"]["rule_id"] == baseline.rule_id
+    assert "grid" not in _mapping_tracks(by_rule[challenger.rule_id])
+    index_ids = {row["rule_id"] for row in result["prob_threshold_calibration_index"]}
+    assert index_ids == {baseline.rule_id, challenger.rule_id}
+
+    # Warm-start lookup: a non-active rule still resolves from the per-rule cache
+    # even when the top-level active payload points at the champion.
+    cached = {
+        "rule_id": challenger.rule_id,
+        "active": True,
+        "selected_threshold": 81.0,
+        "tracks": {
+            "bot": {"active": True, "selected_threshold": 81.0},
+            "rolling_ml": {"active": True, "selected_threshold": 82.0},
+        },
+    }
+    controller._prob_threshold_calibrations_by_rule[challenger.rule_id] = cached
+    controller._prob_threshold_calibration = {
+        "rule_id": baseline.rule_id,
+        "active": False,
+        "selected_threshold": None,
+    }
+    loaded = controller.active_prob_threshold_calibration(
+        rule_id=challenger.rule_id
+    )
+    assert loaded is not None
+    assert loaded["selected_threshold"] == 81.0
+    assert loaded["tracks"]["rolling_ml"]["selected_threshold"] == 82.0
+
+
+def _mapping_tracks(payload: dict) -> dict:
+    tracks = payload.get("tracks") or {}
+    bot = tracks.get("bot") or {}
+    return bot

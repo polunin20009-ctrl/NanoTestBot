@@ -662,6 +662,73 @@ def calibrate_dual_publication_floors(
     return body
 
 
+def slim_dual_calibration_for_cache(
+    calibration: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Drop heavy per-threshold grids while keeping hysteresis state.
+
+    Per-rule report caches keep selected floors / baselines / shadow
+    comparison so a newly promoted champion can warm-start without
+    carrying every grid row for every candidate.
+    """
+
+    payload = dict(_mapping(calibration))
+    if not payload:
+        return {}
+    tracks_out: dict[str, Any] = {}
+    for track_id, track in _mapping(payload.get("tracks")).items():
+        slim_track = {
+            key: value
+            for key, value in dict(track).items()
+            if key != "grid"
+        }
+        tracks_out[str(track_id)] = slim_track
+    if tracks_out:
+        payload["tracks"] = tracks_out
+    # Top-level legacy payloads may also embed a grid.
+    payload.pop("grid", None)
+    return payload
+
+
+def calibration_summary_row(
+    calibration: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compact operator-facing row for one rule's dual LCB state."""
+
+    payload = _mapping(calibration)
+    publication = publication_track_calibration(payload) or {}
+    tracks_in = _mapping(payload.get("tracks"))
+    tracks_out: dict[str, Any] = {}
+    for track_id, track in tracks_in.items():
+        track_payload = _mapping(track)
+        tracks_out[str(track_id)] = {
+            "active": bool(track_payload.get("active")),
+            "selected_threshold": track_payload.get("selected_threshold"),
+            "selection_reason": track_payload.get("selection_reason"),
+            "sample_count_with_prob": track_payload.get(
+                "sample_count_with_prob"
+            ),
+            "baseline": track_payload.get("baseline"),
+        }
+    comparison = _mapping(payload.get("shadow_comparison"))
+    return {
+        "rule_id": payload.get("rule_id"),
+        "phase_id": payload.get("phase_id"),
+        "active": bool(payload.get("active")),
+        "selected_threshold": payload.get("selected_threshold"),
+        "selection_reason": payload.get("selection_reason"),
+        "sample_count_with_prob": payload.get("sample_count_with_prob"),
+        "baseline": publication.get("baseline") or payload.get("baseline"),
+        "tracks": tracks_out,
+        "shadow_comparison": {
+            "comparable_resolved": comparison.get("comparable_resolved"),
+            "overlap": comparison.get("overlap"),
+            "bot_gate": comparison.get("bot_gate"),
+            "rolling_ml_gate": comparison.get("rolling_ml_gate"),
+        },
+    }
+
+
 def apply_publication_prob_gate(
     *,
     combination_allow: bool,
@@ -780,6 +847,7 @@ __all__ = [
     "calibrate_dual_publication_floors",
     "calibrate_publication_min_prob",
     "calibration_inputs_from_feature_values",
+    "calibration_summary_row",
     "extract_bot_prob_to90",
     "extract_prob_feature",
     "extract_rolling_ml_prob_to90",
@@ -788,5 +856,6 @@ __all__ = [
     "publication_track_calibration",
     "rolling_ml_prob_from_prediction",
     "shadow_track_calibration",
+    "slim_dual_calibration_for_cache",
     "summarize_dual_shadow_comparison",
 ]

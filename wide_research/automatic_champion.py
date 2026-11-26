@@ -32,9 +32,11 @@ from .prob_threshold_calibration import (
     apply_dual_prob_threshold_gates,
     apply_publication_prob_gate,
     calibrate_dual_publication_floors,
+    calibration_summary_row,
     extract_bot_prob_to90,
     extract_rolling_ml_prob_to90,
     publication_track_calibration,
+    slim_dual_calibration_for_cache,
 )
 from .rules import rule_manifest_from_dict
 from .schema import canonical_hash
@@ -720,9 +722,22 @@ class AutomaticChampionController:
         # Kept off the champion policy hash on purpose: recalibrating the
         # publication probability floor must not invalidate the pointer CAS.
         self.prob_threshold_policy = ProbThresholdCalibrationPolicy()
+        self._prob_threshold_calibrations_by_rule: dict[str, dict[str, Any]] = (
+            self._load_prob_threshold_calibrations_by_rule_from_report()
+        )
         self._prob_threshold_calibration: Optional[dict[str, Any]] = (
             self._load_prob_threshold_calibration_from_report()
         )
+        if self._prob_threshold_calibration is None:
+            report_active_rule_id = str(
+                self._read_champion_report_payload().get("active_rule_id") or ""
+            )
+            if report_active_rule_id:
+                cached = self._prob_threshold_calibrations_by_rule.get(
+                    report_active_rule_id
+                )
+                if cached:
+                    self._prob_threshold_calibration = dict(cached)
 
     def _phases(self) -> dict[str, Mapping[str, Any]]:
         return {
@@ -978,20 +993,44 @@ class AutomaticChampionController:
 
         return self.active_selection().spec
 
-    def _load_prob_threshold_calibration_from_report(
-        self,
-    ) -> Optional[dict[str, Any]]:
+    def _read_champion_report_payload(self) -> Mapping[str, Any]:
         if not self.report_path:
-            return None
+            return {}
         path = Path(self.report_path)
         if not path.is_file():
-            return None
+            return {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return None
-        calibration = _mapping(payload.get("prob_threshold_calibration"))
+            return {}
+        return payload if isinstance(payload, Mapping) else {}
+
+    def _load_prob_threshold_calibration_from_report(
+        self,
+    ) -> Optional[dict[str, Any]]:
+        calibration = _mapping(
+            self._read_champion_report_payload().get("prob_threshold_calibration")
+        )
         return dict(calibration) if calibration else None
+
+    def _load_prob_threshold_calibrations_by_rule_from_report(
+        self,
+    ) -> dict[str, dict[str, Any]]:
+        payload = self._read_champion_report_payload()
+        raw = payload.get("prob_threshold_calibrations_by_rule")
+        by_rule: dict[str, dict[str, Any]] = {}
+        if isinstance(raw, Mapping):
+            for rule_id, calibration in raw.items():
+                mapped = _mapping(calibration)
+                if not mapped:
+                    continue
+                by_rule[str(rule_id)] = dict(mapped)
+        # Legacy reports only stored the active champion payload.
+        active = _mapping(payload.get("prob_threshold_calibration"))
+        active_rule_id = str(active.get("rule_id") or "")
+        if active and active_rule_id and active_rule_id not in by_rule:
+            by_rule[active_rule_id] = dict(active)
+        return by_rule
 
     def active_prob_threshold_calibration(
         self,
@@ -999,6 +1038,15 @@ class AutomaticChampionController:
         rule_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Return the latest calibrated publication floor for one rule."""
+
+        if not self._prob_threshold_calibrations_by_rule:
+            self._prob_threshold_calibrations_by_rule = (
+                self._load_prob_threshold_calibrations_by_rule_from_report()
+            )
+        if rule_id is not None:
+            cached = self._prob_threshold_calibrations_by_rule.get(str(rule_id))
+            if cached:
+                return dict(cached)
 
         calibration = self._prob_threshold_calibration
         if not calibration:
@@ -1073,25 +1121,95 @@ class AutomaticChampionController:
             samples.append(payload)
         return samples
 
-    def _calibrate_active_prob_threshold(
+    def _calibrate_rule_prob_threshold(
         self,
         *,
         rule_id: str,
         phase_id: str,
         now: datetime,
+        previous: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
-        previous = self.active_prob_threshold_calibration(rule_id=rule_id)
+        prior = (
+            dict(previous)
+            if previous is not None
+            else self.active_prob_threshold_calibration(rule_id=rule_id)
+        )
         samples = self._calibration_samples_for_phase(phase_id)
-        calibration = calibrate_dual_publication_floors(
+        return calibrate_dual_publication_floors(
             samples,
             policy=self.prob_threshold_policy,
-            previous=previous,
+            previous=prior,
             calibrated_at_utc=_utc_iso(now),
             rule_id=rule_id,
             phase_id=phase_id,
         )
-        self._prob_threshold_calibration = dict(calibration)
-        return calibration
+
+    def _calibrate_all_candidate_prob_thresholds(
+        self,
+        *,
+        active_rule_id: str,
+        active_phase_id: str,
+        now: datetime,
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """Calibrate LCB floors for every competing candidate.
+
+        Only the active champion payload is used for live publication gating.
+        Other candidates are calibrated so a later switch can warm-start from
+        their already-selected floors instead of rebuilding evidence from zero.
+        """
+
+        previous_by_rule = dict(self._prob_threshold_calibrations_by_rule)
+        if not previous_by_rule:
+            previous_by_rule = (
+                self._load_prob_threshold_calibrations_by_rule_from_report()
+            )
+        calibrated_by_rule: dict[str, dict[str, Any]] = {}
+        phases = self._phases()
+        for rule_id, phase in sorted(phases.items(), key=lambda item: item[0]):
+            phase_id = str(phase.get("phase_id") or "")
+            if not phase_id:
+                continue
+            calibrated_by_rule[str(rule_id)] = self._calibrate_rule_prob_threshold(
+                rule_id=str(rule_id),
+                phase_id=phase_id,
+                now=now,
+                previous=previous_by_rule.get(str(rule_id)),
+            )
+
+        # Always ensure the current pointer phase is present even if the
+        # catalog/phase join missed it for one reconcile tick.
+        if (
+            active_rule_id
+            and active_phase_id
+            and active_rule_id not in calibrated_by_rule
+        ):
+            calibrated_by_rule[active_rule_id] = self._calibrate_rule_prob_threshold(
+                rule_id=active_rule_id,
+                phase_id=active_phase_id,
+                now=now,
+                previous=previous_by_rule.get(active_rule_id),
+            )
+
+        self._prob_threshold_calibrations_by_rule = {
+            rule_id: dict(payload)
+            for rule_id, payload in calibrated_by_rule.items()
+        }
+        active_calibration = calibrated_by_rule.get(active_rule_id)
+        if active_calibration is None:
+            active_calibration = {
+                "schema_version": 1,
+                "version": self.prob_threshold_policy.version,
+                "active": False,
+                "selected_threshold": None,
+                "selection_reason": "champion_unavailable_for_calibration",
+                "rule_id": active_rule_id or None,
+                "phase_id": active_phase_id or None,
+            }
+        self._prob_threshold_calibration = dict(active_calibration)
+        return dict(active_calibration), {
+            rule_id: dict(payload)
+            for rule_id, payload in calibrated_by_rule.items()
+        }
 
     def _refresh_production_mode(
         self,
@@ -1631,9 +1749,12 @@ class AutomaticChampionController:
 
         current_phase_id = str(pointer.get("phase_id") or "")
         if current_active_rule_id and current_phase_id and not contract_reasons:
-            prob_threshold_calibration = self._calibrate_active_prob_threshold(
-                rule_id=current_active_rule_id,
-                phase_id=current_phase_id,
+            (
+                prob_threshold_calibration,
+                prob_threshold_calibrations_by_rule,
+            ) = self._calibrate_all_candidate_prob_thresholds(
+                active_rule_id=current_active_rule_id,
+                active_phase_id=current_phase_id,
                 now=now,
             )
         else:
@@ -1647,6 +1768,24 @@ class AutomaticChampionController:
                 "phase_id": current_phase_id or None,
             }
             self._prob_threshold_calibration = dict(prob_threshold_calibration)
+            prob_threshold_calibrations_by_rule = dict(
+                self._prob_threshold_calibrations_by_rule
+            )
+
+        prob_threshold_calibrations_by_rule_cached = {
+            rule_id: slim_dual_calibration_for_cache(payload)
+            for rule_id, payload in sorted(
+                prob_threshold_calibrations_by_rule.items(),
+                key=lambda item: item[0],
+            )
+        }
+        prob_threshold_calibration_index = [
+            calibration_summary_row(payload)
+            for _rule_id, payload in sorted(
+                prob_threshold_calibrations_by_rule.items(),
+                key=lambda item: item[0],
+            )
+        ]
 
         result = {
             "schema_version": AUTOMATIC_CHAMPION_REPORT_SCHEMA_VERSION,
@@ -1700,6 +1839,12 @@ class AutomaticChampionController:
             "previous_rule_id": previous_rule_id,
             "evaluations": evaluations,
             "prob_threshold_calibration": prob_threshold_calibration,
+            "prob_threshold_calibrations_by_rule": (
+                prob_threshold_calibrations_by_rule_cached
+            ),
+            "prob_threshold_calibration_index": (
+                prob_threshold_calibration_index
+            ),
         }
         result["checksum"] = canonical_hash(result)
         if self.report_path:

@@ -7,11 +7,13 @@ from wide_research.prob_threshold_calibration import (
     calibrate_dual_publication_floors,
     calibrate_publication_min_prob,
     calibration_inputs_from_feature_values,
+    calibration_summary_row,
     extract_bot_prob_to90,
     extract_rolling_ml_prob_to90,
     hit_rate_lcb,
     iter_threshold_grid,
     rolling_ml_prob_from_prediction,
+    slim_dual_calibration_for_cache,
 )
 
 
@@ -224,3 +226,46 @@ def test_publication_gate_and_fail_closed_without_prob() -> None:
     )
     assert allowed["allow"] is True
     assert allowed["reason"] == "combination_and_calibrated_prob"
+
+
+def test_slim_cache_keeps_selected_floor_and_drops_grid() -> None:
+    samples = (
+        _samples_at(80.0, wins=40, losses=20)
+        + _samples_at(82.0, wins=80, losses=8)
+    )
+    policy = ProbThresholdCalibrationPolicy(
+        min_resolved=40,
+        min_threshold=80.0,
+        max_threshold=85.0,
+        grid_step=1.0,
+        hysteresis_lcb_eps=0.0,
+        require_improvement_vs_baseline=False,
+    )
+    dual = calibrate_dual_publication_floors(
+        [
+            {
+                "calibration_inputs": {
+                    "bot.prob_to90": prob,
+                    "ml.rolling.prob_to90": prob,
+                },
+                "outcome_status": "win" if won else "loss",
+            }
+            for prob, won in samples
+        ],
+        policy=policy,
+        rule_id="rule-a",
+        phase_id="phase-a",
+    )
+    assert dual["tracks"]["bot"]["grid"]
+    slim = slim_dual_calibration_for_cache(dual)
+    assert "grid" not in slim["tracks"]["bot"]
+    assert slim["tracks"]["bot"]["selected_threshold"] == dual["tracks"]["bot"][
+        "selected_threshold"
+    ]
+    assert slim["rule_id"] == "rule-a"
+    row = calibration_summary_row(dual)
+    assert row["rule_id"] == "rule-a"
+    assert row["tracks"]["bot"]["sample_count_with_prob"] == dual[
+        "sample_count_with_prob"
+    ]
+    assert "grid" not in row["tracks"]["bot"]
