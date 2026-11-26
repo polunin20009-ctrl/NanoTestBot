@@ -355,3 +355,74 @@ def test_window_expiry_imputes_pending_leg():
     eu = ledger["bets"]["8"]["legs"][roi.LEG_EU]
     assert eu["impute_basis_reason"] == roi.IMPUTE_REASON_WINDOW_EXPIRED
     assert abs(float(eu["over_decimal"]) - 1.40) < 1e-9
+
+
+def test_settle_excludes_pending_asian_when_no_average_exists():
+    ledger = roi.empty_ledger(epoch_utc="2026-11-03T21:00:00+00:00")
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=11,
+        sent_at_utc="2026-11-03T22:00:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=49,
+        score_home=0,
+        score_away=0,
+        eu_over_decimal=1.12,
+        eu_quote_status="available",
+        eu_line=0.5,
+        asian_over_decimal=None,
+        asian_quote_status="quote_asian_line_mismatch",
+        asian_line=1.0,
+    )
+    asian = ledger["bets"]["11"]["legs"][roi.LEG_ASIAN]
+    assert asian["status"] == roi.STATUS_PENDING_QUOTE
+    roi.settle_published_signal_bet(ledger, fixture_id=11, goals_final=2)
+    eu = ledger["bets"]["11"]["legs"][roi.LEG_EU]
+    asian = ledger["bets"]["11"]["legs"][roi.LEG_ASIAN]
+    assert eu["status"] == "settled"
+    assert eu["outcome"] == "WIN"
+    assert asian["status"] == roi.STATUS_EXCLUDED
+    assert asian["exclude_reason"] == roi.EXCLUDE_REASON_SETTLED_NO_ODDS
+    assert asian["over_decimal"] is None
+    # Finished pending must not remain counted as "still in play".
+    summary = roi.summarize_period(
+        ledger, "all", leg=roi.LEG_ASIAN, now_utc=datetime(2026, 11, 4, tzinfo=timezone.utc)
+    )
+    assert summary.open_count == 0
+    assert summary.excluded == 1
+    assert summary.settled == 0
+
+
+def test_backfill_closes_stale_pending_on_finished_matches():
+    ledger = roi.empty_ledger(epoch_utc="2026-11-03T21:00:00+00:00")
+    roi.open_published_signal_bet(
+        ledger,
+        fixture_id=21,
+        sent_at_utc="2026-11-03T22:00:00+00:00",
+        signal_date_msk="2026-11-03",
+        signal_minute=46,
+        score_home=1,
+        score_away=0,
+        eu_over_decimal=1.10,
+        eu_quote_status="available",
+        asian_over_decimal=None,
+        asian_quote_status="no_recent_quote",
+        asian_line=2.0,
+    )
+    # Simulate historical bug: EU settled, asian left pending after final.
+    ledger["bets"]["21"]["goals_final"] = 3
+    ledger["bets"]["21"]["goals_after_signal"] = 2
+    ledger["bets"]["21"]["legs"][roi.LEG_EU]["status"] = "settled"
+    ledger["bets"]["21"]["legs"][roi.LEG_EU]["outcome"] = "WIN"
+    ledger["bets"]["21"]["legs"][roi.LEG_EU]["pnl_units"] = 0.10
+    ledger["bets"]["21"]["legs"][roi.LEG_EU]["settled_at_utc"] = (
+        "2026-11-03T23:00:00+00:00"
+    )
+    assert ledger["bets"]["21"]["legs"][roi.LEG_ASIAN]["status"] == (
+        roi.STATUS_PENDING_QUOTE
+    )
+    changed = roi.backfill_imputed_odds_and_settle(ledger)
+    assert changed >= 1
+    asian = ledger["bets"]["21"]["legs"][roi.LEG_ASIAN]
+    assert asian["status"] == roi.STATUS_EXCLUDED
+    assert asian["exclude_reason"] == roi.EXCLUDE_REASON_SETTLED_NO_ODDS

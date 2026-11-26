@@ -9464,6 +9464,7 @@ def _refresh_signal_roi_pending_quotes(
         "late_filled": 0,
         "imputed_goal": 0,
         "imputed_expired": 0,
+        "excluded": 0,
         "unchanged": 0,
     }
     if not ENABLE_SIGNAL_ROI:
@@ -9472,11 +9473,13 @@ def _refresh_signal_roi_pending_quotes(
     try:
         with signal_roi._LOCK:
             ledger = signal_roi.load_ledger(SIGNAL_ROI_LEDGER_FILE)
+            # Finished matches must never keep pending legs as "still in play".
+            repaired = signal_roi.backfill_imputed_odds_and_settle(ledger)
             pending_rows = signal_roi.iter_pending_quote_bets(ledger)
             summary["pending"] = len(pending_rows)
-            if not pending_rows:
+            if not pending_rows and not repaired:
                 return summary
-            changed = 0
+            changed = int(repaired)
             for fixture_key, bet, leg_key, leg in pending_rows:
                 fixture_id = _safe_int(bet.get("fixture_id"), -1)
                 if fixture_id < 1:
@@ -9500,6 +9503,20 @@ def _refresh_signal_roi_pending_quotes(
                             fixture_id,
                             leg_key,
                             signal_roi.IMPUTE_REASON_GOAL_BEFORE_QUOTE,
+                        )
+                    elif signal_roi.exclude_pending_leg(
+                        leg,
+                        reason=signal_roi.EXCLUDE_REASON_SETTLED_NO_ODDS,
+                        closed_at_utc=now,
+                    ):
+                        changed += 1
+                        summary["excluded"] += 1
+                        logger.info(
+                            "[SIGNAL_ROI] pending_excluded fixture_id=%s leg=%s "
+                            "reason=%s",
+                            fixture_id,
+                            leg_key,
+                            signal_roi.EXCLUDE_REASON_SETTLED_NO_ODDS,
                         )
                     else:
                         summary["unchanged"] += 1
@@ -9547,6 +9564,20 @@ def _refresh_signal_roi_pending_quotes(
                             fixture_id,
                             leg_key,
                             signal_roi.IMPUTE_REASON_WINDOW_EXPIRED,
+                        )
+                    elif signal_roi.exclude_pending_leg(
+                        leg,
+                        reason=signal_roi.EXCLUDE_REASON_WINDOW_NO_AVG,
+                        closed_at_utc=now,
+                    ):
+                        changed += 1
+                        summary["excluded"] += 1
+                        logger.info(
+                            "[SIGNAL_ROI] pending_excluded fixture_id=%s leg=%s "
+                            "reason=%s",
+                            fixture_id,
+                            leg_key,
+                            signal_roi.EXCLUDE_REASON_WINDOW_NO_AVG,
                         )
                     else:
                         summary["unchanged"] += 1

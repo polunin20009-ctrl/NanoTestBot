@@ -61,6 +61,9 @@ IMPUTE_REASON_GOAL_BEFORE_QUOTE = "goal_before_quote"
 IMPUTE_REASON_WINDOW_EXPIRED = "quote_window_expired"
 IMPUTE_REASON_SETTLED_PENDING = "settled_while_pending"
 
+EXCLUDE_REASON_SETTLED_NO_ODDS = "settled_pending_without_odds"
+EXCLUDE_REASON_WINDOW_NO_AVG = "quote_window_expired_no_avg"
+
 # How long after send we keep hunting for a same-score live quote.
 DEFAULT_QUOTE_FILL_WINDOW_SECONDS = 8 * 60
 
@@ -344,6 +347,27 @@ def apply_late_fill_quote_to_leg(
     return True
 
 
+def exclude_pending_leg(
+    leg: Dict[str, Any],
+    *,
+    reason: str,
+    closed_at_utc: Optional[Any] = None,
+) -> bool:
+    """Close a pending quote that can neither late-fill nor impute."""
+    if not leg_is_pending_quote(leg):
+        return False
+    closed_at = _parse_utc(closed_at_utc) or _utc_now()
+    leg["status"] = STATUS_EXCLUDED
+    leg["exclude_reason"] = str(reason or EXCLUDE_REASON_SETTLED_NO_ODDS)
+    leg["over_decimal"] = None
+    leg["stake_units"] = None
+    leg["outcome"] = None
+    leg["pnl_units"] = None
+    leg["settled_at_utc"] = _fmt_utc(closed_at)
+    leg.pop("pending_deadline_utc", None)
+    return True
+
+
 def _apply_imputed_odds_to_leg(
     leg: Dict[str, Any],
     *,
@@ -522,7 +546,8 @@ def backfill_imputed_odds_and_settle(ledger: Dict[str, Any]) -> int:
         legs = bet.get("legs") if isinstance(bet.get("legs"), dict) else {}
         needs_settle = any(
             isinstance(legs.get(leg_key), dict)
-            and legs[leg_key].get("status") == STATUS_OPEN
+            and str(legs[leg_key].get("status") or "")
+            in {STATUS_OPEN, STATUS_PENDING_QUOTE}
             for leg_key in LEG_KEYS
         )
         if not needs_settle:
@@ -538,7 +563,7 @@ def backfill_imputed_odds_and_settle(ledger: Dict[str, Any]) -> int:
             fixture_id=int(bet.get("fixture_id") or fixture_key),
             goals_final=int(goals_final),
             settled_at_utc=prior_settled,
-            impute_missing_odds=False,
+            impute_missing_odds=True,
         )
         changed += 1
     return changed
@@ -815,24 +840,48 @@ def settle_published_signal_bet(
             }:
                 continue
             avg, known_n = average_known_leg_odds(ledger, leg_key)
-            if avg is None:
-                continue
-            _apply_imputed_odds_to_leg(
-                leg,
-                avg_odds=float(avg),
-                known_n=int(known_n),
-                goals_at_signal=goals_at,
-                line_offset=offset,
-                basis_reason=IMPUTE_REASON_SETTLED_PENDING,
-            )
+            if avg is not None and known_n > 0:
+                _apply_imputed_odds_to_leg(
+                    leg,
+                    avg_odds=float(avg),
+                    known_n=int(known_n),
+                    goals_at_signal=goals_at,
+                    line_offset=offset,
+                    basis_reason=IMPUTE_REASON_SETTLED_PENDING,
+                )
+            elif leg_is_pending_quote(leg):
+                # Match is finished: never leave pending as "still in play".
+                exclude_pending_leg(
+                    leg,
+                    reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                    closed_at_utc=settled_at,
+                )
 
     eu_leg = legs.get(LEG_EU)
     asian_leg = legs.get(LEG_ASIAN)
     if isinstance(eu_leg, dict):
+        if leg_is_pending_quote(eu_leg):
+            exclude_pending_leg(
+                eu_leg,
+                reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                closed_at_utc=settled_at,
+            )
         _settle_leg(eu_leg, outcome=eu_out, settled_at_utc=settled_at)
     if isinstance(asian_leg, dict) and goals_final is not None:
+        if leg_is_pending_quote(asian_leg):
+            exclude_pending_leg(
+                asian_leg,
+                reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                closed_at_utc=settled_at,
+            )
         _settle_leg(asian_leg, outcome=asian_out, settled_at_utc=settled_at)
     elif isinstance(asian_leg, dict) and asian_out in {"WIN", "LOSS", "PUSH"}:
+        if leg_is_pending_quote(asian_leg):
+            exclude_pending_leg(
+                asian_leg,
+                reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                closed_at_utc=settled_at,
+            )
         _settle_leg(asian_leg, outcome=asian_out, settled_at_utc=settled_at)
     return bet
 
