@@ -46,7 +46,7 @@ def _load_msk_timezone():
 
 MSK = _load_msk_timezone()
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError
 
 from second_half.factors import (
@@ -1446,6 +1446,15 @@ ENABLE_SIGNAL_ROI = _parse_env_bool("ENABLE_SIGNAL_ROI", True)
 SIGNAL_ROI_LEDGER_FILE = os.environ.get(
     "SIGNAL_ROI_LEDGER_FILE",
     str(signal_roi.default_state_path()),
+)
+SIGNAL_ROI_QUOTE_FILL_WINDOW_SECONDS = max(
+    60,
+    int(
+        os.environ.get(
+            "SIGNAL_ROI_QUOTE_FILL_WINDOW_SECONDS",
+            str(signal_roi.DEFAULT_QUOTE_FILL_WINDOW_SECONDS),
+        )
+    ),
 )
 AUTOMATIC_PUBLICATION_CHAMPION_FAMILIES = {
     "balanced-two-rule": "balanced-core",
@@ -9319,6 +9328,266 @@ def _record_signal_roi_settle(
         )
     except Exception:
         logger.exception("[SIGNAL_ROI] failed_to_settle fixture_id=%s", match_id)
+
+
+def _roi_late_fill_quote_validation_reason(
+    quote: Mapping[str, Any],
+    *,
+    bet: Mapping[str, Any],
+    leg: Mapping[str, Any],
+    leg_key: str,
+    now_utc: datetime,
+) -> Optional[str]:
+    """Accept the first same-score quote after send, within the fill window."""
+    sent_at = _parse_iso_utc(bet.get("sent_at_utc"))
+    captured_time = _parse_iso_utc(quote.get("captured_at_utc"))
+    if sent_at is None:
+        return "bet_sent_at_missing"
+    if captured_time is None:
+        return "quote_timestamp_missing"
+    if captured_time < sent_at:
+        return "quote_before_send"
+    deadline = signal_roi.pending_quote_deadline_utc(bet, leg)
+    window_seconds = int(
+        bet.get("quote_fill_window_seconds")
+        or SIGNAL_ROI_QUOTE_FILL_WINDOW_SECONDS
+    )
+    if deadline is None:
+        deadline = sent_at + timedelta(seconds=window_seconds)
+    if captured_time > deadline:
+        return "quote_after_fill_window"
+    score_home = _safe_int(bet.get("score_home"), -1)
+    score_away = _safe_int(bet.get("score_away"), -1)
+    if score_home < 0 or score_away < 0:
+        return "bet_score_missing"
+    if (
+        _safe_int(quote.get("score_home"), -2) != score_home
+        or _safe_int(quote.get("score_away"), -2) != score_away
+    ):
+        return "quote_score_mismatch"
+    current_goals = score_home + score_away
+    if _safe_int(quote.get("current_goals"), -1) != current_goals:
+        return "quote_total_mismatch"
+    line = _market_finite_float(quote.get("line"))
+    target_offset = 0.5 if leg_key == signal_roi.LEG_EU else 1.0
+    expected_line = _market_finite_float(leg.get("line"))
+    if expected_line is None:
+        expected_line = float(current_goals) + float(target_offset)
+    if line is None or not math.isclose(line, float(expected_line), abs_tol=1e-9):
+        return (
+            "quote_asian_line_mismatch"
+            if leg_key == signal_roi.LEG_ASIAN
+            else "quote_line_mismatch"
+        )
+    odds = signal_roi.extract_over_decimal(quote)
+    if odds is None or odds <= 1.0:
+        return "quote_odds_missing"
+    if quote.get("shadow_only") is not True:
+        return "quote_not_shadow_only"
+    if quote.get("production_applied") is not False:
+        return "quote_production_flag_invalid"
+    # now_utc reserved for future live-score cross-checks / metrics
+    _ = now_utc
+    return None
+
+
+def _roi_goal_seen_after_signal(
+    history: Sequence[Mapping[str, Any]],
+    *,
+    bet: Mapping[str, Any],
+) -> bool:
+    """True when any post-send quote shows a higher score than the signal."""
+    sent_at = _parse_iso_utc(bet.get("sent_at_utc"))
+    score_home = _safe_int(bet.get("score_home"), -1)
+    score_away = _safe_int(bet.get("score_away"), -1)
+    if sent_at is None or score_home < 0 or score_away < 0:
+        return False
+    goals_at = score_home + score_away
+    for quote in history:
+        if not isinstance(quote, Mapping):
+            continue
+        captured = _parse_iso_utc(quote.get("captured_at_utc"))
+        if captured is None or captured < sent_at:
+            continue
+        quote_goals = _safe_int(quote.get("current_goals"), -1)
+        if quote_goals < 0:
+            qh = _safe_int(quote.get("score_home"), -1)
+            qa = _safe_int(quote.get("score_away"), -1)
+            if qh < 0 or qa < 0:
+                continue
+            quote_goals = qh + qa
+        if quote_goals > goals_at:
+            return True
+    return False
+
+
+def _find_roi_late_fill_quote(
+    history: Sequence[Mapping[str, Any]],
+    *,
+    bet: Mapping[str, Any],
+    leg: Mapping[str, Any],
+    leg_key: str,
+    now_utc: datetime,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    reasons: List[str] = []
+    candidates: List[Tuple[datetime, Dict[str, Any]]] = []
+    for quote in history:
+        if not isinstance(quote, Mapping):
+            continue
+        reason = _roi_late_fill_quote_validation_reason(
+            quote,
+            bet=bet,
+            leg=leg,
+            leg_key=leg_key,
+            now_utc=now_utc,
+        )
+        if reason is not None:
+            reasons.append(reason)
+            continue
+        captured = _parse_iso_utc(quote.get("captured_at_utc"))
+        if captured is None:
+            continue
+        candidates.append((captured, dict(quote)))
+    if not candidates:
+        return None, (reasons[0] if reasons else "no_late_fill_quote")
+    candidates.sort(key=lambda item: (item[0], str(item[1].get("record_key") or "")))
+    return candidates[0][1], "available"
+
+
+def _refresh_signal_roi_pending_quotes(
+    *,
+    now_utc: Optional[datetime] = None,
+) -> Dict[str, int]:
+    """Late-fill pending ROI legs from the market-benchmark quote cache."""
+    summary = {
+        "pending": 0,
+        "late_filled": 0,
+        "imputed_goal": 0,
+        "imputed_expired": 0,
+        "excluded": 0,
+        "unchanged": 0,
+    }
+    if not ENABLE_SIGNAL_ROI:
+        return summary
+    now = now_utc or datetime.now(timezone.utc)
+    try:
+        with signal_roi._LOCK:
+            ledger = signal_roi.load_ledger(SIGNAL_ROI_LEDGER_FILE)
+            # Finished matches must never keep pending legs as "still in play".
+            repaired = signal_roi.backfill_imputed_odds_and_settle(ledger)
+            pending_rows = signal_roi.iter_pending_quote_bets(ledger)
+            summary["pending"] = len(pending_rows)
+            if not pending_rows and not repaired:
+                return summary
+            changed = int(repaired)
+            for fixture_key, bet, leg_key, leg in pending_rows:
+                fixture_id = _safe_int(bet.get("fixture_id"), -1)
+                if fixture_id < 1:
+                    fixture_id = _safe_int(fixture_key, -1)
+                with _market_benchmark_lock:
+                    history = copy.deepcopy(
+                        _market_benchmark_quote_cache.get(int(fixture_id)) or []
+                    )
+                if _roi_goal_seen_after_signal(history, bet=bet):
+                    if signal_roi.impute_leg_with_average(
+                        ledger,
+                        fixture_id=int(fixture_id),
+                        leg_key=leg_key,
+                        basis_reason=signal_roi.IMPUTE_REASON_GOAL_BEFORE_QUOTE,
+                    ):
+                        changed += 1
+                        summary["imputed_goal"] += 1
+                        logger.info(
+                            "[SIGNAL_ROI] pending_imputed fixture_id=%s leg=%s "
+                            "reason=%s",
+                            fixture_id,
+                            leg_key,
+                            signal_roi.IMPUTE_REASON_GOAL_BEFORE_QUOTE,
+                        )
+                    elif signal_roi.exclude_pending_leg(
+                        leg,
+                        reason=signal_roi.EXCLUDE_REASON_SETTLED_NO_ODDS,
+                        closed_at_utc=now,
+                    ):
+                        changed += 1
+                        summary["excluded"] += 1
+                        logger.info(
+                            "[SIGNAL_ROI] pending_excluded fixture_id=%s leg=%s "
+                            "reason=%s",
+                            fixture_id,
+                            leg_key,
+                            signal_roi.EXCLUDE_REASON_SETTLED_NO_ODDS,
+                        )
+                    else:
+                        summary["unchanged"] += 1
+                    continue
+                quote, status = _find_roi_late_fill_quote(
+                    history,
+                    bet=bet,
+                    leg=leg,
+                    leg_key=leg_key,
+                    now_utc=now,
+                )
+                if quote is not None and status == "available":
+                    odds = signal_roi.extract_over_decimal(quote)
+                    if odds is not None and signal_roi.apply_late_fill_quote_to_leg(
+                        leg,
+                        over_decimal=float(odds),
+                        quote_record_key=quote.get("record_key"),
+                        line=_market_finite_float(quote.get("line")),
+                        filled_at_utc=quote.get("captured_at_utc") or now,
+                    ):
+                        changed += 1
+                        summary["late_filled"] += 1
+                        logger.info(
+                            "[SIGNAL_ROI] late_fill fixture_id=%s leg=%s over=%s",
+                            fixture_id,
+                            leg_key,
+                            odds,
+                        )
+                    else:
+                        summary["unchanged"] += 1
+                    continue
+                deadline = signal_roi.pending_quote_deadline_utc(bet, leg)
+                if deadline is not None and now > deadline:
+                    if signal_roi.impute_leg_with_average(
+                        ledger,
+                        fixture_id=int(fixture_id),
+                        leg_key=leg_key,
+                        basis_reason=signal_roi.IMPUTE_REASON_WINDOW_EXPIRED,
+                    ):
+                        changed += 1
+                        summary["imputed_expired"] += 1
+                        logger.info(
+                            "[SIGNAL_ROI] pending_imputed fixture_id=%s leg=%s "
+                            "reason=%s",
+                            fixture_id,
+                            leg_key,
+                            signal_roi.IMPUTE_REASON_WINDOW_EXPIRED,
+                        )
+                    elif signal_roi.exclude_pending_leg(
+                        leg,
+                        reason=signal_roi.EXCLUDE_REASON_WINDOW_NO_AVG,
+                        closed_at_utc=now,
+                    ):
+                        changed += 1
+                        summary["excluded"] += 1
+                        logger.info(
+                            "[SIGNAL_ROI] pending_excluded fixture_id=%s leg=%s "
+                            "reason=%s",
+                            fixture_id,
+                            leg_key,
+                            signal_roi.EXCLUDE_REASON_WINDOW_NO_AVG,
+                        )
+                    else:
+                        summary["unchanged"] += 1
+                else:
+                    summary["unchanged"] += 1
+            if changed:
+                signal_roi.save_ledger(ledger, SIGNAL_ROI_LEDGER_FILE)
+    except Exception:
+        logger.exception("[SIGNAL_ROI] pending_quote_refresh_failed")
+    return summary
 
 
 def _merge_post_send_signal_info(
@@ -21921,6 +22190,9 @@ def _persist_market_benchmark_payload(
     # balanced-two-rule is the production gate and its market-pressure member
     # needs the same causal quote cache regardless of rare-discovery settings.
     _market_research_quote_cache.update(accepted, captured)
+    roi_refresh = _refresh_signal_roi_pending_quotes(
+        now_utc=_parse_iso_utc(captured) or datetime.now(timezone.utc)
+    )
     written_quotes = sum(bool(value) for value in results[: len(accepted)])
     result = {
         "status": "ok" if response_valid else "degraded",
@@ -21930,6 +22202,7 @@ def _persist_market_benchmark_payload(
         "written_quotes": written_quotes,
         "rejection_counts": poll_record["rejection_counts"],
         "cache_fixtures": len(_market_benchmark_quote_cache),
+        "roi_pending_refresh": dict(roi_refresh),
     }
     logger.info(
         "[MARKET_BENCHMARK_POLL] raw=%s accepted=%s written=%s "
@@ -21941,6 +22214,19 @@ def _persist_market_benchmark_payload(
         result["cache_fixtures"],
         result["rejection_counts"],
     )
+    if (
+        roi_refresh.get("late_filled")
+        or roi_refresh.get("imputed_goal")
+        or roi_refresh.get("imputed_expired")
+    ):
+        logger.info(
+            "[SIGNAL_ROI] pending_refresh pending=%s late_filled=%s "
+            "imputed_goal=%s imputed_expired=%s",
+            roi_refresh.get("pending"),
+            roi_refresh.get("late_filled"),
+            roi_refresh.get("imputed_goal"),
+            roi_refresh.get("imputed_expired"),
+        )
     return result
 
 

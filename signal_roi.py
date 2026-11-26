@@ -11,10 +11,15 @@ Same signal, two parallel 1u stakes:
    - exactly 1   => PUSH => 0
    - 2+ more     => WIN  => +(odds - 1)
 
-Odds frozen from API-Football live quotes at successful send time.
-When a leg has no usable quote, it is settled with the mean of already-known
-real odds for that same leg (never overwriting a real quote). Only signals
-at/after epoch count.
+Odds prefer a real live quote:
+- freeze at successful send when available
+- otherwise keep ``pending_quote`` and late-fill the first same-score quote
+  that appears within a short window after send
+- impute the mean of known real odds only when a goal lands before that
+  quote (or the window/settle expires still pending)
+
+Real quotes are never overwritten by an imputed average. Only signals at/after
+epoch count.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_STATE_FILE = Path("stats") / "signal_roi_ledger.json"
 UNIT_STAKE = 1.0
 MODEL_NAME = "dual_over_plus_0_5_and_asian_plus_1_0"
@@ -44,11 +49,37 @@ LEG_KEYS = (LEG_EU, LEG_ASIAN)
 SELECTION_EU = "over_current_goals_plus_0_5"
 SELECTION_ASIAN = "over_current_goals_plus_1_0"
 
+STATUS_OPEN = "open"
+STATUS_PENDING_QUOTE = "pending_quote"
+STATUS_EXCLUDED = "excluded"
+STATUS_SETTLED = "settled"
+
 ODDS_SOURCE_REAL = "real_quote"
 ODDS_SOURCE_IMPUTED_AVG = "imputed_avg_known"
 
+IMPUTE_REASON_GOAL_BEFORE_QUOTE = "goal_before_quote"
+IMPUTE_REASON_WINDOW_EXPIRED = "quote_window_expired"
+IMPUTE_REASON_SETTLED_PENDING = "settled_while_pending"
+
+EXCLUDE_REASON_SETTLED_NO_ODDS = "settled_pending_without_odds"
+EXCLUDE_REASON_WINDOW_NO_AVG = "quote_window_expired_no_avg"
+
+# How long after send we keep hunting for a same-score live quote.
+DEFAULT_QUOTE_FILL_WINDOW_SECONDS = 8 * 60
+
 _MSK = timezone(timedelta(hours=3))
 _LOCK = threading.RLock()
+
+
+def quote_fill_window_seconds() -> int:
+    raw = os.environ.get("SIGNAL_ROI_QUOTE_FILL_WINDOW_SECONDS", "").strip()
+    if not raw:
+        return int(DEFAULT_QUOTE_FILL_WINDOW_SECONDS)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(DEFAULT_QUOTE_FILL_WINDOW_SECONDS)
+    return max(60, value)
 
 
 def _utc_now() -> datetime:
@@ -234,10 +265,26 @@ def leg_has_real_odds(leg: Optional[Mapping[str, Any]]) -> bool:
         return False
     if _leg_odds_source(leg) == ODDS_SOURCE_IMPUTED_AVG:
         return False
+    if str(leg.get("status") or "") not in {STATUS_OPEN, STATUS_SETTLED}:
+        return False
     if str(leg.get("quote_status") or "") != "available":
         return False
     odds = _safe_float(leg.get("over_decimal"))
     return odds is not None and odds > 1.0
+
+
+def leg_is_pending_quote(leg: Optional[Mapping[str, Any]]) -> bool:
+    return isinstance(leg, Mapping) and str(leg.get("status") or "") == STATUS_PENDING_QUOTE
+
+
+def pending_quote_deadline_utc(bet: Mapping[str, Any], leg: Mapping[str, Any]) -> Optional[datetime]:
+    explicit = _parse_utc(leg.get("pending_deadline_utc"))
+    if explicit is not None:
+        return explicit
+    sent = _parse_utc(bet.get("sent_at_utc"))
+    if sent is None:
+        return None
+    return sent + timedelta(seconds=quote_fill_window_seconds())
 
 
 def average_known_leg_odds(
@@ -265,6 +312,62 @@ def average_known_leg_odds(
     return sum(values) / len(values), len(values)
 
 
+def apply_late_fill_quote_to_leg(
+    leg: Dict[str, Any],
+    *,
+    over_decimal: float,
+    quote_record_key: Optional[str],
+    line: Optional[float],
+    filled_at_utc: Any,
+) -> bool:
+    """Attach a real same-score quote to a pending leg. Never touches real legs."""
+    if not leg_is_pending_quote(leg):
+        return False
+    odds = _safe_float(over_decimal)
+    if odds is None or odds <= 1.0:
+        return False
+    filled_at = _parse_utc(filled_at_utc) or _utc_now()
+    leg["over_decimal"] = float(odds)
+    leg["stake_units"] = float(UNIT_STAKE)
+    leg["status"] = STATUS_OPEN
+    leg["outcome"] = None
+    leg["pnl_units"] = None
+    leg["settled_at_utc"] = None
+    leg["exclude_reason"] = None
+    leg["odds_source"] = ODDS_SOURCE_REAL
+    leg["quote_status"] = "available"
+    leg["quote_record_key"] = (
+        str(quote_record_key) if quote_record_key else leg.get("quote_record_key")
+    )
+    if line is not None:
+        leg["line"] = float(line)
+    leg["late_filled"] = True
+    leg["late_filled_at_utc"] = _fmt_utc(filled_at)
+    leg.pop("pending_deadline_utc", None)
+    return True
+
+
+def exclude_pending_leg(
+    leg: Dict[str, Any],
+    *,
+    reason: str,
+    closed_at_utc: Optional[Any] = None,
+) -> bool:
+    """Close a pending quote that can neither late-fill nor impute."""
+    if not leg_is_pending_quote(leg):
+        return False
+    closed_at = _parse_utc(closed_at_utc) or _utc_now()
+    leg["status"] = STATUS_EXCLUDED
+    leg["exclude_reason"] = str(reason or EXCLUDE_REASON_SETTLED_NO_ODDS)
+    leg["over_decimal"] = None
+    leg["stake_units"] = None
+    leg["outcome"] = None
+    leg["pnl_units"] = None
+    leg["settled_at_utc"] = _fmt_utc(closed_at)
+    leg.pop("pending_deadline_utc", None)
+    return True
+
+
 def _apply_imputed_odds_to_leg(
     leg: Dict[str, Any],
     *,
@@ -272,9 +375,14 @@ def _apply_imputed_odds_to_leg(
     known_n: int,
     goals_at_signal: Optional[int],
     line_offset: float,
+    basis_reason: Optional[str] = None,
 ) -> bool:
-    """Fill a missing-quote leg from the known-odds average. Never touches real quotes."""
-    if leg.get("status") == "settled":
+    """Fill a pending/missing-quote leg from the known-odds average.
+
+    Never touches real quotes. Intended fallback when late-fill became impossible
+    (goal before quote / window expired / settle still pending).
+    """
+    if leg.get("status") == STATUS_SETTLED:
         return False
     if leg_has_real_odds(leg):
         return False
@@ -282,22 +390,36 @@ def _apply_imputed_odds_to_leg(
     if (
         existing is not None
         and existing > 1.0
-        and leg.get("status") == "open"
+        and leg.get("status") == STATUS_OPEN
         and _leg_odds_source(leg) != ODDS_SOURCE_IMPUTED_AVG
     ):
         return False
     if avg_odds <= 1.0 or known_n <= 0:
         return False
+    if str(leg.get("status") or "") not in {
+        STATUS_PENDING_QUOTE,
+        STATUS_EXCLUDED,
+        STATUS_OPEN,
+    }:
+        return False
+    # Open legs only get imputed when they already carry an imputed source
+    # placeholder; otherwise leave real opens alone (handled above).
+    if (
+        str(leg.get("status") or "") == STATUS_OPEN
+        and _leg_odds_source(leg) == ODDS_SOURCE_REAL
+    ):
+        return False
 
     basis = (
-        leg.get("impute_basis_reason")
+        basis_reason
+        or leg.get("impute_basis_reason")
         or leg.get("exclude_reason")
         or leg.get("quote_status")
         or "quote_unavailable"
     )
     leg["over_decimal"] = float(avg_odds)
     leg["stake_units"] = float(UNIT_STAKE)
-    leg["status"] = "open"
+    leg["status"] = STATUS_OPEN
     leg["outcome"] = None
     leg["pnl_units"] = None
     leg["settled_at_utc"] = None
@@ -307,6 +429,7 @@ def _apply_imputed_odds_to_leg(
     leg["imputed_from_known_n"] = int(known_n)
     leg["imputed_over_decimal"] = float(avg_odds)
     leg["impute_basis_reason"] = str(basis)
+    leg.pop("pending_deadline_utc", None)
     if leg.get("line") is None and goals_at_signal is not None:
         leg["line"] = float(goals_at_signal) + float(line_offset)
     if not leg.get("selection"):
@@ -316,12 +439,52 @@ def _apply_imputed_odds_to_leg(
     return True
 
 
-def impute_missing_leg_odds(ledger: Dict[str, Any], *, leg_key: str) -> int:
-    """Impute excluded/missing odds for one leg from the real-odds average.
+def impute_leg_with_average(
+    ledger: Dict[str, Any],
+    *,
+    fixture_id: int,
+    leg_key: str,
+    basis_reason: str,
+) -> bool:
+    """Impute one pending/missing leg from the known real-odds average."""
+    if leg_key not in LEG_KEYS:
+        raise ValueError(f"unknown leg: {leg_key}")
+    avg, known_n = average_known_leg_odds(ledger, leg_key)
+    if avg is None or known_n <= 0:
+        return False
+    bet = (ledger.get("bets") or {}).get(str(int(fixture_id)))
+    if not isinstance(bet, dict):
+        return False
+    legs = bet.get("legs")
+    if not isinstance(legs, dict):
+        return False
+    leg = legs.get(leg_key)
+    if not isinstance(leg, dict):
+        return False
+    goals_at = _safe_int(bet.get("goals_at_signal"))
+    if goals_at is None:
+        goals_at = int(bet.get("score_home") or 0) + int(bet.get("score_away") or 0)
+    line_offset = 0.5 if leg_key == LEG_EU else 1.0
+    return _apply_imputed_odds_to_leg(
+        leg,
+        avg_odds=float(avg),
+        known_n=int(known_n),
+        goals_at_signal=goals_at,
+        line_offset=line_offset,
+        basis_reason=str(basis_reason),
+    )
 
-    Returns the number of legs changed. Real ``available`` quotes are never
-    overwritten. Already-settled real legs are left alone; settled imputed legs
-    keep their frozen imputed odds.
+
+def impute_missing_leg_odds(
+    ledger: Dict[str, Any],
+    *,
+    leg_key: str,
+    basis_reason: str = IMPUTE_REASON_SETTLED_PENDING,
+    only_pending: bool = False,
+) -> int:
+    """Impute pending/excluded odds for one leg from the real-odds average.
+
+    Returns the number of legs changed. Real quotes are never overwritten.
     """
     avg, known_n = average_known_leg_odds(ledger, leg_key)
     if avg is None or known_n <= 0:
@@ -337,7 +500,16 @@ def impute_missing_leg_odds(ledger: Dict[str, Any], *, leg_key: str) -> int:
         leg = legs.get(leg_key)
         if not isinstance(leg, dict):
             continue
-        if leg.get("status") == "settled":
+        if leg.get("status") == STATUS_SETTLED:
+            continue
+        if only_pending and not leg_is_pending_quote(leg):
+            continue
+        if not only_pending and str(leg.get("status") or "") not in {
+            STATUS_PENDING_QUOTE,
+            STATUS_EXCLUDED,
+        }:
+            # Preserve historical backfill for excluded legs; do not impute
+            # already-open real/imputed legs here.
             continue
         goals_at = _safe_int(bet.get("goals_at_signal"))
         if goals_at is None:
@@ -348,17 +520,22 @@ def impute_missing_leg_odds(ledger: Dict[str, Any], *, leg_key: str) -> int:
             known_n=int(known_n),
             goals_at_signal=goals_at,
             line_offset=line_offset,
+            basis_reason=basis_reason,
         ):
             changed += 1
     return changed
 
 
 def backfill_imputed_odds_and_settle(ledger: Dict[str, Any]) -> int:
-    """Impute missing odds, then settle any open legs that already have finals."""
+    """Impute still-pending/excluded odds, then settle legs that have finals."""
     ensure_epoch(ledger)
     changed = 0
     for leg_key in LEG_KEYS:
-        changed += impute_missing_leg_odds(ledger, leg_key=leg_key)
+        changed += impute_missing_leg_odds(
+            ledger,
+            leg_key=leg_key,
+            basis_reason=IMPUTE_REASON_SETTLED_PENDING,
+        )
 
     for fixture_key, bet in list((ledger.get("bets") or {}).items()):
         if not isinstance(bet, dict):
@@ -369,7 +546,8 @@ def backfill_imputed_odds_and_settle(ledger: Dict[str, Any]) -> int:
         legs = bet.get("legs") if isinstance(bet.get("legs"), dict) else {}
         needs_settle = any(
             isinstance(legs.get(leg_key), dict)
-            and legs[leg_key].get("status") == "open"
+            and str(legs[leg_key].get("status") or "")
+            in {STATUS_OPEN, STATUS_PENDING_QUOTE}
             for leg_key in LEG_KEYS
         )
         if not needs_settle:
@@ -385,10 +563,28 @@ def backfill_imputed_odds_and_settle(ledger: Dict[str, Any]) -> int:
             fixture_id=int(bet.get("fixture_id") or fixture_key),
             goals_final=int(goals_final),
             settled_at_utc=prior_settled,
-            impute_missing_odds=False,
+            impute_missing_odds=True,
         )
         changed += 1
     return changed
+
+
+def iter_pending_quote_bets(
+    ledger: Mapping[str, Any],
+) -> list[Tuple[str, Dict[str, Any], str, Dict[str, Any]]]:
+    """Return ``(fixture_key, bet, leg_key, leg)`` for every pending quote leg."""
+    rows: list[Tuple[str, Dict[str, Any], str, Dict[str, Any]]] = []
+    for fixture_key, bet in (ledger.get("bets") or {}).items():
+        if not isinstance(bet, dict):
+            continue
+        legs = bet.get("legs")
+        if not isinstance(legs, dict):
+            continue
+        for leg_key in LEG_KEYS:
+            leg = legs.get(leg_key)
+            if isinstance(leg, dict) and leg_is_pending_quote(leg):
+                rows.append((str(fixture_key), bet, leg_key, leg))
+    return rows
 
 
 def _empty_leg(
@@ -401,20 +597,46 @@ def _empty_leg(
     usable: bool,
     exclude_reason: Optional[str],
     stake_units: float,
+    pending: bool = False,
+    pending_deadline_utc: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    if usable:
+        status = STATUS_OPEN
+        resolved_line = line
+        resolved_odds = over_decimal
+        resolved_stake: Optional[float] = float(stake_units)
+        resolved_exclude = None
+        resolved_status = "available"
+    elif pending:
+        status = STATUS_PENDING_QUOTE
+        resolved_line = line
+        resolved_odds = None
+        resolved_stake = None
+        resolved_exclude = exclude_reason
+        resolved_status = str(quote_status or "unavailable")
+    else:
+        status = STATUS_EXCLUDED
+        resolved_line = None
+        resolved_odds = None
+        resolved_stake = None
+        resolved_exclude = exclude_reason
+        resolved_status = str(quote_status or "unavailable")
+    payload = {
         "selection": selection,
-        "line": line if usable else None,
-        "over_decimal": over_decimal if usable else None,
-        "quote_status": "available" if usable else str(quote_status or "unavailable"),
+        "line": resolved_line,
+        "over_decimal": resolved_odds,
+        "quote_status": resolved_status,
         "quote_record_key": quote_record_key,
-        "stake_units": float(stake_units) if usable else None,
-        "status": "open" if usable else "excluded",
+        "stake_units": resolved_stake,
+        "status": status,
         "outcome": None,
         "pnl_units": None,
-        "exclude_reason": exclude_reason,
+        "exclude_reason": resolved_exclude,
         "settled_at_utc": None,
     }
+    if pending and pending_deadline_utc:
+        payload["pending_deadline_utc"] = str(pending_deadline_utc)
+    return payload
 
 
 def open_published_signal_bet(
@@ -484,6 +706,13 @@ def open_published_signal_bet(
     if asian_target is None:
         asian_target = float(goals_at_signal) + 1.0
 
+    pending_deadline = _fmt_utc(
+        sent_at + timedelta(seconds=quote_fill_window_seconds())
+    )
+    # Missing live quote at send => pending late-fill (unless pre-epoch).
+    eu_pending = (not eu_ok) and eu_reason != "pre_epoch"
+    asian_pending = (not asian_ok) and asian_reason != "pre_epoch"
+
     eu_leg = _empty_leg(
         selection=SELECTION_EU,
         line=eu_target,
@@ -493,6 +722,8 @@ def open_published_signal_bet(
         usable=eu_ok,
         exclude_reason=eu_reason,
         stake_units=stake_units,
+        pending=eu_pending,
+        pending_deadline_utc=pending_deadline if eu_pending else None,
     )
     asian_leg = _empty_leg(
         selection=SELECTION_ASIAN,
@@ -503,6 +734,8 @@ def open_published_signal_bet(
         usable=asian_ok,
         exclude_reason=asian_reason,
         stake_units=stake_units,
+        pending=asian_pending,
+        pending_deadline_utc=pending_deadline if asian_pending else None,
     )
     if eu_ok:
         eu_leg["odds_source"] = ODDS_SOURCE_REAL
@@ -519,6 +752,7 @@ def open_published_signal_bet(
         "message_id": _safe_int(message_id),
         "goals_final": None,
         "goals_after_signal": None,
+        "quote_fill_window_seconds": int(quote_fill_window_seconds()),
         "legs": {
             LEG_EU: eu_leg,
             LEG_ASIAN: asian_leg,
@@ -534,20 +768,20 @@ def _settle_leg(
     outcome: str,
     settled_at_utc: str,
 ) -> None:
-    if leg.get("status") == "settled":
+    if leg.get("status") == STATUS_SETTLED:
         return
-    if leg.get("status") != "open":
+    if leg.get("status") != STATUS_OPEN:
         return
     odds = _safe_float(leg.get("over_decimal"))
     stake = _safe_float(leg.get("stake_units")) or UNIT_STAKE
     if odds is None or odds <= 1.0:
-        leg["status"] = "excluded"
+        leg["status"] = STATUS_EXCLUDED
         leg["exclude_reason"] = "quote_unavailable"
         return
     result = str(outcome).upper()
     leg["outcome"] = result
     leg["pnl_units"] = pnl_units(outcome=result, over_decimal=odds, stake_units=stake)
-    leg["status"] = "settled"
+    leg["status"] = STATUS_SETTLED
     leg["settled_at_utc"] = settled_at_utc
     leg["exclude_reason"] = None
 
@@ -598,26 +832,56 @@ def settle_published_signal_bet(
     if impute_missing_odds:
         for leg_key, offset in ((LEG_EU, 0.5), (LEG_ASIAN, 1.0)):
             leg = legs.get(leg_key)
-            if not isinstance(leg, dict) or leg.get("status") == "settled":
+            if not isinstance(leg, dict) or leg.get("status") == STATUS_SETTLED:
+                continue
+            if str(leg.get("status") or "") not in {
+                STATUS_PENDING_QUOTE,
+                STATUS_EXCLUDED,
+            }:
                 continue
             avg, known_n = average_known_leg_odds(ledger, leg_key)
-            if avg is None:
-                continue
-            _apply_imputed_odds_to_leg(
-                leg,
-                avg_odds=float(avg),
-                known_n=int(known_n),
-                goals_at_signal=goals_at,
-                line_offset=offset,
-            )
+            if avg is not None and known_n > 0:
+                _apply_imputed_odds_to_leg(
+                    leg,
+                    avg_odds=float(avg),
+                    known_n=int(known_n),
+                    goals_at_signal=goals_at,
+                    line_offset=offset,
+                    basis_reason=IMPUTE_REASON_SETTLED_PENDING,
+                )
+            elif leg_is_pending_quote(leg):
+                # Match is finished: never leave pending as "still in play".
+                exclude_pending_leg(
+                    leg,
+                    reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                    closed_at_utc=settled_at,
+                )
 
     eu_leg = legs.get(LEG_EU)
     asian_leg = legs.get(LEG_ASIAN)
     if isinstance(eu_leg, dict):
+        if leg_is_pending_quote(eu_leg):
+            exclude_pending_leg(
+                eu_leg,
+                reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                closed_at_utc=settled_at,
+            )
         _settle_leg(eu_leg, outcome=eu_out, settled_at_utc=settled_at)
     if isinstance(asian_leg, dict) and goals_final is not None:
+        if leg_is_pending_quote(asian_leg):
+            exclude_pending_leg(
+                asian_leg,
+                reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                closed_at_utc=settled_at,
+            )
         _settle_leg(asian_leg, outcome=asian_out, settled_at_utc=settled_at)
     elif isinstance(asian_leg, dict) and asian_out in {"WIN", "LOSS", "PUSH"}:
+        if leg_is_pending_quote(asian_leg):
+            exclude_pending_leg(
+                asian_leg,
+                reason=EXCLUDE_REASON_SETTLED_NO_ODDS,
+                closed_at_utc=settled_at,
+            )
         _settle_leg(asian_leg, outcome=asian_out, settled_at_utc=settled_at)
     return bet
 
@@ -813,13 +1077,13 @@ def summarize_period(
             pnl = _safe_float(leg_data.get("pnl_units")) or 0.0
             odds_source = _leg_odds_source(leg_data)
 
-        if status == "open":
+        if status in {STATUS_OPEN, STATUS_PENDING_QUOTE}:
             open_count += 1
             continue
-        if status == "excluded":
+        if status == STATUS_EXCLUDED:
             excluded += 1
             continue
-        if status != "settled":
+        if status != STATUS_SETTLED:
             excluded += 1
             continue
         settled += 1
@@ -936,7 +1200,8 @@ def format_dual_roi_message(
         [
             "",
             "Один сигнал = две параллельные ставки по 1 юниту.",
-            "Нет живого кэфа → берётся средний кэф уже известных сигналов этой же ветки.",
+            "Нет кэфа при отправке → ждём тот же счёт несколько минут.",
+            "Если гол раньше кэфа (или окно истекло) → средний кэф известных сигналов.",
         ]
     )
     return "\n".join(parts)
@@ -1017,8 +1282,37 @@ def record_settle_and_save(
         return bet
 
 
+def reset_ledger(
+    path: Optional[Any] = None,
+    *,
+    backup_suffix: Optional[str] = None,
+) -> str:
+    """Wipe bets and start a fresh epoch. Optionally keep a timestamped backup."""
+    with _LOCK:
+        target = _coerce_path(path)
+        if target.exists():
+            suffix = backup_suffix or _utc_now().strftime("%Y%m%dT%H%M%SZ")
+            backup = target.with_name(f"{target.name}.bak_reset_{suffix}")
+            try:
+                backup.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+                logger.info(
+                    "[SIGNAL_ROI] ledger_backup path=%s backup=%s",
+                    target,
+                    backup,
+                )
+            except Exception:
+                logger.exception(
+                    "[SIGNAL_ROI] failed_to_backup path=%s", target
+                )
+        ledger = empty_ledger()
+        epoch = ensure_epoch(ledger)
+        save_ledger(ledger, target)
+        logger.info("[SIGNAL_ROI] ledger_reset path=%s epoch_utc=%s", target, epoch)
+        return epoch
+
+
 def initialize_ledger(path: Optional[Any] = None) -> str:
-    """Create/persist ledger; reset when upgrading to dual ROI schema."""
+    """Create/persist ledger; reset when upgrading schema/model."""
     with _LOCK:
         target = _coerce_path(path)
         raw_schema = 0
@@ -1035,11 +1329,25 @@ def initialize_ledger(path: Optional[Any] = None) -> str:
             raw_schema < SCHEMA_VERSION or (raw_model and raw_model != MODEL_NAME)
         ):
             logger.info(
-                "[SIGNAL_ROI] resetting ledger for dual ROI model "
+                "[SIGNAL_ROI] resetting ledger for schema/model upgrade "
                 "prior_schema=%s prior_model=%s",
                 raw_schema,
                 raw_model or "unset",
             )
+            # Preserve prior history beside the fresh epoch ledger.
+            try:
+                backup = target.with_name(
+                    f"{target.name}.bak_schema_{raw_schema}_to_{SCHEMA_VERSION}"
+                )
+                if not backup.exists():
+                    backup.write_text(
+                        target.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+            except Exception:
+                logger.exception(
+                    "[SIGNAL_ROI] failed_to_backup_before_schema_reset path=%s",
+                    target,
+                )
             ledger = empty_ledger()
         else:
             ledger = load_ledger(target)
